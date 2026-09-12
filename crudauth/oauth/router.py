@@ -1,9 +1,10 @@
 """Builds the ``/oauth/{provider}/authorize`` and ``/oauth/{provider}/callback`` routes."""
 
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Query, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from ..constants import OAUTH_STATE_TTL_SECONDS
 from ..core import AuthRuntime
@@ -30,6 +31,10 @@ def build_oauth_router(
     account_service: OAuthAccountService,
     session_manager: "SessionManager",
     default_redirect: str = "/",
+    prefix: str = "/oauth",
+    authorize_path: str = "/{provider}/authorize",
+    callback_path: str = "/{provider}/callback",
+    response_mode: Literal["redirect", "json"] = "redirect",
 ) -> APIRouter:
     """Build the ``/oauth/{provider}/authorize`` and ``/callback`` router.
 
@@ -43,9 +48,11 @@ def build_oauth_router(
             absent or not a safe same-origin path.
 
     Returns:
-        An `APIRouter` mounted under ``/oauth``.
+        An `APIRouter` mounted under ``prefix``.
     """
-    router = APIRouter(prefix="/oauth", tags=["oauth"])
+    if response_mode not in ("redirect", "json"):
+        raise ValueError("response_mode must be 'redirect' or 'json'")
+    router = APIRouter(prefix=prefix, tags=["oauth"])
     db_dep = runtime.db_dependency
 
     def _provider(name: str) -> AbstractOAuthProvider:
@@ -68,8 +75,12 @@ def build_oauth_router(
         redirect.delete_cookie(OAUTH_STATE_COOKIE_NAME, path=session_manager.cookie_path)
         return redirect
 
-    @router.get("/{provider}/authorize")
-    async def authorize(provider: str, redirect_to: Annotated[str | None, Query()] = None):
+    @router.get(authorize_path)
+    async def authorize(
+        provider: str,
+        redirect_to: Annotated[str | None, Query()] = None,
+        response_format: Annotated[Literal["redirect", "json"] | None, Query()] = None,
+    ):
         """Start the OAuth flow: stash state + PKCE and 307-redirect to the provider.
 
         ``redirect_to`` is where the callback sends the browser afterwards (only
@@ -103,17 +114,29 @@ def build_oauth_router(
             samesite="lax",
             path=session_manager.cookie_path,
         )
+        if (response_format or response_mode) == "json":
+            result = JSONResponse({"url": auth_data["url"]})
+            result.set_cookie(
+                OAUTH_STATE_COOKIE_NAME,
+                auth_data["state"],
+                max_age=OAUTH_STATE_TTL_SECONDS,
+                httponly=True,
+                secure=session_manager.cookie_secure,
+                samesite="lax",
+                path=session_manager.cookie_path,
+            )
+            return result
         return redirect
 
-    @router.get("/{provider}/callback")
+    @router.get(callback_path)
     async def callback(
         provider: str,
         request: Request,
-        response: Response,
         db: Annotated[Any, Depends(db_dep)],
         code: Annotated[str | None, Query()] = None,
         state: Annotated[str | None, Query()] = None,
         error: Annotated[str | None, Query()] = None,
+        response_format: Annotated[Literal["redirect", "json"] | None, Query()] = None,
     ):
         """Handle the provider callback: verify state/PKCE, link-or-create the
         user, start a session, and 307-redirect to the validated target.
@@ -179,6 +202,15 @@ def build_oauth_router(
             request=request,
             context=HookContext(transport="oauth", request=request),
         )
+        if (response_format or response_mode) == "json":
+            result = JSONResponse(
+                jsonable_encoder(
+                    {"user": runtime.repo.to_dict(user), "csrf_token": csrf, "redirect_to": redirect_url}
+                )
+            )
+            session_manager.set_session_cookies(result, session_id, csrf)
+            result.delete_cookie(OAUTH_STATE_COOKIE_NAME, path=session_manager.cookie_path)
+            return result
         return redirect
 
     return router

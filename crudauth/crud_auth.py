@@ -13,7 +13,7 @@ async def me(user: Principal = Depends(auth.current_user())):
 import inspect
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING, Annotated, Any, Callable, Sequence
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal, Sequence
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, Field
@@ -136,6 +136,8 @@ class CRUDAuth:
         column_map: dict[str, str] | None = None,
         identity: IdentityConfig | None = None,
         oauth: dict[str, Any] | None = None,
+        oauth_paths: dict[str, str] | None = None,
+        oauth_response_mode: Literal["redirect", "json"] = "redirect",
         email: Any = None,
         channels: list[DeliveryChannel] | None = None,
         hooks: AuthHooks | None = None,
@@ -167,6 +169,12 @@ class CRUDAuth:
                 column names when they differ (e.g. ``{"hashed_password": "pw_hash"}``).
             oauth: ``{provider_name: OAuthCredentials}`` to enable OAuth login;
                 requires ``redirect_base_url`` and a session transport.
+            oauth_paths: Optional OAuth router paths: ``prefix``,
+                ``authorize_path``, and ``callback_path``. Defaults to
+                ``{"prefix": "/oauth", "authorize_path": "/{provider}/authorize",
+                "callback_path": "/{provider}/callback"}``.
+            oauth_response_mode: OAuth response mode, ``"redirect"`` (default)
+                or ``"json"``.
             email: An [EmailConfig][crudauth.email.config.EmailConfig] to enable
                 verify/reset/change flows over email (the built-in delivery
                 channel); ``None`` disables email delivery. Either ``email`` or
@@ -289,7 +297,7 @@ class CRUDAuth:
         self._oauth_service: OAuthAccountService | None = None
         self._oauth_state_storage: AbstractSessionStorage[Any] | None = None
         if oauth:
-            self._build_oauth(oauth, redirect_base_url)
+            self._build_oauth(oauth, redirect_base_url, oauth_paths, oauth_response_mode)
 
         if warn_on_memory_backend:
             self._warn_on_memory_backend()
@@ -496,7 +504,13 @@ class CRUDAuth:
         self.runtime.email_service = self._email_service
 
     # --- oauth wiring --------------------------------------------------------
-    def _build_oauth(self, oauth: dict[str, Any], redirect_base_url: str | None) -> None:
+    def _build_oauth(
+        self,
+        oauth: dict[str, Any],
+        redirect_base_url: str | None,
+        oauth_paths: dict[str, str] | None = None,
+        oauth_response_mode: Literal["redirect", "json"] = "redirect",
+    ) -> None:
         if self._session_transport is None:
             raise ValueError(
                 "OAuth establishes a session on callback; add a SessionTransport to transports=[...]."
@@ -504,6 +518,12 @@ class CRUDAuth:
         if not redirect_base_url:
             raise ValueError("redirect_base_url is required when oauth=... is configured")
 
+        paths = {
+            "prefix": "/oauth",
+            "authorize_path": "/{provider}/authorize",
+            "callback_path": "/{provider}/callback",
+            **(oauth_paths or {}),
+        }
         providers = {}
         for name, creds in oauth.items():
             if not self.repo.has(f"{name}_id"):
@@ -513,7 +533,13 @@ class CRUDAuth:
                     f"'{name}_id: Mapped[str | None] = mapped_column(unique=True, index=True, "
                     f"default=None)') or map it via column_map=."
                 )
-            redirect_uri = f"{redirect_base_url.rstrip('/')}/oauth/{name}/callback"
+            callback_route = paths["callback_path"].replace("{provider}", name)
+            route = "/".join(
+                part.strip("/")
+                for part in (paths["prefix"], callback_route)
+                if part.strip("/")
+            )
+            redirect_uri = f"{redirect_base_url.rstrip('/')}/{route}"
             providers[name] = OAuthProviderFactory.create_provider(
                 name,
                 client_id=creds.client_id,
@@ -537,6 +563,8 @@ class CRUDAuth:
             account_service=self._oauth_service,
             session_manager=self.sessions,
             default_redirect=redirect_base_url,
+            response_mode=oauth_response_mode,
+            **paths,
         )
 
     # --- sudo wiring ---------------------------------------------------------

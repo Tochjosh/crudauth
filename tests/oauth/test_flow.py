@@ -103,6 +103,68 @@ async def test_authorize_sets_state_binding_cookie(client) -> None:
     assert "httponly" in set_cookie.lower()
 
 
+async def test_json_authorize_and_callback_keep_cookies(client) -> None:
+    r = await client.get("/oauth/stub/authorize?response_format=json&redirect_to=/dashboard")
+    assert r.status_code == 200
+    assert r.json()["url"].startswith("https://stub.example/authorize")
+    state = parse_qs(urlparse(r.json()["url"]).query)["state"][0]
+    assert "oauth_state=" in " ".join(r.headers.get_list("set-cookie"))
+
+    r = await client.get(f"/oauth/stub/callback?code=abc&state={state}&response_format=json")
+    assert r.status_code == 200
+    assert r.json()["user"]["email"] == "oauthuser@x.com"
+    assert r.json()["csrf_token"]
+    assert r.json()["redirect_to"] == "/dashboard"
+    assert "session_id=" in " ".join(r.headers.get_list("set-cookie"))
+
+
+async def test_json_callback_requires_state_cookie(client) -> None:
+    r = await client.get("/oauth/stub/authorize?response_format=json")
+    state = parse_qs(urlparse(r.json()["url"]).query)["state"][0]
+    client.cookies.clear()
+
+    r = await client.get(f"/oauth/stub/callback?code=abc&state={state}&response_format=json")
+    assert r.status_code == 400
+
+
+@pytest.fixture
+async def custom_path_client(get_session, UserModel):
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+        oauth={"stub": OAuthCredentials(client_id="id", client_secret="sec")},
+        redirect_base_url="http://test",
+        oauth_paths={
+            "prefix": "/api/v1/auth/oauth",
+            "authorize_path": "/{provider}",
+            "callback_path": "/callback/{provider}",
+        },
+        oauth_response_mode="json",
+    )
+    app = FastAPI()
+    app.include_router(auth.router)
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        yield c
+    await auth.shutdown()
+
+
+async def test_custom_oauth_paths_match_provider_redirect_uri(custom_path_client) -> None:
+    r = await custom_path_client.get("/api/v1/auth/oauth/stub")
+    assert r.status_code == 200
+    query = parse_qs(urlparse(r.json()["url"]).query)
+    assert query["redirect_uri"] == ["http://test/api/v1/auth/oauth/callback/stub"]
+    state = query["state"][0]
+    r = await custom_path_client.get(
+        f"/api/v1/auth/oauth/callback/stub?code=abc&state={state}"
+    )
+    assert r.status_code == 200
+
+
 def test_oauth_provider_without_id_column_fails_fast(get_session, UserModel) -> None:
     # A provider whose {name}_id column is missing on the model must raise at
     # startup, not silently fail to persist/match the provider id at login.
