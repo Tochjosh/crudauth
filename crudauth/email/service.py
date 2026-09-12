@@ -21,6 +21,7 @@ from ..exceptions import BadRequestException, DuplicateValueException
 from ..hooks import AuthHooks, HookContext
 from ..ratelimit import RateLimit
 from ..repository import UserRepository
+from ..password import PasswordPolicy, PasswordValidator, validate_password
 from ..storage.base import AbstractSessionStorage
 from ..transports.bearer.tokens import (
     create_signed_token,
@@ -91,8 +92,12 @@ class EmailFlowService:
         verify_ttl_hours: int | None = None,
         reset_ttl_hours: int | None = None,
         change_ttl_hours: int | None = None,
+        password_policy: PasswordPolicy | PasswordValidator | None = None,
     ):
         self.repo = repo
+        self.password_policy: PasswordValidator = (
+            password_policy if password_policy is not None else PasswordPolicy()
+        )
         self.secret_key = secret_key
         self.hooks = hooks
         self.algorithm = algorithm
@@ -330,11 +335,12 @@ class EmailFlowService:
         sub = verify_signed_token(token, self.secret_key, RESET, algorithm=self.algorithm)
         if sub is None:
             raise BadRequestException("Invalid or expired token")
-        if not await self._consume(token, self.reset_ttl_hours * SECONDS_PER_HOUR):
-            raise BadRequestException("Token already used")
         user = await self.repo.get_by_id(db, sub)
         if user is None:
             raise BadRequestException("Invalid or expired token")
+        validate_password(new_password, self.password_policy)
+        if not await self._consume(token, self.reset_ttl_hours * SECONDS_PER_HOUR):
+            raise BadRequestException("Token already used")
         await self.repo.update(db, user, {"hashed_password": get_password_hash(new_password)})
         await self.repo.increment_token_version(db, user)
         if self.session_manager is not None:

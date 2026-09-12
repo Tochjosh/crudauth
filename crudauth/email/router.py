@@ -11,9 +11,8 @@ mounts when the model actually has an email column.
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, EmailStr, Field, create_model
+from pydantic import BaseModel, EmailStr, create_model
 
-from ..constants import MIN_PASSWORD_LENGTH
 from ..principal import Principal
 from ..ratelimit import KeyBy
 from .service import EmailFlowService
@@ -27,7 +26,7 @@ class _TokenIn(BaseModel):
 
 class _ResetIn(BaseModel):
     token: str
-    new_password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
+    new_password: str
 
 
 class _ChangeIn(BaseModel):

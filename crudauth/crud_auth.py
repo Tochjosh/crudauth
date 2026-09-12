@@ -25,7 +25,6 @@ from .constants import (
     DEFAULT_LOGIN_LOCKOUT_BASE_SECONDS,
     DEFAULT_LOGIN_LOCKOUT_MAX_SECONDS,
     DEFAULT_LOGIN_MAX_ATTEMPTS,
-    MIN_PASSWORD_LENGTH,
     OAUTH_STATE_TTL_SECONDS,
     USED_TOKEN_TTL_SECONDS,
 )
@@ -45,6 +44,7 @@ from .identity import IdentityConfig
 from .oauth import OAuthAccountService, OAuthProviderFactory
 from .oauth.router import build_oauth_router
 from .principal import Principal
+from .password import PasswordPolicy, PasswordValidator, validate_password
 from .provisioning import NewUserFields
 from .ratelimit import (
     DEFAULT_RATE_LIMITS,
@@ -73,12 +73,12 @@ __all__ = ["CRUDAuth"]
 
 
 class _SetPasswordIn(BaseModel):
-    new_password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
+    new_password: str
 
 
 class _ChangePasswordIn(BaseModel):
     current_password: str
-    new_password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
+    new_password: str
 
 
 class SessionInfo(BaseModel):
@@ -151,6 +151,7 @@ class CRUDAuth:
         trusted_proxy_hops: int = 0,
         sudo: SudoConfig | None = None,
         warn_on_memory_backend: bool = True,
+        password_policy: PasswordPolicy | PasswordValidator | None = None,
     ):
         """Configure the auth surface.
 
@@ -227,6 +228,8 @@ class CRUDAuth:
                 per-process, so under multiple workers it silently breaks; set
                 ``False`` to silence once you've accepted that (e.g. single-worker
                 dev).
+            password_policy: PasswordPolicy or callable applied to every new
+                password. The default requires at least 8 characters.
 
         Raises:
             ValueError: If ``SECRET_KEY`` is empty; if ``oauth`` or ``sudo`` is
@@ -237,6 +240,9 @@ class CRUDAuth:
         if not SECRET_KEY:
             raise ValueError("SECRET_KEY is required")
         self.session = session
+        self.password_policy: PasswordValidator = (
+            password_policy if password_policy is not None else PasswordPolicy()
+        )
         self.identity = identity or IdentityConfig()
         self.repo = UserRepository(
             user_model,
@@ -432,6 +438,10 @@ class CRUDAuth:
         )
 
     # --- public: session manager --------------------------------------------
+    def validate_password(self, password: str) -> None:
+        """Validate a plaintext password using this auth surface's policy."""
+        validate_password(password, self.password_policy)
+
     @property
     def sessions(self):
         """The [SessionManager][crudauth.transports.session.manager.SessionManager] of the configured session transport."""
@@ -492,6 +502,7 @@ class CRUDAuth:
             session_manager=self.sessions if self._session_transport else None,
             rate_limiter=self.runtime.rate_limiter,
             rate_limits=self._rate_limits,
+            password_policy=self.password_policy,
         )
         self.runtime.email_service = self._email_service
 
@@ -875,6 +886,7 @@ class CRUDAuth:
                 requires first-password establishment to be browser-only.
             """
             user = principal.user
+            self.validate_password(body.new_password)
             if not is_unusable_password(self.repo.get(user, "hashed_password", "")):
                 raise BadRequestException(
                     "Account already has a password; use the password reset flow to change it."
@@ -917,6 +929,7 @@ class CRUDAuth:
                 )
             if not verify_password(body.current_password, current_hash):
                 raise UnauthorizedException("Current password is incorrect.")
+            self.validate_password(body.new_password)
             await self.repo.update(
                 db, user, {"hashed_password": get_password_hash(body.new_password)}
             )

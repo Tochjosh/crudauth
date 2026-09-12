@@ -10,20 +10,21 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 
-from crudauth import AuthHooks, CookieConfig, CRUDAuth, SessionTransport
+from crudauth import AuthHooks, CookieConfig, CRUDAuth, PasswordPolicy, SessionTransport
 from crudauth.repository import UserRepository
 from crudauth.utils import make_unusable_password
 
 SECRET = "test-secret-key-0123456789-0123456789"
 
 
-def _build(get_session, UserModel, hooks=None):
+def _build(get_session, UserModel, hooks=None, password_policy=None):
     auth = CRUDAuth(
         session=get_session,
         user_model=UserModel,
         SECRET_KEY=SECRET,
         transports=[SessionTransport(cookies=CookieConfig(secure=False))],
         hooks=hooks or AuthHooks(),
+        password_policy=password_policy,
     )
     app = FastAPI()
     app.include_router(auth.router)
@@ -38,11 +39,11 @@ async def _client(app):
         yield c
 
 
-async def _register_login(c):
+async def _register_login(c, password="pw123456"):
     await c.post(
-        "/register", json={"email": "a@x.com", "username": "alice", "password": "pw123456"}
+        "/register", json={"email": "a@x.com", "username": "alice", "password": password}
     )
-    r = await c.post("/login", data={"username": "alice", "password": "pw123456"})
+    r = await c.post("/login", data={"username": "alice", "password": password})
     return r.json()["csrf_token"]
 
 
@@ -57,6 +58,20 @@ async def test_wrong_current_password_401(get_session, UserModel) -> None:
             json={"current_password": "not-it", "new_password": "new-strong-1"},
         )
         assert r.status_code == 401
+    await auth.shutdown()
+
+
+async def test_configured_policy_rejects_change(get_session, UserModel) -> None:
+    app, auth = _build(get_session, UserModel, password_policy=PasswordPolicy(min_length=12))
+    await auth.initialize()
+    async with _client(app) as c:
+        csrf = await _register_login(c, "pw1234567890")
+        r = await c.post(
+            "/change-password",
+            headers={"X-CSRF-Token": csrf},
+            json={"current_password": "pw1234567890", "new_password": "short"},
+        )
+        assert r.status_code == 422
     await auth.shutdown()
 
 

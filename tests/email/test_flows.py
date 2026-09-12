@@ -6,7 +6,16 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from crudauth import AuthHooks, CookieConfig, CRUDAuth, EmailConfig, EmailSender, SessionTransport
+from crudauth import (
+    AuthHooks,
+    CookieConfig,
+    CRUDAuth,
+    EmailConfig,
+    EmailSender,
+    PasswordPolicy,
+    SessionTransport,
+    UnprocessableEntityException,
+)
 from crudauth.email.service import EmailFlowService
 from crudauth.repository import UserRepository
 from crudauth.utils import get_password_hash
@@ -157,6 +166,26 @@ async def test_password_reset_flow(ctx) -> None:
     assert (
         await client.post("/login", data={"username": "alice", "password": "newpw12345"})
     ).status_code == 200
+
+
+async def test_direct_password_reset_enforces_policy(sessionmaker, UserModel) -> None:
+    repo = UserRepository(UserModel)
+    sender = CapturingSender()
+    svc = EmailFlowService(
+        repo=repo,
+        secret_key="test-secret-key-0123456789-0123456789",
+        config=EmailConfig(sender=sender, frontend_url="https://app"),
+        hooks=AuthHooks(),
+        password_policy=PasswordPolicy(min_length=12),
+    )
+    async with sessionmaker() as db:
+        await repo.create(
+            db, {"email": "reset@x.com", "username": "reset", "hashed_password": get_password_hash("pw123456")}
+        )
+        await svc.request_password_reset(db, "reset@x.com")
+        with pytest.raises(UnprocessableEntityException) as error:
+            await svc.reset_password(db, sender.token_for("reset_password"), "short")
+        assert error.value.status_code == 422
 
 
 async def test_reset_request_idempotent_for_unknown_email(ctx) -> None:

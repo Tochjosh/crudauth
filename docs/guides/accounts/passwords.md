@@ -23,8 +23,22 @@ silently truncates a long password. Verification returns `False` for a malformed
 instead of raising, so a corrupted row is a clean "invalid password", not a 500. You never
 handle the plaintext beyond the route that receives it.
 
-`MIN_PASSWORD_LENGTH` (8) is enforced on registration and on password reset. A custom
-`register_schema` governs its own field constraints.
+The default `PasswordPolicy` requires 8 characters. Configure one policy for every password
+write, including direct service calls:
+
+```python
+from crudauth import CRUDAuth, PasswordPolicy
+
+auth = CRUDAuth(
+    session=get_session, user_model=User, SECRET_KEY="change-me",
+    password_policy=PasswordPolicy(min_length=12, require_digit=True),
+)
+auth.validate_password("candidate")  # reusable in app-owned schemas
+```
+
+You can also pass a callable that raises `ValueError` for invalid passwords. Violations return
+`422`, including all unmet `PasswordPolicy` requirements. A custom `register_schema` controls
+request parsing, but the configured policy still runs in the service path.
 
 ## Setting a password on an OAuth-only account
 

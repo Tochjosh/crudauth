@@ -45,6 +45,7 @@ from .identity import IdentityConfig
 from .models.mixin import AuthUserMixin, make_auth_identity
 from .oauth import OAuthAccountService, OAuthCredentials
 from .principal import Principal
+from .password import PasswordPolicy
 from .provisioning import NewUserContext, NewUserFields
 from .repository import UserRepository
 from .sudo import SudoConfig, SudoManager
@@ -84,6 +85,7 @@ __all__ = [
     "Transport",
     "AuthContext",
     "CookieConfig",
+    "PasswordPolicy",
     "SudoConfig",
     # toolbox: reusable building blocks (use the wired services off `auth`, or
     # construct/type them directly). Token issuance is intentionally not exported

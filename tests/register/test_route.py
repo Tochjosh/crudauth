@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from crudauth import CookieConfig, CRUDAuth, SessionTransport
+from crudauth import CookieConfig, CRUDAuth, PasswordPolicy, SessionTransport
 from crudauth.repository import UserRepository
 
 
@@ -86,4 +86,25 @@ async def test_default_schema_still_works(get_session, UserModel) -> None:
             "/register", json={"email": "c@x.com", "username": "carol", "password": "pw123456"}
         )
         assert r.status_code == 200
+    await auth.shutdown()
+
+
+async def test_configured_password_policy_runs_after_request_parsing(get_session, UserModel) -> None:
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+        password_policy=PasswordPolicy(min_length=12),
+    )
+    app = FastAPI()
+    app.include_router(auth.router)
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        r = await c.post(
+            "/register", json={"email": "policy@x.com", "username": "policy", "password": "short"}
+        )
+        assert r.status_code == 422
     await auth.shutdown()
