@@ -35,6 +35,7 @@ from .email.router import build_email_router
 from .email.service import EmailFlowService
 from .exceptions import (
     BadRequestException,
+    CSRFException,
     ForbiddenException,
     NotFoundException,
     RateLimitException,
@@ -556,7 +557,13 @@ class CRUDAuth:
 
     # --- the current_user() factory -----------------------------------------
     async def _resolve_principal(
-        self, request: Request, db: Any, selected: list[Transport]
+        self,
+        request: Request,
+        db: Any,
+        selected: list[Transport],
+        *,
+        enforce_csrf: bool = True,
+        update_activity: bool = True,
     ) -> Principal | None:
         """Run the transport loop once per request, per transport selection.
 
@@ -573,15 +580,101 @@ class CRUDAuth:
             request.state._crudauth_principals = cache
         key = tuple(t.name for t in selected)
         if key in cache:
+            principal = cache[key]
+            # A middleware lookup is deliberately read-only. Upgrade its cached
+            # result for a later dependency without loading the user again.
+            if key in getattr(request.state, "_crudauth_read_only", set()):
+                if principal is not None and principal.transport == "session":
+                    session_transport = next(t for t in selected if t.name == "session")
+                    assert isinstance(session_transport, SessionTransport)
+                    session_id = principal.metadata.get("session_id")
+                    if enforce_csrf or update_activity:
+                        session = await session_transport.manager.validate_session(
+                            session_id, update_activity=update_activity
+                        )
+                        if session is None:
+                            cache[key] = None
+                            return None
+                        if enforce_csrf:
+                            await session_transport._enforce_csrf(request, session_id)
+                if enforce_csrf:
+                    request.state._crudauth_read_only.discard(key)
             return cache[key]
-        ctx = AuthContext(request=request, db=db, runtime=self.runtime)
+        ctx = AuthContext(
+            request=request,
+            db=db,
+            runtime=self.runtime,
+            enforce_csrf=enforce_csrf,
+            update_activity=update_activity,
+        )
         principal: Principal | None = None
         for t in selected:
             principal = await t.authenticate(request, ctx)
             if principal is not None:
                 break
         cache[key] = principal
+        if not enforce_csrf:
+            read_only = getattr(request.state, "_crudauth_read_only", None)
+            if read_only is None:
+                read_only = set()
+                request.state._crudauth_read_only = read_only
+            read_only.add(key)
         return principal
+
+    async def resolve_principal(
+        self, request: Request, update_activity: bool = False
+    ) -> Principal | None:
+        """Resolve the request principal outside FastAPI dependency injection.
+
+        This is intended for middleware and other request-level code. It tries
+        transports in configured order, returns ``None`` for anonymous or
+        invalid credentials, does not enforce CSRF, and does not slide sessions
+        unless ``update_activity=True``. The result shares the cache used by
+        ``current_user()``.
+        """
+        selected = self.transports
+        cache = getattr(request.state, "_crudauth_principals", None)
+        key = tuple(t.name for t in selected)
+        if cache is not None and key in cache:
+            return await self._resolve_principal(
+                request,
+                None,
+                selected,
+                enforce_csrf=False,
+                update_activity=update_activity,
+            )
+
+        provided = self.session()
+        close = None
+        if inspect.isawaitable(provided):
+            db = await provided
+        elif inspect.isasyncgen(provided):
+            db = await anext(provided)
+            close = provided.aclose
+        elif inspect.isgenerator(provided):
+            db = next(provided)
+            close = provided.close
+        else:
+            db = provided
+        try:
+            try:
+                return await self._resolve_principal(
+                    request,
+                    db,
+                    selected,
+                    enforce_csrf=False,
+                    update_activity=update_activity,
+                )
+            except (UnauthorizedException, CSRFException):
+                if cache is None:
+                    cache = getattr(request.state, "_crudauth_principals", {})
+                cache[key] = None
+                return None
+        finally:
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
 
     async def authenticate_password(
         self, db: Any, identifier: str, password: str, *, request: Request

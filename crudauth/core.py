@@ -155,6 +155,8 @@ class AuthContext:
     request: Request
     db: "AsyncSession"
     runtime: AuthRuntime
+    enforce_csrf: bool = True
+    update_activity: bool = True
     _cache: dict[Any, Any] = field(default_factory=dict)
 
     @property

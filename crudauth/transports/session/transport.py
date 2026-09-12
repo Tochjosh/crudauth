@@ -186,11 +186,14 @@ class SessionTransport(Transport):
         if not session_id:
             return None
 
-        session = await self.manager.validate_session(session_id)
+        session = await self.manager.validate_session(
+            session_id, update_activity=ctx.update_activity
+        )
         if session is None:
             return None
 
-        await self._enforce_csrf(request, session_id)
+        if ctx.enforce_csrf:
+            await self._enforce_csrf(request, session_id)
 
         user = await ctx.resolve_user(session.user_id)
         if user is None or not ctx.repo.is_active(user):

@@ -104,6 +104,25 @@ A *present but invalid* credential (for example a session cookie that fails its 
 a mutation) still raises, even under `optional=True`. A tampered credential is treated as an
 attack signal, not as "anonymous".
 
+## Resolving outside dependency injection
+
+Middleware and other request-level code can resolve the same principal directly:
+
+```python
+@app.middleware("http")
+async def audit(request: Request, call_next):
+    principal = await auth.resolve_principal(request)
+    if principal is not None:
+        logger.info("request from user %s", principal.user_id)
+    return await call_next(request)
+```
+
+This method returns `None` for anonymous or invalid credentials, does not enforce CSRF, and does
+not slide session activity by default. Pass `update_activity=True` when middleware should count
+the request as session activity. Its result is cached on `request.state` and reused by a later
+`current_user()` dependency; that dependency still applies its normal CSRF and authorization
+checks.
+
 ## Protecting a whole router
 
 Attach the dependency at the router level to gate every route under it:
