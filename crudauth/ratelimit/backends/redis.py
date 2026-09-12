@@ -26,8 +26,11 @@ class RedisBackend(RateLimiterBackend):
         client: Any = None,
         prefix: str = REDIS_KEY_PREFIX,
     ):
+        if client is not None and redis_url is not None:
+            raise ValueError("client and redis_url are mutually exclusive")
         if client is not None:
             self.client = client
+            self._owns_client = False
         else:
             try:
                 from redis.asyncio import Redis
@@ -39,6 +42,7 @@ class RedisBackend(RateLimiterBackend):
             self.client = Redis.from_url(
                 redis_url or "redis://localhost:6379/0", decode_responses=False
             )
+            self._owns_client = True
         self.prefix = prefix
 
     def _k(self, key: str) -> str:
@@ -118,4 +122,5 @@ class RedisBackend(RateLimiterBackend):
         await self.client.ping()
 
     async def close(self) -> None:
-        await self.client.aclose()
+        if self._owns_client:
+            await self.client.aclose()

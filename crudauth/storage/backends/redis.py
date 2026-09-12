@@ -34,8 +34,11 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
         **_: Any,
     ):
         super().__init__(prefix=prefix, expiration=expiration)
+        if client is not None and redis_url is not None:
+            raise ValueError("client and redis_url are mutually exclusive")
         if client is not None:
             self.client = client
+            self._owns_client = False
         else:
             try:
                 from redis.asyncio import Redis
@@ -45,6 +48,7 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
                     "Install with: pip install 'crudauth[redis]'"
                 ) from exc
             self.client = Redis.from_url(redis_url or DEFAULT_REDIS_URL, decode_responses=False)
+            self._owns_client = True
         self.user_sessions_prefix = f"{prefix.rstrip(':')}{USER_INDEX_SUFFIX}"
 
     def _user_key(self, user_id: Any) -> str:
@@ -54,7 +58,8 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
         await self.client.ping()
 
     async def close(self) -> None:
-        await self.client.aclose()
+        if self._owns_client:
+            await self.client.aclose()
 
     async def create(
         self, data: T, session_id: str | None = None, expiration: int | None = None

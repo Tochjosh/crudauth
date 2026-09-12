@@ -28,6 +28,7 @@ def get_session_storage(
     prefix: str = DEFAULT_STORAGE_PREFIX,
     expiration: int = DEFAULT_SESSION_TTL_SECONDS,
     redis_url: str | None = None,
+    client: Any = None,
     **kwargs: Any,
 ) -> AbstractSessionStorage[Any]:
     """Construct a storage backend by name.
@@ -37,6 +38,7 @@ def get_session_storage(
         prefix: Key namespace prefix.
         expiration: Default TTL in seconds.
         redis_url: Connection URL, required for ``backend="redis"``.
+        client: Existing async Redis client. The caller owns its lifecycle.
 
     Returns:
         An [AbstractSessionStorage][crudauth.storage.base.AbstractSessionStorage] for the requested backend.
@@ -49,6 +51,6 @@ def get_session_storage(
         return MemorySessionStorage(prefix=prefix, expiration=expiration)
     if backend == BACKEND_REDIS:
         return RedisSessionStorage(
-            prefix=prefix, expiration=expiration, redis_url=redis_url, **kwargs
+            prefix=prefix, expiration=expiration, redis_url=redis_url, client=client, **kwargs
         )
     raise ValueError(f"Unknown session backend: {backend!r} (expected 'memory' or 'redis')")

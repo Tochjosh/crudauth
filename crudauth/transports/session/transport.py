@@ -51,6 +51,8 @@ class SessionTransport(Transport):
     Args:
         backend: ``"memory"`` (default) or ``"redis"`` for shared/persistent state.
         redis_url: Connection URL when ``backend="redis"``.
+        redis_client: Existing async Redis client for session and CSRF state. The
+            caller owns its lifecycle and should use ``decode_responses=False``.
         csrf: Enforce the synchronizer-token header on unsafe methods (default ``True``).
         cookies: Per-transport [CookieConfig][crudauth.core.CookieConfig] override.
         login_max_attempts: Failed logins before the escalating lockout trips.
@@ -80,6 +82,7 @@ class SessionTransport(Transport):
         *,
         backend: str = BACKEND_MEMORY,
         redis_url: str | None = None,
+        redis_client: Any = None,
         csrf: bool = True,
         max_sessions_per_user: int = DEFAULT_MAX_SESSIONS_PER_USER,
         session_timeout_minutes: int = DEFAULT_SESSION_TIMEOUT_MINUTES,
@@ -95,6 +98,11 @@ class SessionTransport(Transport):
     ):
         self.backend = backend
         self.redis_url = redis_url
+        self.redis_client = redis_client
+        if redis_client is not None:
+            if redis_url is not None:
+                raise ValueError("redis_client and redis_url are mutually exclusive")
+            self.backend = "redis"
         self.csrf_enabled = csrf
         self.max_sessions_per_user = max_sessions_per_user
         self.session_timeout_minutes = session_timeout_minutes
@@ -138,6 +146,7 @@ class SessionTransport(Transport):
             prefix=SESSION_STORAGE_PREFIX,
             expiration=timeout_seconds,
             redis_url=self.redis_url,
+            client=self.redis_client,
         )
         csrf_storage = None
         if self.csrf_enabled:
@@ -146,6 +155,7 @@ class SessionTransport(Transport):
                 prefix=CSRF_STORAGE_PREFIX,
                 expiration=timeout_seconds,
                 redis_url=self.redis_url,
+                client=self.redis_client,
             )
 
         self.manager = SessionManager(

@@ -52,6 +52,7 @@ from .ratelimit import (
     LockoutPolicy,
     MemoryRateLimiterBackend,
     RateLimit,
+    redis_rate_limiter,
 )
 from .ratelimit.constants import RATE_LIMIT_NAMESPACE
 from .repository import REGISTRATION_ALLOWED_FIELDS, UserRepository
@@ -147,6 +148,8 @@ class CRUDAuth:
         new_user_fields: NewUserFields | None = None,
         new_user_defaults: dict[str, Any] | None = None,
         rate_limiter: "RateLimiterBackend | None" = None,
+        redis_url: str | None = None,
+        redis_client: Any = None,
         rate_limits: dict[str, RateLimit] | None = None,
         trusted_proxy_hops: int = 0,
         sudo: SudoConfig | None = None,
@@ -210,6 +213,12 @@ class CRUDAuth:
             rate_limiter: Backend for lockout/throttles; defaults to an in-process
                 [MemoryRateLimiterBackend][crudauth.ratelimit.backends.memory.MemoryRateLimiterBackend]. Use
                 ``redis_rate_limiter(...)`` in production.
+            redis_url: Redis URL for the used-token/OAuth-state stores and the default
+                rate limiter. Mutually exclusive with ``redis_client``.
+            redis_client: Existing async Redis client for the used-token/OAuth-state
+                stores and default rate limiter. The caller owns its lifecycle and
+                must use ``decode_responses=False``. Mutually exclusive with
+                ``redis_url``.
             rate_limits: Per-action overrides merged over
                 :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS`.
             trusted_proxy_hops: Number of trusted reverse proxies in front of the
@@ -236,7 +245,11 @@ class CRUDAuth:
         """
         if not SECRET_KEY:
             raise ValueError("SECRET_KEY is required")
+        if redis_client is not None and redis_url is not None:
+            raise ValueError("redis_client and redis_url are mutually exclusive")
         self.session = session
+        self.redis_url = redis_url
+        self.redis_client = redis_client
         self.identity = identity or IdentityConfig()
         self.repo = UserRepository(
             user_model,
@@ -263,7 +276,12 @@ class CRUDAuth:
             db_dependency=session,
             algorithm=algorithm,
             cookie_config=cookies or CookieConfig(),
-            rate_limiter=rate_limiter or MemoryRateLimiterBackend(),
+            rate_limiter=rate_limiter
+            or (
+                redis_rate_limiter(redis_url=redis_url, client=redis_client)
+                if redis_client is not None or redis_url is not None
+                else MemoryRateLimiterBackend()
+            ),
             trusted_proxy_hops=trusted_proxy_hops,
         )
         self._session_transport = next(
@@ -403,10 +421,18 @@ class CRUDAuth:
             )
 
     # --- backend detection ---------------------------------------------------
-    def _backend_config(self) -> tuple[str, str | None]:
+    def _backend_config(self) -> tuple[str, str | None, Any]:
+        if self.redis_client is not None:
+            return "redis", None, self.redis_client
+        if self.redis_url is not None:
+            return "redis", self.redis_url, None
         if self._session_transport is not None:
-            return self._session_transport.backend, self._session_transport.redis_url
-        return BACKEND_MEMORY, None
+            return (
+                self._session_transport.backend,
+                self._session_transport.redis_url,
+                self._session_transport.redis_client,
+            )
+        return BACKEND_MEMORY, None, None
 
     def _warn_on_memory_backend(self) -> None:
         """Warn when an in-memory backend is active (the zero-config default).
@@ -476,9 +502,13 @@ class CRUDAuth:
     def _build_email(
         self, email: Any, channels: list[DeliveryChannel] | None, algorithm: str
     ) -> None:
-        backend, redis_url = self._backend_config()
+        backend, redis_url, redis_client = self._backend_config()
         token_store = get_session_storage(
-            backend, prefix="used_token:", expiration=USED_TOKEN_TTL_SECONDS, redis_url=redis_url
+            backend,
+            prefix="used_token:",
+            expiration=USED_TOKEN_TTL_SECONDS,
+            redis_url=redis_url,
+            client=redis_client,
         )
         self._email_token_store = token_store
         self._email_service = EmailFlowService(
@@ -522,9 +552,13 @@ class CRUDAuth:
                 scopes=creds.scopes,
             )
 
-        backend, redis_url = self._backend_config()
+        backend, redis_url, redis_client = self._backend_config()
         state_storage = get_session_storage(
-            backend, prefix="oauth_state:", expiration=OAUTH_STATE_TTL_SECONDS, redis_url=redis_url
+            backend,
+            prefix="oauth_state:",
+            expiration=OAUTH_STATE_TTL_SECONDS,
+            redis_url=redis_url,
+            client=redis_client,
         )
         self._oauth_state_storage = state_storage
         self._oauth_service = OAuthAccountService(
