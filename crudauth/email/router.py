@@ -95,6 +95,7 @@ def build_email_router(*, auth: Any, service: EmailFlowService) -> APIRouter:
     @router.post("/password/reset-confirm")
     async def reset(body: _ResetIn, db: Annotated[Any, Depends(db_dep)]):
         """Reset the password from a valid token and evict the user's other sessions."""
+        auth.validate_password(body.new_password)
         await service.reset_password(db, body.token, body.new_password)
         return {"detail": "Password reset successfully."}
 
