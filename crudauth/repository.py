@@ -12,7 +12,7 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
-from sqlalchemy import UniqueConstraint, select
+from sqlalchemy import String, UniqueConstraint, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .constants import (
@@ -128,6 +128,13 @@ class UserRepository:
 
     def _attr(self, logical: str) -> Any:
         return getattr(self.model, self.col(logical))
+
+    def string_length(self, logical: str) -> int | None:
+        """Return the resolved SQLAlchemy ``String`` column length, if known."""
+        column = self.model.__table__.columns.get(self.col(logical))
+        if column is None or not isinstance(column.type, String):
+            return None
+        return column.type.length
 
     # --- reads ---------------------------------------------------------------
     def _coerce_id(self, user_id: Any) -> Any:

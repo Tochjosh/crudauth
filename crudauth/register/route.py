@@ -158,6 +158,7 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
                     db=db,
                     register_data=submitted,
                     oauth=None,
+                    name_max_length=auth.repo.string_length("name"),
                 ),
                 auth.repo,
             )
