@@ -7,6 +7,7 @@ import functools
 import hashlib
 import secrets
 from typing import overload
+from urllib.parse import urlsplit
 
 import bcrypt
 from fastapi import Request
@@ -21,6 +22,7 @@ __all__ = [
     "canonical_identifier",
     "mask_email",
     "get_client_ip",
+    "safe_redirect_path",
 ]
 
 
@@ -218,3 +220,25 @@ def get_client_ip(request: Request, trusted_hops: int = 0) -> str:
     if request.client is not None:
         return request.client.host
     return "unknown"
+
+
+def safe_redirect_path(target: str | None, default: str = "/") -> str:
+    """Return a safe same-origin redirect path, or ``default`` when rejected.
+
+    Only single-slash-rooted relative paths are accepted. Absolute URLs,
+    protocol-relative URLs, backslashes, control characters, and values with a
+    URL scheme or network location are rejected. Use this for client-supplied
+    post-login or post-logout redirect targets to prevent open redirects.
+
+    Args:
+        target: The untrusted redirect target.
+        default: The fallback path returned for an unsafe or missing target.
+    """
+    if not target or not target.startswith("/") or target.startswith("//"):
+        return default
+    if "\\" in target or any(ord(c) < 0x20 for c in target):
+        return default
+    parts = urlsplit(target)
+    if parts.scheme or parts.netloc:
+        return default
+    return target
