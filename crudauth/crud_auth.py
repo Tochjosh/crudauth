@@ -480,6 +480,13 @@ class CRUDAuth:
         """
         return self._oauth_service
 
+    @property
+    def oauth_router(self) -> APIRouter:
+        """The configured OAuth routes, for apps keeping their own auth routes."""
+        if self._oauth_router is None:
+            raise RuntimeError("OAuth is not configured")
+        return self._oauth_router
+
     # --- email wiring --------------------------------------------------------
     def _build_email(
         self, email: Any, channels: list[DeliveryChannel] | None, algorithm: str
