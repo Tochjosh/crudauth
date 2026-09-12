@@ -38,6 +38,10 @@ CRUDAuth binds the `state` parameter to the initiating browser via a cookie, so 
 forged callback can't complete someone else's login. The redirect target after login is
 validated against an allowlist to prevent open redirects.
 
+For hand-written post-login or post-logout redirects, reuse
+[`safe_redirect_path`](../../api/utils.md) rather than accepting a client-supplied URL
+directly. It accepts only single-slash relative paths and falls back to `/` by default.
+
 ## Account linking
 
 On a successful callback, CRUDAuth finds or creates the user:

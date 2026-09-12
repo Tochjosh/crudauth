@@ -1,7 +1,7 @@
 # Utilities
 
-Cross-cutting helpers: password hashing, email and identifier normalization, client-IP
-resolution, and display masking.
+Cross-cutting helpers: password hashing, email and identifier normalization, safe redirect
+validation, client-IP resolution, and display masking.
 
 ::: crudauth.utils.get_password_hash
 
@@ -20,3 +20,5 @@ resolution, and display masking.
 ::: crudauth.utils.mask_email
 
 ::: crudauth.utils.get_client_ip
+
+::: crudauth.utils.safe_redirect_path

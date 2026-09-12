@@ -6,6 +6,7 @@ Importing this package registers the built-in providers (Google, GitHub) with
 
 from __future__ import annotations
 
+from ..utils import safe_redirect_path
 from . import providers as _providers  # noqa: F401  (registers built-in providers)
 from .factory import OAuthProviderFactory
 from .provider import AbstractOAuthProvider
@@ -19,4 +20,5 @@ __all__ = [
     "OAuthUserInfo",
     "OAuthState",
     "OAuthAccountService",
+    "safe_redirect_path",
 ]
