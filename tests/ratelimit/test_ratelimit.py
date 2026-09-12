@@ -226,6 +226,66 @@ async def test_rate_limit_keyed_by_custom_callable(get_session, UserModel) -> No
     await auth.shutdown()
 
 
+async def test_rate_limit_accepts_dynamic_limits_and_two_argument_keys(get_session, UserModel) -> None:
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+    )
+    app = FastAPI()
+    seen: list[Principal | None] = []
+
+    async def dynamic(request: httpx.Request, principal: Principal | None):
+        return RateLimit(1, 100) if request.headers.get("X-Limit") else None
+
+    def by_request(request, principal: Principal | None) -> str:
+        seen.append(principal)
+        return request.headers.get("X-Tenant", "anon")
+
+    @app.get("/dynamic", dependencies=[Depends(auth.rate_limit("dynamic", dynamic, key=by_request))])
+    async def dynamic_route() -> dict:
+        return {"ok": True}
+
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        assert (await c.get("/dynamic")).status_code == 200
+        assert (await c.get("/dynamic")).status_code == 200  # resolver returned None
+        assert (await c.get("/dynamic", headers={"X-Limit": "yes"})).status_code == 200
+        assert (await c.get("/dynamic", headers={"X-Limit": "yes"})).status_code == 429
+    await auth.shutdown()
+    assert seen == [None, None, None, None]
+
+
+async def test_user_or_ip_uses_public_principal_and_trusted_ip(get_session, UserModel) -> None:
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+        trusted_proxy_hops=1,
+    )
+    app = FastAPI()
+
+    @app.get(
+        "/mixed", dependencies=[Depends(auth.rate_limit("mixed", RateLimit(1, 100), key=KeyBy.USER_OR_IP))]
+    )
+    async def mixed() -> dict:
+        return {"ok": True}
+
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        assert (await c.get("/mixed", headers={"X-Forwarded-For": "1.2.3.4"})).status_code == 200
+        assert (await c.get("/mixed", headers={"X-Forwarded-For": "1.2.3.4"})).status_code == 429
+        assert (await c.get("/mixed", headers={"X-Forwarded-For": "5.6.7.8"})).status_code == 200
+    await auth.shutdown()
+    assert auth.rate_limiter is auth.runtime.rate_limiter
+
+
 async def test_rate_limit_disabled_with_times_zero(get_session, UserModel) -> None:
     auth = CRUDAuth(
         session=get_session,
