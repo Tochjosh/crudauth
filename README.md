@@ -12,19 +12,19 @@
 
 <p align="center">
 <a href="https://pypi.org/project/crudauth/">
-  <img src="https://img.shields.io/pypi/v/crudauth?color=%2334D058&label=pypi%20package" alt="PyPi Version"/>
+  <img src="https://img.shields.io/pypi/v/crudauth?color=%2334D058&label=pypi%20package&style=for-the-badge" alt="PyPi Version"/>
 </a>
 <a href="https://pypi.org/project/crudauth/">
-  <img src="https://img.shields.io/pypi/pyversions/crudauth.svg?color=%2334D058" alt="Supported Python Versions"/>
+  <img src="https://img.shields.io/pypi/pyversions/crudauth.svg?color=%2334D058&style=for-the-badge" alt="Supported Python Versions"/>
 </a>
 <a href="https://github.com/benavlabs/crudauth/blob/main/LICENSE">
-  <img src="https://img.shields.io/badge/license-MIT-34D058" alt="License"/>
+  <img src="https://img.shields.io/badge/license-MIT-34D058?style=for-the-badge" alt="License"/>
 </a>
 <a href="https://benavlabs.github.io/crudauth">
-  <img src="https://img.shields.io/badge/docs-benavlabs.github.io%2Fcrudauth-34D058?logo=materialformkdocs&logoColor=white" alt="Documentation"/>
+  <img src="https://img.shields.io/badge/docs-benavlabs.github.io%2Fcrudauth-34D058?logo=materialformkdocs&logoColor=white&style=for-the-badge" alt="Documentation"/>
 </a>
 <a href="https://deepwiki.com/benavlabs/crudauth">
-  <img src="https://img.shields.io/badge/DeepWiki-1F2937.svg?logo=book&logoColor=white&labelColor=1F2937&color=34D058" alt="DeepWiki"/>
+  <img src="https://img.shields.io/badge/DeepWiki-1F2937.svg?logo=book&logoColor=white&labelColor=1F2937&color=34D058&style=for-the-badge" alt="DeepWiki"/>
 </a>
 </p>
 
