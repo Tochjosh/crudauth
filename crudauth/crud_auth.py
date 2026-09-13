@@ -622,18 +622,24 @@ class CRUDAuth:
                 metadata=snapshot["metadata"],
             )
 
-            # Enforce CSRF on unsafe methods when upgrading from middleware.
-            if enforce_csrf and request.method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
-                transport = next((t for t in selected if t.name == snapshot["transport"]), None)
-                if isinstance(transport, SessionTransport) and transport.manager is not None:
-                    session_id = snapshot["metadata"].get("session_id")
-                    if session_id:
-                        session = await transport.manager.validate_session(
-                            session_id, update_activity=update_activity
-                        )
-                        if session is None:
-                            return None
-                        await transport._enforce_csrf(request, session_id)
+            # When upgrading from middleware (csrf_enforced=False) on an unsafe
+            # method, enforce CSRF now via the session transport.
+            if (
+                enforce_csrf
+                and not snapshot.get("csrf_enforced")
+                and request.method.upper() in ("POST", "PUT", "PATCH", "DELETE")
+            ):
+                for t in selected:
+                    if isinstance(t, SessionTransport) and t.manager is not None:
+                        session_id = snapshot["metadata"].get("session_id")
+                        if session_id:
+                            session = await t.manager.validate_session(
+                                session_id, update_activity=update_activity
+                            )
+                            if session is None:
+                                return None
+                            await t._enforce_csrf(request, session_id)
+                        break
             return cached_principal
 
         ctx = AuthContext(
@@ -660,6 +666,7 @@ class CRUDAuth:
                 "email_verified": principal.email_verified,
                 "recovery_verified": principal.recovery_verified,
                 "metadata": dict(principal.metadata),
+                "csrf_enforced": enforce_csrf,
             }
         return principal
 
