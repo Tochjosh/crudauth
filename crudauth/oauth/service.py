@@ -176,13 +176,13 @@ class OAuthAccountService:
 
     def _username_with_suffix(self, base: str, suffix: str) -> str:
         limit = self._username_length()
-        available = limit - len(suffix)
+        available = limit - len(suffix) - 1  # -1 for the underscore separator
         if available <= 0:
             return suffix[:limit]
-        if available == 1:
-            return f"{base[:1]}{suffix}"[:limit]
-        trimmed = base[: available - 1].rstrip("_")
-        return f"{trimmed}_{suffix}".strip("_")[:limit].strip("_")
+        trimmed = base[:available].rstrip("_")
+        if not trimmed:
+            return suffix[:limit]
+        return f"{trimmed}_{suffix}"[:limit]
 
     def _random_username(self, base: str) -> str:
         suffix = secrets.token_hex(USERNAME_RANDOM_SUFFIX_BYTES)

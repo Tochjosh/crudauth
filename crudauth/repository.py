@@ -131,8 +131,11 @@ class UserRepository:
 
     def string_length(self, logical: str) -> int | None:
         """Return the resolved SQLAlchemy ``String`` column length, if known."""
-        column = self.model.__table__.columns.get(self.col(logical))
-        if column is None or not isinstance(column.type, String):
+        try:
+            column = self._attr(logical).property.columns[0]
+        except (AttributeError, IndexError):
+            return None
+        if not isinstance(column.type, String):
             return None
         return column.type.length
 

@@ -96,7 +96,7 @@ async def test_oauth_usernames_fit_column_and_suffixes(short_sessionmaker) -> No
     async with short_sessionmaker() as db:
         user, _ = await service.get_or_create_user(info, db)
         assert user.username == "very_long_di"
-        assert user.name == "__Very "
+        assert user.name == "__Very"
 
         second = info.model_copy(update={"provider_user_id": "g-2", "email": "second@example.com"})
         user2, _ = await service.get_or_create_user(second, db)

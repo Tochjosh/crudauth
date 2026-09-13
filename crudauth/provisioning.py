@@ -72,7 +72,7 @@ class NewUserContext:
             value = self.email.split("@")[0]
         else:
             value = self.username
-        return value[: self.name_max_length] if self.name_max_length else value
+        return (value[: self.name_max_length] if self.name_max_length else value).rstrip()
 
 
 NewUserFields = Callable[
