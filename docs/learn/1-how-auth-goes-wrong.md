@@ -53,7 +53,7 @@ The fix is an allowlist: decide which fields a signup is allowed to set, and dro
 
 Two related mistakes show up once OAuth is involved - the first is an open redirect: a "send me back where I was" parameter that isn't validated lets an attacker craft a link on *your* domain that bounces the user to *theirs*, which is exactly what makes phishing convincing. The second is an OAuth `state` that isn't tied to the browser that started the flow, which lets an attacker complete a sign-in as themselves inside the victim's browser.
 
-CRUDAuth checks the post-login redirect against an allowlist, and binds the OAuth `state` to a cookie set when the flow begins, so a forged or replayed callback can't go through.
+CRUDAuth only follows a post-login redirect that's a same-origin relative path, and binds the OAuth `state` to a cookie set when the flow begins, so a forged or replayed callback can't go through.
 
 ## None of this is clever
 

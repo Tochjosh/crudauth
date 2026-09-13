@@ -35,8 +35,13 @@ is `{redirect_base_url}/oauth/{provider}/callback`.
 </p>
 
 CRUDAuth binds the `state` parameter to the initiating browser via a cookie, so a stolen or
-forged callback can't complete someone else's login. The redirect target after login is
-validated against an allowlist to prevent open redirects.
+forged callback can't complete someone else's login. The redirect target after login must be
+a same-origin relative path; anything else falls back to the default, which prevents open
+redirects.
+
+For hand-written post-login or post-logout redirects, reuse
+[`safe_redirect_path`](../../api/utils.md) rather than accepting a client-supplied URL
+directly. It accepts only single-slash relative paths and falls back to `/` by default.
 
 ## Account linking
 

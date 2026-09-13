@@ -1,7 +1,6 @@
 """Builds the ``/oauth/{provider}/authorize`` and ``/oauth/{provider}/callback`` routes."""
 
 from typing import TYPE_CHECKING, Annotated, Any
-from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import RedirectResponse
@@ -11,6 +10,7 @@ from ..core import AuthRuntime
 from ..exceptions import BadRequestException
 from ..hooks import HookContext
 from ..storage.base import AbstractSessionStorage
+from ..utils import safe_redirect_path
 from .constants import OAUTH_STATE_COOKIE_NAME
 from .provider import AbstractOAuthProvider, _require_httpx
 from .schemas import OAuthState
@@ -47,24 +47,6 @@ def build_oauth_router(
     """
     router = APIRouter(prefix="/oauth", tags=["oauth"])
     db_dep = runtime.db_dependency
-
-    def _safe_redirect(target: str | None) -> str:
-        """Only allow same-origin relative paths, to block open-redirect abuse.
-
-        Accepts a target only when it is a single-slash-rooted relative path with
-        no scheme and no host. Rejected: absolute URLs (``https://evil.com``),
-        protocol-relative (``//evil.com``), backslash tricks (``/\\evil.com``,
-        which several browsers normalize to ``//evil.com``), and anything with
-        control characters. Anything rejected falls back to ``default_redirect``.
-        """
-        if not target or not target.startswith("/") or target.startswith("//"):
-            return default_redirect
-        if "\\" in target or any(ord(c) < 0x20 for c in target):
-            return default_redirect
-        parts = urlsplit(target)
-        if parts.scheme or parts.netloc:
-            return default_redirect
-        return target
 
     def _provider(name: str) -> AbstractOAuthProvider:
         provider = providers.get(name)
@@ -187,7 +169,7 @@ def build_oauth_router(
             user_id=runtime.repo.user_id(user),
             metadata={"login_type": "oauth", "oauth_provider": provider},
         )
-        redirect_url = _safe_redirect(state_data.redirect_to)
+        redirect_url = safe_redirect_path(state_data.redirect_to, default=default_redirect)
         redirect = RedirectResponse(url=redirect_url, status_code=307)
         session_manager.set_session_cookies(redirect, session_id, csrf)
         redirect.delete_cookie(OAUTH_STATE_COOKIE_NAME, path=session_manager.cookie_path)
