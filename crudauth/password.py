@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Callable
 
@@ -37,13 +38,18 @@ class PasswordPolicy:
             raise ValueError("Password must contain " + ", ".join(errors) + ".")
 
 
-def validate_password(password: str, policy: PasswordValidator) -> None:
-    """Apply a policy and expose failures as a 422 response."""
+async def validate_password(password: str, policy: PasswordValidator) -> None:
+    """Apply a policy and expose failures as a 422 response.
+
+    Supports both sync and async validators. Async validators are awaited.
+    """
     try:
-        policy(password)
+        result = policy(password)
+        if inspect.isawaitable(result):
+            await result
     except UnprocessableEntityException:
         raise
-    except (TypeError, ValueError) as exc:
+    except ValueError as exc:
         raise UnprocessableEntityException(str(exc) or "Password does not meet policy.") from exc
 
 

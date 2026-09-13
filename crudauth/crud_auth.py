@@ -25,6 +25,7 @@ from .constants import (
     DEFAULT_LOGIN_LOCKOUT_BASE_SECONDS,
     DEFAULT_LOGIN_LOCKOUT_MAX_SECONDS,
     DEFAULT_LOGIN_MAX_ATTEMPTS,
+    MIN_PASSWORD_LENGTH,
     OAUTH_STATE_TTL_SECONDS,
     USED_TOKEN_TTL_SECONDS,
 )
@@ -73,12 +74,12 @@ __all__ = ["CRUDAuth"]
 
 
 class _SetPasswordIn(BaseModel):
-    new_password: str
+    new_password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
 
 
 class _ChangePasswordIn(BaseModel):
     current_password: str
-    new_password: str
+    new_password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
 
 
 class SessionInfo(BaseModel):
@@ -438,9 +439,9 @@ class CRUDAuth:
         )
 
     # --- public: session manager --------------------------------------------
-    def validate_password(self, password: str) -> None:
+    async def validate_password(self, password: str) -> None:
         """Validate a plaintext password using this auth surface's policy."""
-        validate_password(password, self.password_policy)
+        await validate_password(password, self.password_policy)
 
     @property
     def sessions(self):
@@ -886,7 +887,7 @@ class CRUDAuth:
                 requires first-password establishment to be browser-only.
             """
             user = principal.user
-            self.validate_password(body.new_password)
+            await self.validate_password(body.new_password)
             if not is_unusable_password(self.repo.get(user, "hashed_password", "")):
                 raise BadRequestException(
                     "Account already has a password; use the password reset flow to change it."
@@ -929,7 +930,7 @@ class CRUDAuth:
                 )
             if not verify_password(body.current_password, current_hash):
                 raise UnauthorizedException("Current password is incorrect.")
-            self.validate_password(body.new_password)
+            await self.validate_password(body.new_password)
             await self.repo.update(
                 db, user, {"hashed_password": get_password_hash(body.new_password)}
             )

@@ -11,8 +11,9 @@ mounts when the model actually has an email column.
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, EmailStr, create_model
+from pydantic import BaseModel, EmailStr, Field, create_model
 
+from ..constants import MIN_PASSWORD_LENGTH
 from ..principal import Principal
 from ..ratelimit import KeyBy
 from .service import EmailFlowService
@@ -26,7 +27,7 @@ class _TokenIn(BaseModel):
 
 class _ResetIn(BaseModel):
     token: str
-    new_password: str
+    new_password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
 
 
 class _ChangeIn(BaseModel):
@@ -95,7 +96,7 @@ def build_email_router(*, auth: Any, service: EmailFlowService) -> APIRouter:
     @router.post("/password/reset-confirm")
     async def reset(body: _ResetIn, db: Annotated[Any, Depends(db_dep)]):
         """Reset the password from a valid token and evict the user's other sessions."""
-        auth.validate_password(body.new_password)
+        await auth.validate_password(body.new_password)
         await service.reset_password(db, body.token, body.new_password)
         return {"detail": "Password reset successfully."}
 

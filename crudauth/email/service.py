@@ -338,7 +338,7 @@ class EmailFlowService:
         user = await self.repo.get_by_id(db, sub)
         if user is None:
             raise BadRequestException("Invalid or expired token")
-        validate_password(new_password, self.password_policy)
+        await validate_password(new_password, self.password_policy)
         if not await self._consume(token, self.reset_ttl_hours * SECONDS_PER_HOUR):
             raise BadRequestException("Token already used")
         await self.repo.update(db, user, {"hashed_password": get_password_hash(new_password)})

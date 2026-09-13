@@ -10,9 +10,10 @@ from collections.abc import Awaitable
 from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, Request, Response, status
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.exc import IntegrityError
 
+from ..constants import MIN_PASSWORD_LENGTH
 from ..exceptions import DuplicateValueException
 from ..hooks import HookContext
 from ..provisioning import NewUserContext, resolve_new_user_fields
@@ -39,7 +40,7 @@ class RegisterIn(BaseModel):
 
     email: EmailStr
     username: str
-    password: str
+    password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
 
 
 def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter:
@@ -89,7 +90,7 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
         login_fields = auth.identity.login
         data = cast(BaseModel, body).model_dump()
         password = data.pop("password")
-        auth.validate_password(password)
+        await auth.validate_password(password)
         submitted = dict(data)
         data = auth.repo.filter_registration_data(data)
         login_values = {f: data.pop(f) for f in login_fields}
