@@ -573,33 +573,52 @@ class CRUDAuth:
         - one transport loop, one user load, one CSRF check - instead of running
         it once per dependency. Gates (superuser/scopes/check) are still applied
         per call by the caller, on the shared principal.
+
+        The cache stores only identity snapshots (no ORM user object), so a
+        middleware-resolved principal can be safely rehydrated through a route's
+        own DB session without detached-instance errors.
         """
         cache = getattr(request.state, "_crudauth_principals", None)
         if cache is None:
             cache = {}
             request.state._crudauth_principals = cache
         key = tuple(t.name for t in selected)
+
         if key in cache:
-            principal = cache[key]
-            # A middleware lookup is deliberately read-only. Upgrade its cached
-            # result for a later dependency without loading the user again.
-            if key in getattr(request.state, "_crudauth_read_only", set()):
-                if principal is not None and principal.transport == "session":
-                    session_transport = next(t for t in selected if t.name == "session")
-                    assert isinstance(session_transport, SessionTransport)
-                    session_id = principal.metadata.get("session_id")
-                    if enforce_csrf or update_activity:
-                        session = await session_transport.manager.validate_session(
+            snapshot = cache[key]
+            if snapshot is None:
+                return None
+
+            # Rehydrate: load the user through the route's DB session.
+            user = await self.repo.get_by_id(db, snapshot["user_id"])
+            if user is None or not self.repo.is_active(user):
+                return None
+
+            principal = Principal(
+                user_id=snapshot["user_id"],
+                scopes=snapshot["scopes"],
+                transport=snapshot["transport"],
+                user=user,
+                is_superuser=snapshot["is_superuser"],
+                email_verified=snapshot["email_verified"],
+                recovery_verified=snapshot["recovery_verified"],
+                metadata=snapshot["metadata"],
+            )
+
+            # Enforce CSRF on unsafe methods when upgrading from middleware.
+            if enforce_csrf and request.method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+                transport = next((t for t in selected if t.name == snapshot["transport"]), None)
+                if isinstance(transport, SessionTransport) and transport.manager is not None:
+                    session_id = snapshot["metadata"].get("session_id")
+                    if session_id:
+                        session = await transport.manager.validate_session(
                             session_id, update_activity=update_activity
                         )
                         if session is None:
-                            cache[key] = None
                             return None
-                        if enforce_csrf:
-                            await session_transport._enforce_csrf(request, session_id)
-                if enforce_csrf:
-                    request.state._crudauth_read_only.discard(key)
-            return cache[key]
+                        await transport._enforce_csrf(request, session_id)
+            return principal
+
         ctx = AuthContext(
             request=request,
             db=db,
@@ -612,14 +631,36 @@ class CRUDAuth:
             principal = await t.authenticate(request, ctx)
             if principal is not None:
                 break
-        cache[key] = principal
-        if not enforce_csrf:
-            read_only = getattr(request.state, "_crudauth_read_only", None)
-            if read_only is None:
-                read_only = set()
-                request.state._crudauth_read_only = read_only
-            read_only.add(key)
+
+        # Only cache successful results; never cache None so a later
+        # dependency still raises 401 for tampered/missing credentials.
+        if principal is not None:
+            cache[key] = {
+                "user_id": principal.user_id,
+                "scopes": principal.scopes,
+                "transport": principal.transport,
+                "is_superuser": principal.is_superuser,
+                "email_verified": principal.email_verified,
+                "recovery_verified": principal.recovery_verified,
+                "metadata": dict(principal.metadata),
+            }
         return principal
+
+    async def _open_session(self) -> tuple[Any, Callable | None]:
+        """Open a DB session from the configured dependency, handling all shapes."""
+        provided = self.session()
+        close = None
+        if inspect.isawaitable(provided):
+            db = await provided
+        elif inspect.isasyncgen(provided):
+            db = await anext(provided)
+            close = provided.aclose
+        elif inspect.isgenerator(provided):
+            db = next(provided)
+            close = provided.close
+        else:
+            db = provided
+        return db, close
 
     async def resolve_principal(
         self, request: Request, update_activity: bool = False
@@ -633,29 +674,7 @@ class CRUDAuth:
         ``current_user()``.
         """
         selected = self.transports
-        cache = getattr(request.state, "_crudauth_principals", None)
-        key = tuple(t.name for t in selected)
-        if cache is not None and key in cache:
-            return await self._resolve_principal(
-                request,
-                None,
-                selected,
-                enforce_csrf=False,
-                update_activity=update_activity,
-            )
-
-        provided = self.session()
-        close = None
-        if inspect.isawaitable(provided):
-            db = await provided
-        elif inspect.isasyncgen(provided):
-            db = await anext(provided)
-            close = provided.aclose
-        elif inspect.isgenerator(provided):
-            db = next(provided)
-            close = provided.close
-        else:
-            db = provided
+        db, close = await self._open_session()
         try:
             try:
                 return await self._resolve_principal(
@@ -665,10 +684,9 @@ class CRUDAuth:
                     enforce_csrf=False,
                     update_activity=update_activity,
                 )
-            except (UnauthorizedException, CSRFException):
-                if cache is None:
-                    cache = getattr(request.state, "_crudauth_principals", {})
-                cache[key] = None
+            except UnauthorizedException:
+                # Don't cache - current_user() must re-run the transport
+                # so tampered credentials raise 401 instead of returning None.
                 return None
         finally:
             if close is not None:
