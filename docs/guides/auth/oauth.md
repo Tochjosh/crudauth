@@ -25,7 +25,8 @@ built-in ones.
 
 This adds two routes per provider: `GET /oauth/{provider}/authorize` (start the flow) and
 `GET /oauth/{provider}/callback` (finish it). The redirect URI you register with the provider
-is `{redirect_base_url}/oauth/{provider}/callback`.
+is `{redirect_base_url}/oauth/{provider}/callback`. Both the paths and the response format are
+configurable; see [Custom paths and JSON responses](#custom-paths-and-json-responses).
 
 ## The flow
 
@@ -63,6 +64,48 @@ configured), so a hand-written callback can reuse it:
 Add a provider by implementing the `AbstractOAuthProvider` port and registering it with
 `OAuthProviderFactory`, then pass its credentials in `oauth={...}` like the built-ins. See
 the [OAuth reference](../../api/oauth.md) for the port and factory.
+
+## Custom paths and JSON responses
+
+`oauth_paths` moves the routes. Both paths must contain `{provider}`:
+
+```python
+auth = CRUDAuth(
+    session=get_session, user_model=User, SECRET_KEY="change-me",
+    redirect_base_url="https://app.example.com",
+    transports=[SessionTransport()],
+    oauth={"google": OAuthCredentials(client_id="...", client_secret="...")},
+    oauth_paths={
+        "prefix": "/api/v1/auth/oauth",
+        "authorize_path": "/{provider}",
+        "callback_path": "/callback/{provider}",
+    },
+)
+```
+
+The redirect URI follows the same paths, here
+`https://app.example.com/api/v1/auth/oauth/callback/google`. CRUDAuth doesn't see a prefix
+you add when mounting (`app.include_router(auth.router, prefix="/api")`), so include that
+prefix in `redirect_base_url` as well.
+
+`auth.oauth_router` returns only the OAuth routes, for apps that mount their own auth routes
+instead of `auth.router`. Mount one or the other, not both.
+
+`oauth_response_mode="json"` is for single-page and mobile clients:
+
+- `authorize` returns `{"url": ...}` instead of redirecting, and still sets the state cookie.
+  The client then sends the browser to that URL.
+- `callback` returns `{"user": ..., "csrf_token": ..., "redirect_to": ...}` with the session
+  cookies set. `user` has the same fields as `/me`. A failed callback returns `400` with
+  `{"detail": "oauth_failed"}` instead of redirecting.
+
+The provider still sends the browser to the redirect URI, so in JSON mode that URI should be a
+frontend page: point `redirect_base_url` at the frontend, serve the callback path there, and
+have that page call the API's callback with the same `code` and `state`, using
+`fetch(url, {credentials: "include"})`. Call `authorize` with credentials too, so the browser
+keeps the state cookie. That cookie is `SameSite=Lax`, so the frontend and the API must be on
+the same site (for example `app.example.com` and `api.example.com`); a cross-site request
+doesn't send it and the callback returns `400`.
 
 ---
 
