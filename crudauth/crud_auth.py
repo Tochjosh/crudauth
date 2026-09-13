@@ -74,12 +74,20 @@ __all__ = ["CRUDAuth"]
 
 
 def _accepts_two_arguments(callback: Callable[..., Any]) -> bool:
-    """Keep legacy one-argument key callbacks working without masking errors."""
+    """Keep legacy one-argument key callbacks working without masking errors.
+
+    Only returns True when the callback has at least 2 *required* positional
+    parameters, so ``def key(request, extra=None)`` is treated as legacy.
+    """
     try:
-        inspect.signature(callback).bind(object(), object())
-    except (TypeError, ValueError):
+        params = inspect.signature(callback).parameters
+    except (ValueError, TypeError):
         return False
-    return True
+    required_positional = sum(
+        1 for p in params.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
+    )
+    return required_positional >= 2
 
 
 class _SetPasswordIn(BaseModel):
@@ -874,6 +882,58 @@ class CRUDAuth:
         return selected
 
     # --- the rate_limit() factory -------------------------------------------
+    async def _resolve_from_cache_or_session(
+        self, request: Request, db: Any
+    ) -> Principal | None:
+        """Resolve principal from cache or through the given DB session.
+
+        Used by rate-limit dependencies that share the route's DB session,
+        avoiding the middleware's separate session.
+        """
+        cache = getattr(request.state, "_crudauth_principals", None)
+        key = tuple(t.name for t in self.transports)
+        if cache is not None and key in cache:
+            snapshot = cache[key]
+            if snapshot is None:
+                return None
+            user = await self.repo.get_by_id(db, snapshot["user_id"])
+            if user is None or not self.repo.is_active(user):
+                return None
+            return Principal(
+                user_id=snapshot["user_id"],
+                scopes=snapshot["scopes"],
+                transport=snapshot["transport"],
+                user=user,
+                is_superuser=snapshot["is_superuser"],
+                email_verified=snapshot["email_verified"],
+                recovery_verified=snapshot["recovery_verified"],
+                metadata=snapshot["metadata"],
+            )
+        ctx = AuthContext(
+            request=request,
+            db=db,
+            runtime=self.runtime,
+            enforce_csrf=False,
+            update_activity=True,
+        )
+        for t in self.transports:
+            principal = await t.authenticate(request, ctx)
+            if principal is not None:
+                if cache is None:
+                    cache = {}
+                    request.state._crudauth_principals = cache
+                cache[key] = {
+                    "user_id": principal.user_id,
+                    "scopes": principal.scopes,
+                    "transport": principal.transport,
+                    "is_superuser": principal.is_superuser,
+                    "email_verified": principal.email_verified,
+                    "recovery_verified": principal.recovery_verified,
+                    "metadata": dict(principal.metadata),
+                }
+                return principal
+        return None
+
     def rate_limit(
         self,
         action: str,
@@ -922,8 +982,10 @@ class CRUDAuth:
 
         if key is KeyBy.USER_OR_IP:
 
-            async def by_user_or_ip(request: Request, response: Response) -> None:
-                principal = await self.resolve_principal(request)
+            async def by_user_or_ip(
+                request: Request, response: Response, db: Annotated[Any, Depends(self.session)]
+            ) -> None:
+                principal = await self._resolve_from_cache_or_session(request, db)
                 ident = (
                     f"user:{principal.user_id}"
                     if principal is not None
@@ -935,17 +997,21 @@ class CRUDAuth:
 
         if key is KeyBy.IP:
 
-            async def by_ip(request: Request, response: Response) -> None:
+            async def by_ip(
+                request: Request, response: Response, db: Annotated[Any, Depends(self.session)]
+            ) -> None:
                 ip = get_client_ip(request, self.runtime.trusted_proxy_hops)
-                principal = await self.resolve_principal(request) if dynamic else None
+                principal = await self._resolve_from_cache_or_session(request, db) if dynamic else None
                 await self._apply_rate_limit(response, action, ip, resolved, request, principal)
 
             return by_ip
 
         keyfn = key
 
-        async def by_custom(request: Request, response: Response) -> None:
-            principal = await self.resolve_principal(request) if needs_principal else None
+        async def by_custom(
+            request: Request, response: Response, db: Annotated[Any, Depends(self.session)]
+        ) -> None:
+            principal = await self._resolve_from_cache_or_session(request, db) if needs_principal else None
             ident = keyfn(request, principal) if key_accepts_principal else keyfn(request)
             await self._apply_rate_limit(response, action, ident, resolved, request, principal)
 
