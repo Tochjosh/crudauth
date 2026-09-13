@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable
 
 from .constants import MIN_PASSWORD_LENGTH
 from .exceptions import UnprocessableEntityException
 
-PasswordValidator = Callable[[str], None]
+PasswordValidator = Callable[[str], None | Awaitable[None]]
 
 
 @dataclass(frozen=True)
