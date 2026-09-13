@@ -22,17 +22,17 @@ if TYPE_CHECKING:  # pragma: no cover
 
 __all__ = ["build_oauth_router"]
 
-_OAUTH_SENSITIVE_FIELDS = frozenset({
-    "hashed_password", "token_version", "is_superuser", "is_active",
-    "email_verified", "recovery_verified", "google_id", "github_id",
-})
 
-
-def _safe_user_payload(user: Any, repo: Any) -> dict[str, Any]:
-    """Return a minimal, safe user dict for JSON responses."""
-    d = repo.to_dict(user)
-    filtered = {k: v for k, v in d.items() if k not in _OAUTH_SENSITIVE_FIELDS}
-    return jsonable_encoder(filtered)
+def _user_payload(user: Any, repo: Any) -> dict[str, Any]:
+    """The identity fields ``/me`` returns, for the JSON callback response."""
+    return jsonable_encoder(
+        {
+            "user_id": repo.user_id(user),
+            "username": repo.get(user, "username"),
+            "email": repo.get(user, "email"),
+            "is_superuser": repo.is_superuser(user),
+        }
+    )
 
 
 def build_oauth_router(
@@ -66,9 +66,7 @@ def build_oauth_router(
         raise ValueError("response_mode must be 'redirect' or 'json'")
     for path_template in (authorize_path, callback_path):
         if "{provider}" not in path_template:
-            raise ValueError(
-                f"OAuth path {path_template!r} must contain '{{provider}}'"
-            )
+            raise ValueError(f"OAuth path {path_template!r} must contain '{{provider}}'")
     router = APIRouter(prefix=prefix, tags=["oauth"])
     db_dep = runtime.db_dependency
 
@@ -213,7 +211,11 @@ def build_oauth_router(
         )
         if response_mode == "json":
             result = JSONResponse(
-                {"user": _safe_user_payload(user, runtime.repo), "csrf_token": csrf, "redirect_to": redirect_url}
+                {
+                    "user": _user_payload(user, runtime.repo),
+                    "csrf_token": csrf,
+                    "redirect_to": redirect_url,
+                }
             )
             session_manager.set_session_cookies(result, session_id, csrf)
             _clear_state_cookie(result)

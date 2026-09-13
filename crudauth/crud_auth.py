@@ -172,9 +172,14 @@ class CRUDAuth:
             oauth_paths: Optional OAuth router paths: ``prefix``,
                 ``authorize_path``, and ``callback_path``. Defaults to
                 ``{"prefix": "/oauth", "authorize_path": "/{provider}/authorize",
-                "callback_path": "/{provider}/callback"}``.
-            oauth_response_mode: OAuth response mode, ``"redirect"`` (default)
-                or ``"json"``.
+                "callback_path": "/{provider}/callback"}``. Both paths must contain
+                ``{provider}``. The provider redirect URI is ``redirect_base_url``
+                plus ``prefix`` plus the callback path, so ``redirect_base_url``
+                must include any prefix the app adds when mounting the router.
+            oauth_response_mode: ``"redirect"`` (default) or ``"json"``. In JSON
+                mode ``authorize`` returns ``{"url": ...}`` and ``callback``
+                returns ``{"user": ..., "csrf_token": ..., "redirect_to": ...}``
+                with the session cookies set, or a ``400`` on failure.
             email: An [EmailConfig][crudauth.email.config.EmailConfig] to enable
                 verify/reset/change flows over email (the built-in delivery
                 channel); ``None`` disables email delivery. Either ``email`` or
@@ -525,12 +530,17 @@ class CRUDAuth:
         if not redirect_base_url:
             raise ValueError("redirect_base_url is required when oauth=... is configured")
 
-        paths = {
+        default_paths = {
             "prefix": "/oauth",
             "authorize_path": "/{provider}/authorize",
             "callback_path": "/{provider}/callback",
-            **(oauth_paths or {}),
         }
+        unknown_paths = sorted(set(oauth_paths or {}) - set(default_paths))
+        if unknown_paths:
+            raise ValueError(
+                f"Unknown oauth_paths key(s) {unknown_paths}; expected {sorted(default_paths)}."
+            )
+        paths = {**default_paths, **(oauth_paths or {})}
         providers = {}
         for name, creds in oauth.items():
             if not self.repo.has(f"{name}_id"):
@@ -542,9 +552,7 @@ class CRUDAuth:
                 )
             callback_route = paths["callback_path"].replace("{provider}", name)
             route = "/".join(
-                part.strip("/")
-                for part in (paths["prefix"], callback_route)
-                if part.strip("/")
+                part.strip("/") for part in (paths["prefix"], callback_route) if part.strip("/")
             )
             redirect_uri = f"{redirect_base_url.rstrip('/')}/{route}"
             providers[name] = OAuthProviderFactory.create_provider(

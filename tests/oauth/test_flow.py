@@ -137,9 +137,7 @@ async def test_json_authorize_and_callback_keep_cookies(json_client) -> None:
     assert r.json()["csrf_token"]
     assert r.json()["redirect_to"] == "/dashboard"
     assert "session_id=" in " ".join(r.headers.get_list("set-cookie"))
-    # Verify sensitive fields are not leaked
-    assert "hashed_password" not in r.json()["user"]
-    assert "token_version" not in r.json()["user"]
+    assert set(r.json()["user"]) == {"user_id", "username", "email", "is_superuser"}
 
 
 async def test_json_callback_requires_state_cookie(json_client) -> None:
@@ -149,6 +147,13 @@ async def test_json_callback_requires_state_cookie(json_client) -> None:
 
     r = await json_client.get(f"/oauth/stub/callback?code=abc&state={state}")
     assert r.status_code == 400
+
+
+async def test_json_callback_provider_error_returns_json_400(json_client) -> None:
+    r = await json_client.get("/oauth/stub/callback?error=access_denied&state=whatever")
+    assert r.status_code == 400
+    assert r.json() == {"detail": "oauth_failed"}
+    assert "location" not in r.headers
 
 
 @pytest.fixture
@@ -183,10 +188,29 @@ async def test_custom_oauth_paths_match_provider_redirect_uri(custom_path_client
     query = parse_qs(urlparse(r.json()["url"]).query)
     assert query["redirect_uri"] == ["http://test/api/v1/auth/oauth/callback/stub"]
     state = query["state"][0]
-    r = await custom_path_client.get(
-        f"/api/v1/auth/oauth/callback/stub?code=abc&state={state}"
-    )
+    r = await custom_path_client.get(f"/api/v1/auth/oauth/callback/stub?code=abc&state={state}")
     assert r.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("oauth_paths", "message"),
+    [
+        ({"authorize_path": "/login"}, r"must contain '\{provider\}'"),
+        ({"callback_path": "/callback"}, r"must contain '\{provider\}'"),
+        ({"callbak_path": "/{provider}/cb"}, "callbak_path"),
+    ],
+)
+def test_invalid_oauth_paths_fail_fast(get_session, UserModel, oauth_paths, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        CRUDAuth(
+            session=get_session,
+            user_model=UserModel,
+            SECRET_KEY="test-secret-key-0123456789-0123456789",
+            transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+            oauth={"stub": OAuthCredentials(client_id="id", client_secret="sec")},
+            redirect_base_url="http://test",
+            oauth_paths=oauth_paths,
+        )
 
 
 def test_oauth_provider_without_id_column_fails_fast(get_session, UserModel) -> None:
