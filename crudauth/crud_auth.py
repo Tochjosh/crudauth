@@ -937,6 +937,7 @@ class CRUDAuth:
                     "email_verified": principal.email_verified,
                     "recovery_verified": principal.recovery_verified,
                     "metadata": dict(principal.metadata),
+                    "csrf_enforced": False,
                 }
                 return principal
         return None
