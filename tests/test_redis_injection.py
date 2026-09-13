@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import fakeredis.aioredis
 import pytest
 
@@ -39,6 +41,8 @@ async def test_injected_redis_is_shared_and_not_closed(get_session, UserModel) -
 
     assert isinstance(auth.runtime.rate_limiter, RedisBackend)
     assert auth.runtime.rate_limiter.client is client
+    assert isinstance(auth.sessions.storage, RedisSessionStorage)
+    assert isinstance(auth.sessions.csrf_storage, RedisSessionStorage)
     assert auth.sessions.storage.client is client
     assert auth.sessions.csrf_storage.client is client
 
@@ -49,7 +53,7 @@ async def test_injected_redis_is_shared_and_not_closed(get_session, UserModel) -
 
 def test_injected_storage_client_is_caller_owned() -> None:
     client = redis_client()
-    storage = RedisSessionStorage(client=client)
+    storage: RedisSessionStorage[Any] = RedisSessionStorage(client=client)
     assert storage._owns_client is False
 
 
@@ -74,6 +78,8 @@ async def test_injected_redis_reaches_email_and_oauth_stores(get_session, UserMo
         warn_on_memory_backend=False,
     )
 
+    assert isinstance(auth._email_token_store, RedisSessionStorage)
+    assert isinstance(auth._oauth_state_storage, RedisSessionStorage)
     assert auth._email_token_store.client is client
     assert auth._oauth_state_storage.client is client
 
