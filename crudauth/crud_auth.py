@@ -214,11 +214,12 @@ class CRUDAuth:
                 [MemoryRateLimiterBackend][crudauth.ratelimit.backends.memory.MemoryRateLimiterBackend]. Use
                 ``redis_rate_limiter(...)`` in production.
             redis_url: Redis URL for the used-token/OAuth-state stores and the default
-                rate limiter. Mutually exclusive with ``redis_client``.
+                rate limiter. Mutually exclusive with ``redis_client`` (passing both
+                raises ``ValueError``; prior versions silently preferred ``client``).
             redis_client: Existing async Redis client for the used-token/OAuth-state
                 stores and default rate limiter. The caller owns its lifecycle and
                 must use ``decode_responses=False``. Mutually exclusive with
-                ``redis_url``.
+                ``redis_url`` (passing both raises ``ValueError``).
             rate_limits: Per-action overrides merged over
                 :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS`.
             trusted_proxy_hops: Number of trusted reverse proxies in front of the

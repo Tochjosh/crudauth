@@ -53,6 +53,7 @@ class SessionTransport(Transport):
         redis_url: Connection URL when ``backend="redis"``.
         redis_client: Existing async Redis client for session and CSRF state. The
             caller owns its lifecycle and should use ``decode_responses=False``.
+            Mutually exclusive with ``redis_url`` (passing both raises ``ValueError``).
         csrf: Enforce the synchronizer-token header on unsafe methods (default ``True``).
         cookies: Per-transport [CookieConfig][crudauth.core.CookieConfig] override.
         login_max_attempts: Failed logins before the escalating lockout trips.
