@@ -35,7 +35,6 @@ from .email.router import build_email_router
 from .email.service import EmailFlowService
 from .exceptions import (
     BadRequestException,
-    CSRFException,
     ForbiddenException,
     NotFoundException,
     RateLimitException,
@@ -594,7 +593,7 @@ class CRUDAuth:
             if user is None or not self.repo.is_active(user):
                 return None
 
-            principal = Principal(
+            cached_principal = Principal(
                 user_id=snapshot["user_id"],
                 scopes=snapshot["scopes"],
                 transport=snapshot["transport"],
@@ -617,7 +616,7 @@ class CRUDAuth:
                         if session is None:
                             return None
                         await transport._enforce_csrf(request, session_id)
-            return principal
+            return cached_principal
 
         ctx = AuthContext(
             request=request,
@@ -646,10 +645,10 @@ class CRUDAuth:
             }
         return principal
 
-    async def _open_session(self) -> tuple[Any, Callable | None]:
+    async def _open_session(self) -> tuple[Any, Callable[[], Any] | None]:
         """Open a DB session from the configured dependency, handling all shapes."""
         provided = self.session()
-        close = None
+        close: Callable[[], Any] | None = None
         if inspect.isawaitable(provided):
             db = await provided
         elif inspect.isasyncgen(provided):
