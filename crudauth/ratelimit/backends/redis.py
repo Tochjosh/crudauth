@@ -26,12 +26,10 @@ class RedisBackend(RateLimiterBackend):
         client: Any = None,
         prefix: str = REDIS_KEY_PREFIX,
     ):
-        if client is not None and redis_url is not None:
-            raise ValueError("client and redis_url are mutually exclusive")
         if client is not None:
             self.client = client
             self._owns_client = False
-        else:
+        elif redis_url is not None:
             try:
                 from redis.asyncio import Redis
             except ImportError as exc:  # pragma: no cover

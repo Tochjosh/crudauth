@@ -444,7 +444,13 @@ class CRUDAuth:
         memory: list[str] = []
         if isinstance(self.runtime.rate_limiter, MemoryRateLimiterBackend):
             memory.append("rate limiter (lockout/throttle counters)")
-        if self._backend_config()[0] == BACKEND_MEMORY:
+        # Check the session transport's backend separately from the
+        # CRUDAuth-level client. A CRUDAuth-level redis_client doesn't
+        # change the session transport's backend from memory to redis.
+        session_backend = (
+            self._session_transport.backend if self._session_transport is not None else BACKEND_MEMORY
+        )
+        if session_backend == BACKEND_MEMORY and self.redis_client is None and self.redis_url is None:
             memory.append("sessions/CSRF and one-time-token/OAuth-state stores")
         if not memory:
             return
