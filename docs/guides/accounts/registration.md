@@ -27,8 +27,13 @@ curl -X POST http://localhost:8000/register \
   -d '{"email": "alice@example.com", "username": "alice", "password": "hunter2..."}'
 ```
 
-`password` enforces `MIN_PASSWORD_LENGTH` (8). On success the `on_after_register` hook fires,
-and if email verification is configured, a verification email is sent.
+`password` must meet the [password policy](passwords.md#password-policy), 8 characters by
+default. A value longer than its `String(n)` column is
+rejected before anything is written, whether it comes from the default body or a custom
+`register_schema`, with a `422` in FastAPI's validation-error format: one `string_too_long` entry
+per field, like the password rule's `string_too_short`. An email is measured the way it's
+stored, trimmed and lowercased. On success the `on_after_register` hook fires, and if email
+verification is configured, a verification email is sent.
 
 ## Persisting extra fields
 
@@ -41,16 +46,18 @@ auth = CRUDAuth(..., register_extra_fields={"full_name", "locale"})
 To also accept those fields in the request body, supply a custom `register_schema`:
 
 ```python
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr
 
 class RegisterIn(BaseModel):
     email: EmailStr
     username: str
-    password: str = Field(min_length=8)
+    password: str
     full_name: str | None = None
 
 auth = CRUDAuth(..., register_schema=RegisterIn, register_extra_fields={"full_name"})
 ```
+
+The password policy runs on a custom schema too, so `password` doesn't need its own length rule.
 
 A field declared in the schema but not opted into `register_extra_fields` is dropped (with a
 startup warning). CRUDAuth's privileged fields (`is_superuser`, `email_verified`, ...) can
@@ -77,8 +84,8 @@ auth = CRUDAuth(..., new_user_fields=new_user_fields)
 The callback gets a [`NewUserContext`](../../api/provisioning.md): `email`, `username`,
 `source` (`"register"` or `"oauth"`), the live `db`, the validated `register_data`, and the
 `oauth` profile, so you can branch on the path or derive from the provider. `ctx.suggested_name`
-is the OAuth display name, with the email local-part as a fallback. Return a dict or a Pydantic
-model.
+is the OAuth display name, with the email local-part as a fallback. It isn't truncated, so slice
+it to fit a length-limited column (`ctx.suggested_name[:50]`). Return a dict or a Pydantic model.
 
 The difference from `register_extra_fields` is the trust boundary: this is fed a server-built
 context, never the request body, so a client can't set these values. `new_user_defaults` merges

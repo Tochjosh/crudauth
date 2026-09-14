@@ -19,10 +19,10 @@ Present whenever `auth.router` is included, regardless of transports.
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| POST | `/register` | none | Create an account. Strict field allowlist. ([Registration](../guides/accounts/registration.md)) |
+| POST | `/register` | none | Create an account. Strict field allowlist; `422` for a password that fails the [policy](../guides/accounts/passwords.md#password-policy) or a value longer than its column. ([Registration](../guides/accounts/registration.md)) |
 | GET | `/me` | any | The authenticated user's id, scopes, and transport. |
-| POST | `/set-password` | authenticated | First password for an OAuth-only account; `400` if one already exists. ([Passwords](../guides/accounts/passwords.md#setting-a-password-on-an-oauth-only-account)) |
-| POST | `/change-password` | authenticated | Change a known password; `401` wrong current, `400` if unusable. Bumps `token_version`, revokes other sessions. ([Passwords](../guides/accounts/passwords.md#changing-a-known-password)) |
+| POST | `/set-password` | authenticated | First password for an OAuth-only account; `400` if one already exists, `422` if it fails the password policy. ([Passwords](../guides/accounts/passwords.md#setting-a-password-on-an-oauth-only-account)) |
+| POST | `/change-password` | authenticated | Change a known password; `401` wrong current, `400` if unusable, `422` if the new one fails the password policy. Bumps `token_version`, revokes other sessions. ([Passwords](../guides/accounts/passwords.md#changing-a-known-password)) |
 
 ## Session transport
 
@@ -63,13 +63,13 @@ bodies are shaped to the factor (`{"email": ...}` or `{"phone": ...}`). ([Email 
 | POST | `/email/verify-request` | none | Send a verification link/code. Non-enumerable (uniform response). |
 | POST | `/email/verify-confirm` | none | `{"token"}` → marks the recovery factor verified. |
 | POST | `/password/reset-request` | none | Send a reset link/code. Non-enumerable. |
-| POST | `/password/reset-confirm` | none | `{"token", "new_password"}`; evicts the user's other sessions. |
-| POST | `/email/change-request` | authenticated | `{"new_email", "password"}`. Mounted only when the model has an `email` column. |
+| POST | `/password/reset-confirm` | none | `{"token", "new_password"}`; `422` if the password fails the policy, without using up the token. Evicts the user's other sessions. |
+| POST | `/email/change-request` | authenticated | `{"new_email", "password"}`; `422` if `new_email` is longer than the `email` column. Mounted only when the model has an `email` column. |
 | POST | `/email/change-confirm` | none | `{"token"}` → applies the new address. |
 
 ## OAuth
 
-Mounted per provider in `oauth={...}` (needs a `SessionTransport` + `redirect_base_url`). ([OAuth](../guides/auth/oauth.md))
+Mounted per provider in `oauth={...}` (needs a `SessionTransport` + `redirect_base_url`). The paths below are the defaults; `oauth_paths` and `oauth_response_mode` change the paths and switch both routes to JSON responses. ([OAuth](../guides/auth/oauth.md#custom-paths-and-json-responses))
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|

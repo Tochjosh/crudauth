@@ -152,7 +152,16 @@ Full flows, endpoints, the `kind` values, and the security rules: `references/em
 `register_extra_fields={"display_name"}`. For server-set columns (a default tier, a derived name),
 use `new_user_defaults={...}` (constants) or `new_user_fields=callback` (derived; runs on `/register`
 **and** OAuth signup). Privileged fields (`is_superuser`, `email_verified`, `token_version`, oauth ids,
-the PK) are never settable through any of these.
+the PK) are never settable through any of these. A client value longer than its `String(n)` column gets
+`422` on `/register` and `/email/change-request`, and an over-long provider email fails OAuth signup with
+`400`, before anything is written.
+
+New passwords (`/register`, `/set-password`, `/change-password`, `/password/reset-confirm`, and a direct
+`EmailFlowService.reset_password`) must meet `password_policy=PasswordPolicy(min_length=8, require_uppercase=...,
+require_lowercase=..., require_digit=..., require_special=..., validators=[...])`, failing with a validation-shaped
+`422` per unmet rule. A validator raises `ValueError`; one taking `(password, context)` gets a `PasswordContext`
+(`source`, `username`, `email`, `user`). Before hashing a password in your own code, call
+`await auth.validate_password(password, user=user, source="change")`.
 
 ---
 

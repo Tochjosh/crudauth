@@ -30,11 +30,11 @@ from .schemas import OAuthUserInfo
 __all__ = ["OAuthAccountService"]
 
 
-def _sanitize_username(raw: str) -> str:
+def _sanitize_username(raw: str, max_length: int) -> str:
     value = re.sub(r"[^a-z0-9]+", "_", (raw or "").lower()).strip("_")
     if len(value) < USERNAME_MIN_LENGTH:
         value = f"{USERNAME_FALLBACK}_{value}".strip("_")
-    return value[:USERNAME_MAX_LENGTH].strip("_") or USERNAME_FALLBACK
+    return value[:max_length].rstrip("_")
 
 
 class OAuthAccountService:
@@ -60,6 +60,7 @@ class OAuthAccountService:
         self.repo = repo
         self.new_user_fields = new_user_fields
         self.new_user_defaults = new_user_defaults or {}
+        self._username_max_length = repo.string_length("username") or USERNAME_MAX_LENGTH
 
     async def get_or_create_user(self, info: OAuthUserInfo, db: AsyncSession) -> tuple[Any, bool]:
         """Resolve an OAuth identity to a user; lookup order: provider id → email → create.
@@ -115,6 +116,12 @@ class OAuthAccountService:
                 f"The {info.provider} account did not provide an email address, "
                 "which is required to create an account."
             )
+        limit = self.repo.exceeds_length("email", canonical_email(info.email))
+        if limit is not None:
+            raise BadRequestException(
+                f"The {info.provider} email address is longer than the {limit} characters "
+                "this app accepts."
+            )
         user = await self._create_user(info, db)
         return user, True
 
@@ -168,12 +175,17 @@ class OAuthAccountService:
             or (info.email.split("@")[0] if info.email else None)
             or USERNAME_FALLBACK
         )
-        return _sanitize_username(candidate_raw)
+        return _sanitize_username(candidate_raw, self._username_max_length)
+
+    def _username_with_suffix(self, base: str, suffix: str) -> str:
+        available = self._username_max_length - len(suffix) - 1
+        if available <= 0:
+            return suffix[: self._username_max_length]
+        return f"{base[:available].rstrip('_')}_{suffix}"
 
     def _random_username(self, base: str) -> str:
         suffix = secrets.token_hex(USERNAME_RANDOM_SUFFIX_BYTES)
-        trimmed = base[: USERNAME_MAX_LENGTH - len(suffix) - 1]
-        return f"{trimmed}_{suffix}"
+        return self._username_with_suffix(base, suffix)
 
     async def _unique_username(self, db: AsyncSession, base: str) -> str:
         """Find an available username from ``base``: numbered suffixes then random.
@@ -187,8 +199,7 @@ class OAuthAccountService:
         if not await self.repo.username_exists(db, base):
             return base
         for n in range(1, USERNAME_MAX_SUFFIX_ATTEMPTS):
-            trimmed = base[: USERNAME_MAX_LENGTH - len(str(n)) - 1]
-            candidate = f"{trimmed}_{n}"
+            candidate = self._username_with_suffix(base, str(n))
             if not await self.repo.username_exists(db, candidate):
                 return candidate
         return self._random_username(base)

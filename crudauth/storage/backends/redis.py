@@ -37,7 +37,7 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
         if client is not None:
             self.client = client
             self._owns_client = False
-        elif redis_url is not None:
+        else:
             try:
                 from redis.asyncio import Redis
             except ImportError as exc:  # pragma: no cover

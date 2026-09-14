@@ -21,12 +21,12 @@ If the user types the value at signup (a display name, say), add it to your `reg
 opt the column into the write allowlist:
 
 ```python
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 class Register(BaseModel):
     email: str
     username: str
-    password: str = Field(min_length=8)
+    password: str
     display_name: str
 
 auth = CRUDAuth(
@@ -58,7 +58,8 @@ auth = CRUDAuth(
 
 `new_user_defaults` merges first, then `new_user_fields`, so a derived value can override a constant.
 `ctx.suggested_name` is the OAuth display name, falling back to the email local-part, so the same
-callback does the right thing on both signup paths.
+callback does the right thing on both signup paths. It isn't truncated, so slice it when your column
+is shorter than a provider's display name can be (`ctx.suggested_name[:50]`).
 
 ## See it in action
 

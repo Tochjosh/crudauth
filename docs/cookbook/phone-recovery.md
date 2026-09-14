@@ -66,7 +66,7 @@ factor-neutral here: a phone verification arrives as `verify_recovery`, not the 
 Declare the same shape to `CRUDAuth`, register the channel, and let `/register` accept the phone:
 
 ```python title="main.py"
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from crudauth import CRUDAuth, IdentityConfig
 from myapp.db import get_session
 from myapp.models import User
@@ -75,7 +75,7 @@ from myapp.sms import SmsChannel
 class Register(BaseModel):
     username: str
     phone: str
-    password: str = Field(min_length=8)
+    password: str
 
 auth = CRUDAuth(
     session=get_session, user_model=User, SECRET_KEY="change-me",

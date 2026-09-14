@@ -6,6 +6,7 @@ dependency-light.
 """
 
 from http import HTTPStatus
+from typing import Any
 
 from fastapi import HTTPException, status
 
@@ -17,6 +18,8 @@ __all__ = [
     "UnauthorizedException",
     "UnprocessableEntityException",
     "DuplicateValueException",
+    "ValueTooLongException",
+    "PasswordPolicyException",
     "RateLimitException",
     "SudoLockoutError",
     "CSRFException",
@@ -27,7 +30,7 @@ class CustomException(HTTPException):
     def __init__(
         self,
         status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail: str | None = None,
+        detail: Any = None,
         headers: dict[str, str] | None = None,
     ):
         if not detail:
@@ -63,6 +66,39 @@ class UnprocessableEntityException(CustomException):
 class DuplicateValueException(CustomException):
     def __init__(self, detail: str | None = None):
         super().__init__(status_code=422, detail=detail)
+
+
+class ValueTooLongException(CustomException):
+    """A ``422`` in FastAPI's validation-error format, one ``string_too_long`` entry per field."""
+
+    def __init__(self, limits: dict[str, int]):
+        super().__init__(
+            status_code=422,
+            detail=[
+                {
+                    "type": "string_too_long",
+                    "loc": ["body", field],
+                    "msg": f"String should have at most {limit} characters",
+                    "ctx": {"max_length": limit},
+                }
+                for field, limit in limits.items()
+            ],
+        )
+
+
+class PasswordPolicyException(CustomException):
+    """A ``422`` in FastAPI's validation-error format, one entry per unmet password rule."""
+
+    def __init__(self, field: str, errors: list[dict[str, Any]]):
+        self.errors = [
+            {
+                "type": error["type"],
+                "loc": ["body", field],
+                **{key: value for key, value in error.items() if key != "type"},
+            }
+            for error in errors
+        ]
+        super().__init__(status_code=422, detail=self.errors)
 
 
 class RateLimitException(CustomException):

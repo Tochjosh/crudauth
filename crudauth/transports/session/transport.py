@@ -25,7 +25,7 @@ from ...exceptions import CSRFException
 from ...hooks import HookContext
 from ...principal import Principal
 from ...storage import get_session_storage
-from ...storage.constants import BACKEND_MEMORY
+from ...storage.constants import BACKEND_MEMORY, BACKEND_REDIS
 from ...utils import get_client_ip
 from .constants import (
     CSRF_HEADER_NAME,
@@ -49,11 +49,14 @@ class SessionTransport(Transport):
     ``SameSite=None`` (rejected at construction).
 
     Args:
-        backend: ``"memory"`` (default) or ``"redis"`` for shared/persistent state.
-        redis_url: Connection URL when ``backend="redis"``.
-        redis_client: Existing async Redis client for session and CSRF state. The
-            caller owns its lifecycle and should use ``decode_responses=False``.
-            Mutually exclusive with ``redis_url`` (passing both raises ``ValueError``).
+        backend: Where sessions and CSRF tokens live, ``"memory"`` or ``"redis"``. Left
+            unset, it's Redis when this transport or [CRUDAuth][crudauth.crud_auth.CRUDAuth]
+            has a ``redis_url`` or ``redis_client``, and memory otherwise.
+        redis_url: Redis URL for this transport's sessions and CSRF tokens, overriding
+            ``CRUDAuth``'s.
+        redis_client: Existing async Redis client for this transport, overriding
+            ``CRUDAuth``'s. The caller owns it, so ``auth.shutdown()`` doesn't close it.
+            Mutually exclusive with ``redis_url``.
         csrf: Enforce the synchronizer-token header on unsafe methods (default ``True``).
         cookies: Per-transport [CookieConfig][crudauth.core.CookieConfig] override.
         login_max_attempts: Failed logins before the escalating lockout trips.
@@ -71,7 +74,8 @@ class SessionTransport(Transport):
         ```python
         CRUDAuth(
             session=get_session, user_model=User, SECRET_KEY=...,
-            transports=[SessionTransport(backend="redis", redis_url=..., csrf=True)],
+            redis_url=...,
+            transports=[SessionTransport(session_timeout_minutes=30, csrf=True)],
         )
         ```
     """
@@ -81,7 +85,7 @@ class SessionTransport(Transport):
     def __init__(
         self,
         *,
-        backend: str = BACKEND_MEMORY,
+        backend: str | None = None,
         redis_url: str | None = None,
         redis_client: Any = None,
         csrf: bool = True,
@@ -97,13 +101,17 @@ class SessionTransport(Transport):
         on_login_success: Literal["clear_all", "clear_user_only"] = "clear_all",
         management_routes: bool = False,
     ):
+        if redis_url is not None and redis_client is not None:
+            raise ValueError("redis_url and redis_client are mutually exclusive")
+        backend = backend.lower() if backend else None
+        if backend == BACKEND_MEMORY and (redis_url is not None or redis_client is not None):
+            raise ValueError("backend='memory' can't be combined with redis_url or redis_client")
+        self._backend = backend
+        self._redis_url = redis_url
+        self._redis_client = redis_client
         self.backend = backend
         self.redis_url = redis_url
         self.redis_client = redis_client
-        if redis_client is not None:
-            if redis_url is not None:
-                raise ValueError("redis_client and redis_url are mutually exclusive")
-            self.backend = "redis"
         self.csrf_enabled = csrf
         self.max_sessions_per_user = max_sessions_per_user
         self.session_timeout_minutes = session_timeout_minutes
@@ -142,6 +150,16 @@ class SessionTransport(Transport):
                 "protection). Use 'lax' or 'strict'."
             )
         timeout_seconds = self.session_timeout_minutes * SECONDS_PER_MINUTE
+        url, client = self._redis_url, self._redis_client
+        if url is None and client is None and self._backend != BACKEND_MEMORY:
+            url, client = runtime.redis_url, runtime.redis_client
+        if self._backend is not None:
+            backend = self._backend
+        elif url is not None or client is not None:
+            backend = BACKEND_REDIS
+        else:
+            backend = BACKEND_MEMORY
+        self.backend, self.redis_url, self.redis_client = backend, url, client
         session_storage = get_session_storage(
             self.backend,
             prefix=SESSION_STORAGE_PREFIX,
@@ -197,11 +215,14 @@ class SessionTransport(Transport):
         if not session_id:
             return None
 
-        session = await self.manager.validate_session(session_id)
+        session = await self.manager.validate_session(
+            session_id, update_activity=ctx.update_activity
+        )
         if session is None:
             return None
 
-        await self._enforce_csrf(request, session_id)
+        if ctx.enforce_csrf:
+            await self._enforce_csrf(request, session_id)
 
         user = await ctx.resolve_user(session.user_id)
         if user is None or not ctx.repo.is_active(user):
@@ -213,6 +234,18 @@ class SessionTransport(Transport):
             scopes=(),
             metadata={"session_id": session_id},
         )
+
+    async def revalidate(self, request: Request, principal: Principal, ctx: AuthContext) -> bool:
+        """Slide the session and enforce CSRF when an earlier resolution in this request skipped them."""
+        assert self.manager is not None
+        session_id = principal.metadata.get("session_id")
+        if not session_id:
+            return True
+        if ctx.update_activity and await self.manager.validate_session(session_id) is None:
+            return False
+        if ctx.enforce_csrf:
+            await self._enforce_csrf(request, session_id)
+        return True
 
     async def _enforce_csrf(self, request: Request, session_id: str) -> None:
         """Require a valid synchronizer-token header on unsafe methods.

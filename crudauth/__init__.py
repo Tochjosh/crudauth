@@ -33,10 +33,12 @@ from .exceptions import (
     DuplicateValueException,
     ForbiddenException,
     NotFoundException,
+    PasswordPolicyException,
     RateLimitException,
     SudoLockoutError,
     UnauthorizedException,
     UnprocessableEntityException,
+    ValueTooLongException,
 )
 from .crud_auth import CRUDAuth, SessionInfo
 from .email.service import EmailFlowService
@@ -45,6 +47,7 @@ from .identity import IdentityConfig
 from .models.mixin import AuthUserMixin, make_auth_identity
 from .oauth import OAuthAccountService, OAuthCredentials
 from .principal import Principal
+from .password import PasswordContext, PasswordPolicy
 from .provisioning import NewUserContext, NewUserFields
 from .repository import UserRepository
 from .sudo import SudoConfig, SudoManager
@@ -54,6 +57,7 @@ from .utils import (
     get_password_hash,
     is_unusable_password,
     make_unusable_password,
+    safe_redirect_path,
     verify_password,
 )
 
@@ -84,6 +88,8 @@ __all__ = [
     "Transport",
     "AuthContext",
     "CookieConfig",
+    "PasswordPolicy",
+    "PasswordContext",
     "SudoConfig",
     # toolbox: reusable building blocks (use the wired services off `auth`, or
     # construct/type them directly). Token issuance is intentionally not exported
@@ -97,6 +103,7 @@ __all__ = [
     "verify_password",
     "is_unusable_password",
     "make_unusable_password",
+    "safe_redirect_path",
     # exceptions
     "BadRequestException",
     "NotFoundException",
@@ -104,6 +111,8 @@ __all__ = [
     "UnauthorizedException",
     "UnprocessableEntityException",
     "DuplicateValueException",
+    "ValueTooLongException",
+    "PasswordPolicyException",
     "RateLimitException",
     "SudoLockoutError",
     "CSRFException",
