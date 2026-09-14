@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 import fakeredis.aioredis
 import httpx
 import pytest
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 
 from crudauth import CookieConfig, CRUDAuth, Principal, SessionTransport
 from crudauth.ratelimit import (
@@ -22,6 +22,7 @@ from crudauth.ratelimit import (
 )
 from crudauth.ratelimit.base import RateLimiterBackend
 from crudauth.ratelimit.constants import LOCKOUT_NAMESPACE, MEMORY_SWEEP_EVERY_INCREMENTS
+from crudauth.transports.bearer.transport import BearerTransport
 
 
 def _fakeredis_client():
@@ -238,10 +239,10 @@ async def test_rate_limit_accepts_dynamic_limits_and_two_argument_keys(
     app = FastAPI()
     seen: list[Principal | None] = []
 
-    async def dynamic(request: httpx.Request, principal: Principal | None):
+    async def dynamic(request: Request, principal: Principal | None) -> RateLimit | None:
         return RateLimit(1, 100) if request.headers.get("X-Limit") else None
 
-    def by_request(request, principal: Principal | None) -> str:
+    def by_request(request: Request, principal: Principal | None) -> str:
         seen.append(principal)
         return request.headers.get("X-Tenant", "anon")
 
@@ -256,7 +257,7 @@ async def test_rate_limit_accepts_dynamic_limits_and_two_argument_keys(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as c:
         assert (await c.get("/dynamic")).status_code == 200
-        assert (await c.get("/dynamic")).status_code == 200  # resolver returned None
+        assert (await c.get("/dynamic")).status_code == 200
         assert (await c.get("/dynamic", headers={"X-Limit": "yes"})).status_code == 200
         assert (await c.get("/dynamic", headers={"X-Limit": "yes"})).status_code == 429
     await auth.shutdown()
@@ -429,6 +430,115 @@ async def test_static_ip_limit_does_not_open_a_session(sessionmaker, UserModel) 
         assert (await c.get("/static")).status_code == 200
     await auth.shutdown()
     assert opened["n"] == 0
+
+
+async def test_user_key_calls_sync_limit_function_with_the_principal(
+    get_session, UserModel
+) -> None:
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+    )
+    seen: list[Principal | None] = []
+
+    def per_user(request: Request, principal: Principal | None) -> RateLimit:
+        seen.append(principal)
+        return RateLimit(1, 100)
+
+    app = FastAPI()
+    app.include_router(auth.router)
+
+    @app.get(
+        "/per-user",
+        dependencies=[Depends(auth.rate_limit("per_user", per_user, key=KeyBy.USER))],
+    )
+    async def per_user_route() -> dict:
+        return {"ok": True}
+
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        await _register_and_login(c)
+        assert (await c.get("/per-user")).status_code == 200
+        assert (await c.get("/per-user")).status_code == 429
+    await auth.shutdown()
+    assert [p and p.transport for p in seen] == ["session", "session"]
+
+
+async def test_transport_narrowed_limit_shares_authentication(
+    get_session, UserModel, monkeypatch
+) -> None:
+    session_transport = SessionTransport(cookies=CookieConfig(secure=False))
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[session_transport, BearerTransport(cookies=CookieConfig(secure=False))],
+    )
+    calls = {"n": 0}
+    real = session_transport.authenticate
+
+    async def counting(request, ctx):
+        calls["n"] += 1
+        return await real(request, ctx)
+
+    monkeypatch.setattr(session_transport, "authenticate", counting)
+
+    with pytest.raises(ValueError):
+        auth.rate_limit("narrow", RateLimit(100, 60), transport="missing")
+
+    app = FastAPI()
+    app.include_router(auth.router)
+    limit = auth.rate_limit("narrow", RateLimit(100, 60), key=KeyBy.USER_OR_IP, transport="session")
+
+    @app.get("/narrow", dependencies=[Depends(limit)])
+    async def narrow(user: Principal = Depends(auth.current_user(transport="session"))):
+        return {"id": user.user_id}
+
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        await _register_and_login(c)
+        calls["n"] = 0
+        assert (await c.get("/narrow")).status_code == 200
+    await auth.shutdown()
+    assert calls["n"] == 1
+
+
+async def test_limit_reading_the_principal_rejects_a_tampered_bearer(
+    get_session, UserModel
+) -> None:
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[BearerTransport(cookies=CookieConfig(secure=False))],
+    )
+    app = FastAPI()
+
+    @app.get("/ip", dependencies=[Depends(auth.rate_limit("ip", RateLimit(100, 60)))])
+    async def by_ip() -> dict:
+        return {"ok": True}
+
+    @app.get(
+        "/mixed",
+        dependencies=[Depends(auth.rate_limit("mixed", RateLimit(100, 60), key=KeyBy.USER_OR_IP))],
+    )
+    async def mixed() -> dict:
+        return {"ok": True}
+
+    await auth.initialize()
+    tampered = {"Authorization": "Bearer tampered.token.value"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        assert (await c.get("/ip", headers=tampered)).status_code == 200
+        assert (await c.get("/mixed", headers=tampered)).status_code == 401
+    await auth.shutdown()
 
 
 async def test_rate_limit_disabled_with_times_zero(get_session, UserModel) -> None:
