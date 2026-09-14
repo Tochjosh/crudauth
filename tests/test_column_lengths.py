@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 import pytest
 from fastapi import FastAPI
-from pydantic import BaseModel, EmailStr
-from sqlalchemy import String, func, select
+from pydantic import BaseModel
+from sqlalchemy import String, TypeDecorator, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -20,6 +22,11 @@ SECRET = "test-secret-key-0123456789-0123456789"
 LONG_EMAIL = "abcdefghijklm@xyz.com"
 
 
+class Nickname(TypeDecorator):
+    impl = String(5)
+    cache_ok = True
+
+
 class SizedBase(DeclarativeBase):
     pass
 
@@ -30,13 +37,15 @@ class SizedUser(SizedBase, AuthUserMixin):
     username: Mapped[str] = mapped_column(String(12), unique=True, index=True)
     email: Mapped[str] = mapped_column(String(20), unique=True, index=True)
     full_name: Mapped[str | None] = mapped_column(String(5), default=None)
+    nickname: Mapped[str | None] = mapped_column(Nickname, default=None)
 
 
 class Register(BaseModel):
-    email: EmailStr
+    email: str
     username: str
     password: str
     full_name: str | None = None
+    nickname: str | None = None
 
 
 class RecordingSender(EmailSender):
@@ -45,6 +54,15 @@ class RecordingSender(EmailSender):
 
     async def send(self, *, to, subject, body, kind, context):
         self.kinds.append(kind)
+
+
+def too_long(field: str, limit: int) -> dict[str, Any]:
+    return {
+        "type": "string_too_long",
+        "loc": ["body", field],
+        "msg": f"String should have at most {limit} characters",
+        "ctx": {"max_length": limit},
+    }
 
 
 @pytest.fixture
@@ -76,28 +94,56 @@ def _client(auth: CRUDAuth) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
 
-async def test_register_rejects_values_longer_than_their_column(sized_sessionmaker) -> None:
-    auth = _auth(sized_sessionmaker, register_schema=Register, register_extra_fields={"full_name"})
-    body = {"email": "new@x.com", "username": "new", "password": "pw123456"}
-    fitting = {**body, "email": "abcdefghijkl@xyz.com", "username": "a" * 12, "full_name": "Alice"}
+async def test_register_reports_every_value_longer_than_its_column(sized_sessionmaker) -> None:
+    auth = _auth(
+        sized_sessionmaker,
+        register_schema=Register,
+        register_extra_fields={"full_name", "nickname"},
+    )
+    too_long_body = {
+        "email": LONG_EMAIL,
+        "username": "a" * 13,
+        "password": "pw123456",
+        "full_name": "Alice Smith",
+        "nickname": "sixsix",
+    }
+    at_the_limit = {
+        "email": "abcdefghijkl@xyz.com",
+        "username": "a" * 12,
+        "password": "pw123456",
+        "full_name": "Alice",
+        "nickname": "fives",
+    }
 
     await auth.initialize()
     async with _client(auth) as c:
-        long_username = await c.post("/register", json={**body, "username": "a" * 13})
-        long_email = await c.post("/register", json={**body, "email": LONG_EMAIL})
-        long_name = await c.post("/register", json={**body, "full_name": "Alice Smith"})
-        fits = await c.post("/register", json=fitting)
+        rejected = await c.post("/register", json=too_long_body)
+        accepted = await c.post("/register", json=at_the_limit)
     await auth.shutdown()
 
-    assert long_username.status_code == 422
-    assert long_username.json() == {"detail": "Username must be at most 12 characters"}
-    assert long_email.status_code == 422
-    assert long_email.json() == {"detail": "Email must be at most 20 characters"}
-    assert long_name.status_code == 422
-    assert long_name.json() == {"detail": "Full name must be at most 5 characters"}
-    assert fits.status_code == 200, fits.text
+    assert rejected.status_code == 422
+    assert sorted(rejected.json()["detail"], key=lambda error: error["loc"]) == [
+        too_long("email", 20),
+        too_long("full_name", 5),
+        too_long("nickname", 5),
+        too_long("username", 12),
+    ]
+    assert accepted.status_code == 200, accepted.text
     async with sized_sessionmaker() as db:
         assert await db.scalar(select(func.count()).select_from(SizedUser)) == 1
+
+
+async def test_register_measures_the_email_as_it_will_be_stored(sized_sessionmaker) -> None:
+    auth = _auth(sized_sessionmaker, register_schema=Register)
+    body = {"email": "  ABCDEFGHIJKL@XYZ.COM  ", "username": "alice", "password": "pw123456"}
+
+    await auth.initialize()
+    async with _client(auth) as c:
+        response = await c.post("/register", json=body)
+    await auth.shutdown()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["email"] == "abcdefghijkl@xyz.com"
 
 
 async def test_email_change_request_rejects_an_address_longer_than_the_column(
@@ -123,7 +169,7 @@ async def test_email_change_request_rejects_an_address_longer_than_the_column(
     await auth.shutdown()
 
     assert response.status_code == 422
-    assert response.json() == {"detail": "Email must be at most 20 characters"}
+    assert response.json() == {"detail": [too_long("new_email", 20)]}
     assert "change_email" not in sender.kinds
 
 
