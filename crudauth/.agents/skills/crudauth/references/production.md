@@ -8,20 +8,21 @@ over plain HTTP. Going to production is four changes; the auth config and the AP
 
 crudauth keeps server-side state (sessions, CSRF, lockout counters, single-use email/OAuth tokens) in
 a pluggable store. In memory it isn't shared across workers/pods, which silently weakens lockout,
-sessions, and one-time-token atomicity. Point both stores at Redis:
+sessions, and one-time-token atomicity. Point crudauth at Redis once:
 
 ```python
-from crudauth import CRUDAuth, SessionTransport
-from crudauth.ratelimit import redis_rate_limiter
-
 REDIS_URL = os.environ["REDIS_URL"]
-auth = CRUDAuth(
-    ..., transports=[SessionTransport(backend="redis", redis_url=REDIS_URL)],
-    rate_limiter=redis_rate_limiter(REDIS_URL),
-)
+auth = CRUDAuth(..., redis_url=REDIS_URL)  # sessions, CSRF, tokens, OAuth state, lockout/throttles
 ```
 
-crudauth logs a startup warning whenever an in-memory backend is active. Pass
+- `redis_client=` instead of `redis_url=` reuses an app-built async client (any `decode_responses`);
+  crudauth never closes a client it didn't build.
+- Configuring a part directly overrides the default for that part:
+  `SessionTransport(redis_client=...)` or `SessionTransport(backend="memory")` for sessions/CSRF,
+  `rate_limiter=redis_rate_limiter(client=...)` for counters.
+- Keep auth state in its own Redis database, not the cache's: a flush or eviction logs users out.
+
+crudauth logs a startup warning naming each part still in memory. Pass
 `warn_on_memory_backend=False` only if you deliberately run a single worker.
 
 ## 2. Wire the lifespan

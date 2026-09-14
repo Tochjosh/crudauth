@@ -19,23 +19,56 @@ deployments.
 
 ## Redis (production)
 
-Point both the session store and the rate limiter at Redis:
+Pass a Redis URL to `CRUDAuth` and every store moves to Redis: sessions and CSRF tokens, the
+lockout and throttle counters, and the one-time-token and OAuth-state stores.
+
+```python
+from crudauth import CRUDAuth
+
+auth = CRUDAuth(
+    session=get_session, user_model=User, SECRET_KEY="change-me",
+    redis_url="redis://localhost:6379/0",
+)
+```
+
+Give auth state a Redis database of its own rather than sharing your cache's. A cache flush or an
+eviction policy would otherwise log users out and reset lockout counters.
+
+### Sharing a client
+
+If your app already builds a Redis client (a tuned connection pool, TLS, Sentinel), pass it with
+`redis_client=` instead of a URL. CRUDAuth uses it for every store and never closes it:
+`auth.shutdown()` only closes the clients CRUDAuth built from a URL, so the client's lifecycle stays
+with your app. Either `decode_responses` setting works.
+
+```python
+from redis.asyncio import Redis
+
+auth_redis = Redis.from_url(os.environ["AUTH_REDIS_URL"], max_connections=50)
+auth = CRUDAuth(..., redis_client=auth_redis)
+```
+
+`redis_url` and `redis_client` are mutually exclusive.
+
+### Overriding one part
+
+The `CRUDAuth` setting is the default. Configure a part directly to put it somewhere else:
 
 ```python
 from crudauth import CRUDAuth, SessionTransport
 from crudauth.ratelimit import redis_rate_limiter
 
 auth = CRUDAuth(
-    session=get_session, user_model=User, SECRET_KEY="change-me",
-    transports=[SessionTransport(backend="redis", redis_url="redis://localhost:6379")],
-    rate_limiter=redis_rate_limiter("redis://localhost:6379"),
+    ...,
+    redis_client=auth_redis,
+    transports=[SessionTransport(redis_client=session_redis)],  # sessions and CSRF tokens
+    rate_limiter=redis_rate_limiter(client=limiter_redis),      # lockout and throttle counters
 )
 ```
 
-`SessionTransport(backend="redis")` moves sessions, CSRF, and the one-time-token / OAuth-state
-stores to Redis; `redis_rate_limiter(...)` moves the lockout and throttle counters. Once
-you've deliberately accepted in-memory on a single worker, pass `warn_on_memory_backend=False`
-to silence the warning.
+`SessionTransport(backend="memory")` keeps sessions in memory even when `CRUDAuth` has Redis.
+The startup warning names each part that's still in memory; once you've deliberately accepted
+that on a single worker, pass `warn_on_memory_backend=False` to silence it.
 
 ## Lifespan
 
