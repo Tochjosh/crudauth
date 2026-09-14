@@ -14,7 +14,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.exc import IntegrityError
 
 from ..constants import MIN_PASSWORD_LENGTH
-from ..exceptions import DuplicateValueException, UnprocessableEntityException
+from ..exceptions import DuplicateValueException, ValueTooLongException
 from ..hooks import HookContext
 from ..provisioning import NewUserContext, resolve_new_user_fields
 from ..ratelimit import KeyBy
@@ -93,11 +93,13 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
         submitted = dict(data)
         data = auth.repo.filter_registration_data(data)
         login_values = {f: data.pop(f) for f in login_fields}
-        for field, value in {**login_values, **data}.items():
-            limit = auth.repo.exceeds_length(field, value)
-            if limit is not None:
-                label = field.replace("_", " ").capitalize()
-                raise UnprocessableEntityException(f"{label} must be at most {limit} characters")
+        too_long = {
+            field: limit
+            for field, value in {**login_values, **data}.items()
+            if (limit := auth.repo.exceeds_length(field, value)) is not None
+        }
+        if too_long:
+            raise ValueTooLongException(too_long)
 
         async def _send_best_effort(coro: Awaitable[Any]) -> None:
             """Dispatch a registration email without letting a send failure fail
