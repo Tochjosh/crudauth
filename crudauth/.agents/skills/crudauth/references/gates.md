@@ -85,3 +85,5 @@ class Principal:
   cached authentication, so it composes with `current_user` without a second lookup. Use
   `KeyBy.USER_OR_IP` to fall back to the client IP for anonymous callers, and pass a function of
   `(request, principal)` as the limit to pick a `RateLimit` (or `None` for no limit) per request.
+  Give `rate_limit` the same `transport=` as a narrowed `current_user(transport=...)` so they
+  still share one authentication.

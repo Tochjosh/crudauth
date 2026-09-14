@@ -46,9 +46,15 @@ async def search(...):
 ```
 
 The principal comes from the same cached authentication `current_user()` uses, so a route
-with both authenticates once, and `current_user()` still enforces CSRF. A limit that doesn't
-need the principal (a fixed `RateLimit` keyed by IP or by `key(request)`) doesn't touch the
-database. For your own throttling logic, `auth.rate_limiter` is the configured backend.
+with both authenticates once, and `current_user()` still enforces CSRF. `transport=` narrows
+which credentials identify the caller, as it does on `current_user()`; give both the same
+value so they keep sharing that authentication. Like `current_user(optional=True)`, a limit
+that reads the principal treats a missing or expired credential as anonymous but rejects a
+tampered one with `401`.
+
+A limit that doesn't need the principal (a fixed `RateLimit` keyed by IP or by
+`key(request)`) doesn't touch the database. For your own throttling logic,
+`auth.rate_limiter` is the configured backend.
 
 The built-in account actions (`register`, the email/password requests) ship with defaults.
 Override them per action with `rate_limits={...}` on `CRUDAuth`:
