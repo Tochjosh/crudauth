@@ -150,9 +150,10 @@ from crudauth import CRUDAuth, SessionTransport, BearerTransport
 
 auth = CRUDAuth(
     session=get_session, user_model=User, SECRET_KEY=...,
+    redis_url=...,
     transports=[
-        SessionTransport(backend="redis", redis_url=..., csrf=True),  # browsers
-        BearerTransport(access_ttl=900, refresh="cookie"),            # apps/scripts
+        SessionTransport(csrf=True),                        # browsers
+        BearerTransport(access_ttl=900, refresh="cookie"),  # apps/scripts
     ],
 )
 ```

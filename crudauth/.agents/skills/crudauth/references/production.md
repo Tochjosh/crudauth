@@ -15,8 +15,9 @@ REDIS_URL = os.environ["REDIS_URL"]
 auth = CRUDAuth(..., redis_url=REDIS_URL)  # sessions, CSRF, tokens, OAuth state, lockout/throttles
 ```
 
-- `redis_client=` instead of `redis_url=` reuses an app-built async client (any `decode_responses`);
-  crudauth never closes a client it didn't build.
+- crudauth opens one client for the URL, shares it across every store, and closes it on shutdown.
+- `redis_client=` instead of `redis_url=` reuses an app-built async client (any `decode_responses`,
+  `RedisCluster` included); crudauth never closes a client it didn't build.
 - Configuring a part directly overrides the default for that part:
   `SessionTransport(redis_client=...)` or `SessionTransport(backend="memory")` for sessions/CSRF,
   `rate_limiter=redis_rate_limiter(client=...)` for counters.

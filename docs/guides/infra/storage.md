@@ -20,7 +20,8 @@ deployments.
 ## Redis (production)
 
 Pass a Redis URL to `CRUDAuth` and every store moves to Redis: sessions and CSRF tokens, the
-lockout and throttle counters, and the one-time-token and OAuth-state stores.
+lockout and throttle counters, and the one-time-token and OAuth-state stores. CRUDAuth opens one
+client for the URL, shares it across all of them, and closes it in `auth.shutdown()`.
 
 ```python
 from crudauth import CRUDAuth
@@ -32,12 +33,13 @@ auth = CRUDAuth(
 ```
 
 Give auth state a Redis database of its own rather than sharing your cache's. A cache flush or an
-eviction policy would otherwise log users out and reset lockout counters.
+eviction policy would otherwise log users out and reset lockout counters. Redis Cluster only has
+database 0, so there it means a cluster of its own.
 
 ### Sharing a client
 
-If your app already builds a Redis client (a tuned connection pool, TLS, Sentinel), pass it with
-`redis_client=` instead of a URL. CRUDAuth uses it for every store and never closes it:
+If your app already builds a Redis client (a tuned connection pool, TLS, Sentinel, or a
+`RedisCluster`), pass it with `redis_client=` instead of a URL. CRUDAuth uses it for every store and never closes it:
 `auth.shutdown()` only closes the clients CRUDAuth built from a URL, so the client's lifecycle stays
 with your app. Either `decode_responses` setting works.
 
