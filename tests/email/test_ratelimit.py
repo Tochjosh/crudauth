@@ -110,11 +110,11 @@ async def test_email_trigger_is_rate_limited(email_client) -> None:
     assert tripped.status_code == 429
 
 
-async def test_reset_rejects_short_password(email_client) -> None:
+async def test_reset_checks_the_token_before_the_password(email_client) -> None:
     r = await email_client.post(
         "/password/reset-confirm", json={"token": "whatever", "new_password": "short"}
     )
-    assert r.status_code == 422  # below MIN_PASSWORD_LENGTH
+    assert r.status_code == 400
 
 
 async def test_register_rejects_invalid_email(get_session, UserModel) -> None:
@@ -153,7 +153,7 @@ async def test_register_rejects_short_password(get_session, UserModel) -> None:
         r = await c.post(
             "/register", json={"email": "a@x.com", "username": "u", "password": "short"}
         )
-        assert r.status_code == 422  # below MIN_PASSWORD_LENGTH, like the reset flow
+        assert r.status_code == 422  # below MIN_PASSWORD_LENGTH
     await auth.shutdown()
 
 

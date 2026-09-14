@@ -13,8 +13,8 @@ from crudauth import (
     EmailConfig,
     EmailSender,
     PasswordPolicy,
+    PasswordPolicyException,
     SessionTransport,
-    UnprocessableEntityException,
 )
 from crudauth.email.service import EmailFlowService
 from crudauth.repository import UserRepository
@@ -168,24 +168,75 @@ async def test_password_reset_flow(ctx) -> None:
     ).status_code == 200
 
 
-async def test_direct_password_reset_enforces_policy(sessionmaker, UserModel) -> None:
+async def test_direct_reset_enforces_the_policy_without_using_the_token(
+    sessionmaker, UserModel
+) -> None:
     repo = UserRepository(UserModel)
     sender = CapturingSender()
+    contexts = []
+
+    def record(password, context):
+        contexts.append(context)
+
     svc = EmailFlowService(
         repo=repo,
         secret_key="test-secret-key-0123456789-0123456789",
         config=EmailConfig(sender=sender, frontend_url="https://app"),
         hooks=AuthHooks(),
-        password_policy=PasswordPolicy(min_length=12),
+        password_policy=PasswordPolicy(min_length=12, validators=[record]),
     )
     async with sessionmaker() as db:
         await repo.create(
-            db, {"email": "reset@x.com", "username": "reset", "hashed_password": get_password_hash("pw123456")}
+            db,
+            {
+                "email": "reset@x.com",
+                "username": "reset",
+                "hashed_password": get_password_hash("pw123456"),
+            },
         )
         await svc.request_password_reset(db, "reset@x.com")
-        with pytest.raises(UnprocessableEntityException) as error:
-            await svc.reset_password(db, sender.token_for("reset_password"), "short")
-        assert error.value.status_code == 422
+        token = sender.token_for("reset_password")
+        with pytest.raises(PasswordPolicyException) as error:
+            await svc.reset_password(db, token, "tenchars10")
+        await svc.reset_password(db, token, "twelve-chars")
+
+    assert [entry["loc"] for entry in error.value.errors] == [["body", "new_password"]]
+    assert [(c.source, c.username, c.email) for c in contexts] == [
+        ("reset", "reset", "reset@x.com")
+    ]
+
+
+async def test_reset_route_checks_the_policy_once(get_session, UserModel) -> None:
+    sender = CapturingSender()
+    checked: list[str] = []
+
+    async def record(password: str) -> None:
+        checked.append(password)
+
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+        email=EmailConfig(sender=sender, frontend_url="https://app.example.com"),
+        password_policy=PasswordPolicy(validators=[record]),
+    )
+    app = FastAPI()
+    app.include_router(auth.router)
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        await _register(c)
+        await c.post("/password/reset-request", json={"email": "a@x.com"})
+        r = await c.post(
+            "/password/reset-confirm",
+            json={"token": sender.token_for("reset_password"), "new_password": "newpw12345"},
+        )
+    await auth.shutdown()
+
+    assert r.status_code == 200, r.text
+    assert checked == ["pw123456", "newpw12345"]
 
 
 async def test_reset_request_idempotent_for_unknown_email(ctx) -> None:

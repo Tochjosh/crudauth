@@ -40,9 +40,7 @@ async def _client(app):
 
 
 async def _register_login(c, password="pw123456"):
-    await c.post(
-        "/register", json={"email": "a@x.com", "username": "alice", "password": password}
-    )
+    await c.post("/register", json={"email": "a@x.com", "username": "alice", "password": password})
     r = await c.post("/login", data={"username": "alice", "password": password})
     return r.json()["csrf_token"]
 
@@ -61,18 +59,36 @@ async def test_wrong_current_password_401(get_session, UserModel) -> None:
     await auth.shutdown()
 
 
-async def test_configured_policy_rejects_change(get_session, UserModel) -> None:
-    app, auth = _build(get_session, UserModel, password_policy=PasswordPolicy(min_length=12))
+async def test_policy_rejects_change_with_the_user_context(get_session, UserModel) -> None:
+    contexts = []
+
+    def record(password, context):
+        contexts.append(context)
+
+    policy = PasswordPolicy(min_length=12, validators=[record])
+    app, auth = _build(get_session, UserModel, password_policy=policy)
     await auth.initialize()
     async with _client(app) as c:
         csrf = await _register_login(c, "pw1234567890")
-        r = await c.post(
+        weak = await c.post(
             "/change-password",
             headers={"X-CSRF-Token": csrf},
-            json={"current_password": "pw1234567890", "new_password": "short"},
+            json={"current_password": "pw1234567890", "new_password": "tenchars10"},
         )
-        assert r.status_code == 422
+        strong = await c.post(
+            "/change-password",
+            headers={"X-CSRF-Token": csrf},
+            json={"current_password": "pw1234567890", "new_password": "new-password-1"},
+        )
     await auth.shutdown()
+
+    assert weak.status_code == 422
+    assert [error["loc"] for error in weak.json()["detail"]] == [["body", "new_password"]]
+    assert strong.status_code == 200, strong.text
+    assert [(context.source, context.username, context.email) for context in contexts] == [
+        ("register", "alice", "a@x.com"),
+        ("change", "alice", "a@x.com"),
+    ]
 
 
 async def test_unusable_password_400(get_session, UserModel, sessionmaker) -> None:
