@@ -59,6 +59,7 @@ from .ratelimit.constants import RATE_LIMIT_NAMESPACE
 from .repository import REGISTRATION_ALLOWED_FIELDS, UserRepository
 from .resolution import PrincipalResolver
 from .storage import MemorySessionStorage, get_session_storage
+from .storage.backends.redis import redis_client_from_url
 from .sudo import SudoConfig, SudoManager
 from .storage.constants import BACKEND_MEMORY, BACKEND_REDIS
 from .transports.bearer.transport import BearerTransport
@@ -295,6 +296,8 @@ class CRUDAuth:
         self._warn_on_register_extra_fields(register_extra_fields)
         self._warn_on_privileged_register_fields(register_schema)
         self._rate_limits: dict[str, RateLimit] = {**DEFAULT_RATE_LIMITS, **(rate_limits or {})}
+        self._owned_redis = redis_client_from_url(redis_url) if redis_url is not None else None
+        shared_redis = redis_client if redis_client is not None else self._owned_redis
 
         self.runtime = AuthRuntime(
             secret_key=SECRET_KEY,
@@ -306,13 +309,12 @@ class CRUDAuth:
             cookie_config=cookies or CookieConfig(),
             rate_limiter=rate_limiter
             or (
-                redis_rate_limiter(redis_url=redis_url, client=redis_client)
-                if redis_client is not None or redis_url is not None
+                redis_rate_limiter(client=shared_redis)
+                if shared_redis is not None
                 else MemoryRateLimiterBackend()
             ),
             trusted_proxy_hops=trusted_proxy_hops,
-            redis_url=redis_url,
-            redis_client=redis_client,
+            redis_client=shared_redis,
         )
         self._principals = PrincipalResolver(self.runtime)
         self._session_transport = next(
@@ -452,16 +454,12 @@ class CRUDAuth:
             )
 
     # --- backend detection ---------------------------------------------------
-    def _backend_config(self) -> tuple[str, str | None, Any]:
-        if self.runtime.redis_url is not None or self.runtime.redis_client is not None:
-            return BACKEND_REDIS, self.runtime.redis_url, self.runtime.redis_client
+    def _backend_config(self) -> tuple[str, Any]:
+        if self.runtime.redis_client is not None:
+            return BACKEND_REDIS, self.runtime.redis_client
         if self._session_transport is not None and self._session_transport.backend is not None:
-            return (
-                self._session_transport.backend,
-                self._session_transport.redis_url,
-                self._session_transport.redis_client,
-            )
-        return BACKEND_MEMORY, None, None
+            return self._session_transport.backend, self._session_transport.redis_client
+        return BACKEND_MEMORY, None
 
     def _warn_on_memory_backend(self) -> None:
         """Warn when an in-memory backend is active (the zero-config default).
@@ -563,13 +561,9 @@ class CRUDAuth:
     def _build_email(
         self, email: Any, channels: list[DeliveryChannel] | None, algorithm: str
     ) -> None:
-        backend, redis_url, redis_client = self._backend_config()
+        backend, redis_client = self._backend_config()
         token_store = get_session_storage(
-            backend,
-            prefix="used_token:",
-            expiration=USED_TOKEN_TTL_SECONDS,
-            redis_url=redis_url,
-            client=redis_client,
+            backend, prefix="used_token:", expiration=USED_TOKEN_TTL_SECONDS, client=redis_client
         )
         self._email_token_store = token_store
         self._email_service = EmailFlowService(
@@ -635,13 +629,9 @@ class CRUDAuth:
                 scopes=creds.scopes,
             )
 
-        backend, redis_url, redis_client = self._backend_config()
+        backend, redis_client = self._backend_config()
         state_storage = get_session_storage(
-            backend,
-            prefix="oauth_state:",
-            expiration=OAUTH_STATE_TTL_SECONDS,
-            redis_url=redis_url,
-            client=redis_client,
+            backend, prefix="oauth_state:", expiration=OAUTH_STATE_TTL_SECONDS, client=redis_client
         )
         self._oauth_state_storage = state_storage
         self._oauth_service = OAuthAccountService(
@@ -1288,3 +1278,5 @@ class CRUDAuth:
             await self._email_token_store.close()
         if self.runtime.rate_limiter is not None:
             await self.runtime.rate_limiter.close()
+        if self._owned_redis is not None:
+            await self._owned_redis.aclose()

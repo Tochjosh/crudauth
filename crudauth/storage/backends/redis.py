@@ -9,7 +9,19 @@ from ...constants import DEFAULT_SESSION_TTL_SECONDS, USER_INDEX_TTL_BUFFER_SECO
 from ..base import AbstractSessionStorage, T
 from ..constants import DEFAULT_REDIS_URL, DEFAULT_STORAGE_PREFIX, USER_INDEX_SUFFIX
 
-__all__ = ["RedisSessionStorage"]
+__all__ = ["RedisSessionStorage", "redis_client_from_url"]
+
+
+def redis_client_from_url(url: str | None = None) -> Any:
+    """Build an async Redis client for ``url`` (localhost when omitted), guarding the optional dependency."""
+    try:
+        from redis.asyncio import Redis
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "Redis backend requires the 'redis' package. "
+            "Install with: pip install 'crudauth[redis]'"
+        ) from exc
+    return Redis.from_url(url or DEFAULT_REDIS_URL, decode_responses=False)
 
 
 class RedisSessionStorage(AbstractSessionStorage[T]):
@@ -18,6 +30,12 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
     Layout:
         * ``{prefix}{session_id}`` -> serialized model (TTL = expiration)
         * ``{prefix_root}_users:{user_id}`` -> SET of session ids (TTL = expiration + 1h)
+
+    Note:
+        No transaction spans more than one key, so the backend works on Redis
+        Cluster. The user index is written before a record and cleaned after it,
+        so it never misses a live session; a leftover member points at a record
+        that no longer exists and is skipped when sessions are listed.
 
     Note:
         Pass an existing ``client=`` to share one connection pool with other
@@ -38,14 +56,7 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
             self.client = client
             self._owns_client = False
         else:
-            try:
-                from redis.asyncio import Redis
-            except ImportError as exc:  # pragma: no cover
-                raise ImportError(
-                    "Redis backend requires the 'redis' package. "
-                    "Install with: pip install 'crudauth[redis]'"
-                ) from exc
-            self.client = Redis.from_url(redis_url or DEFAULT_REDIS_URL, decode_responses=False)
+            self.client = redis_client_from_url(redis_url)
             self._owns_client = True
         self.user_sessions_prefix = f"{prefix.rstrip(':')}{USER_INDEX_SUFFIX}"
 
@@ -63,17 +74,16 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
         self, data: T, session_id: str | None = None, expiration: int | None = None
     ) -> str:
         sid = session_id or self.generate_session_id()
-        key = self.get_key(sid)
         ttl = expiration if expiration is not None else self.expiration
         payload = data.model_dump_json().encode()
         user_id = getattr(data, "user_id", None)
-        async with self.client.pipeline(transaction=True) as pipe:
-            pipe.set(key, payload, ex=ttl)
-            if user_id is not None:
-                ukey = self._user_key(user_id)
+        if user_id is not None:
+            ukey = self._user_key(user_id)
+            async with self.client.pipeline(transaction=True) as pipe:
                 pipe.sadd(ukey, sid)
                 pipe.expire(ukey, ttl + USER_INDEX_TTL_BUFFER_SECONDS)
-            await pipe.execute()
+                await pipe.execute()
+        await self.client.set(self.get_key(sid), payload, ex=ttl)
         return sid
 
     async def get(self, session_id: str, model_class: type[T]) -> T | None:
@@ -118,12 +128,10 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
                     user_id = json.loads(raw).get("user_id")
                 except Exception:
                     user_id = None
-        async with self.client.pipeline(transaction=True) as pipe:
-            pipe.delete(key)
-            if user_id is not None:
-                pipe.srem(self._user_key(user_id), session_id)
-            results = await pipe.execute()
-        return bool(results[0])
+        deleted = await self.client.delete(key)
+        if user_id is not None:
+            await self.client.srem(self._user_key(user_id), session_id)
+        return bool(deleted)
 
     async def extend(self, session_id: str, expiration: int | None = None) -> bool:
         ttl = expiration if expiration is not None else self.expiration

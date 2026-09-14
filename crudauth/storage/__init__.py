@@ -37,7 +37,8 @@ def get_session_storage(
         backend: ``"memory"`` (default, dev/testing) or ``"redis"`` (production).
         prefix: Key namespace prefix.
         expiration: Default TTL in seconds.
-        redis_url: Connection URL, required for ``backend="redis"``.
+        redis_url: Connection URL for ``backend="redis"`` when no ``client`` is given;
+            localhost when omitted.
         client: Existing async Redis client. The caller owns its lifecycle.
 
     Returns:

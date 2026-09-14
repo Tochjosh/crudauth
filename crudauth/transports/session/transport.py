@@ -25,6 +25,7 @@ from ...exceptions import CSRFException
 from ...hooks import HookContext
 from ...principal import Principal
 from ...storage import get_session_storage
+from ...storage.backends.redis import redis_client_from_url
 from ...storage.constants import BACKEND_MEMORY, BACKEND_REDIS
 from ...utils import get_client_ip
 from .constants import (
@@ -53,7 +54,7 @@ class SessionTransport(Transport):
             unset, it's Redis when this transport or [CRUDAuth][crudauth.crud_auth.CRUDAuth]
             has a ``redis_url`` or ``redis_client``, and memory otherwise.
         redis_url: Redis URL for this transport's sessions and CSRF tokens, overriding
-            ``CRUDAuth``'s.
+            ``CRUDAuth``'s. The transport opens one client for it and closes it on shutdown.
         redis_client: Existing async Redis client for this transport, overriding
             ``CRUDAuth``'s. The caller owns it, so ``auth.shutdown()`` doesn't close it.
             Mutually exclusive with ``redis_url``.
@@ -112,6 +113,7 @@ class SessionTransport(Transport):
         self.backend = backend
         self.redis_url = redis_url
         self.redis_client = redis_client
+        self._owned_client: Any = None
         self.csrf_enabled = csrf
         self.max_sessions_per_user = max_sessions_per_user
         self.session_timeout_minutes = session_timeout_minutes
@@ -150,21 +152,19 @@ class SessionTransport(Transport):
                 "protection). Use 'lax' or 'strict'."
             )
         timeout_seconds = self.session_timeout_minutes * SECONDS_PER_MINUTE
-        url, client = self._redis_url, self._redis_client
-        if url is None and client is None and self._backend != BACKEND_MEMORY:
-            url, client = runtime.redis_url, runtime.redis_client
-        if self._backend is not None:
-            backend = self._backend
-        elif url is not None or client is not None:
-            backend = BACKEND_REDIS
-        else:
-            backend = BACKEND_MEMORY
-        self.backend, self.redis_url, self.redis_client = backend, url, client
+        client = self._redis_client
+        if client is None and self._redis_url is not None:
+            client = self._owned_client = redis_client_from_url(self._redis_url)
+        elif client is None and self._backend != BACKEND_MEMORY:
+            client = runtime.redis_client
+        backend = self._backend or (BACKEND_REDIS if client is not None else BACKEND_MEMORY)
+        if backend == BACKEND_REDIS and client is None:
+            client = self._owned_client = redis_client_from_url()
+        self.backend, self.redis_client = backend, client
         session_storage = get_session_storage(
             self.backend,
             prefix=SESSION_STORAGE_PREFIX,
             expiration=timeout_seconds,
-            redis_url=self.redis_url,
             client=self.redis_client,
         )
         csrf_storage = None
@@ -173,7 +173,6 @@ class SessionTransport(Transport):
                 self.backend,
                 prefix=CSRF_STORAGE_PREFIX,
                 expiration=timeout_seconds,
-                redis_url=self.redis_url,
                 client=self.redis_client,
             )
 
@@ -197,9 +196,11 @@ class SessionTransport(Transport):
             await self.manager.initialize()
 
     async def shutdown(self) -> None:
-        """Close the session manager's storage connections."""
+        """Close the session manager's storage connections, and the client built from ``redis_url``."""
         if self.manager is not None:
             await self.manager.shutdown()
+        if self._owned_client is not None:
+            await self._owned_client.aclose()
 
     # --- authn ---------------------------------------------------------------
     async def authenticate(self, request: Request, ctx: AuthContext) -> Principal | None:

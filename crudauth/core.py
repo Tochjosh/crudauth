@@ -78,10 +78,9 @@ class AuthRuntime:
         trusted_proxy_hops: Number of trusted reverse proxies in front of the
             app, used to resolve the client IP from ``X-Forwarded-For``. ``0``
             (default) ignores the header and uses the socket peer.
-        redis_url: App-wide Redis URL, used by every Redis-capable component that
-            isn't configured directly.
-        redis_client: App-wide async Redis client, the alternative to ``redis_url``.
-            The caller owns it.
+        redis_client: The app-wide async Redis client every Redis-capable component
+            uses unless it's configured directly: the one ``CRUDAuth`` built from
+            ``redis_url``, or the caller's ``redis_client``.
 
     Note:
         ``lockout`` is a single shared policy used by BOTH the session ``/login``
@@ -100,7 +99,6 @@ class AuthRuntime:
     rate_limiter: "RateLimiterBackend | None" = None
     lockout: "LockoutPolicy | None" = None
     trusted_proxy_hops: int = 0
-    redis_url: str | None = None
     redis_client: Any = None
 
     async def authenticate_password(
