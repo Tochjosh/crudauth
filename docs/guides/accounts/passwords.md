@@ -23,8 +23,11 @@ silently truncates a long password. Verification returns `False` for a malformed
 instead of raising, so a corrupted row is a clean "invalid password", not a 500. You never
 handle the plaintext beyond the route that receives it.
 
-The default `PasswordPolicy` requires 8 characters. Configure one policy for every password
-write, including direct service calls:
+## Password policy
+
+Every new password, on `/register`, `/set-password`, `/change-password` and
+`/password/reset-confirm`, must meet the configured `PasswordPolicy`. The default only requires
+8 characters:
 
 ```python
 from crudauth import CRUDAuth, PasswordPolicy
@@ -33,12 +36,69 @@ auth = CRUDAuth(
     session=get_session, user_model=User, SECRET_KEY="change-me",
     password_policy=PasswordPolicy(min_length=12, require_digit=True),
 )
-auth.validate_password("candidate")  # reusable in app-owned schemas
 ```
 
-You can also pass a callable that raises `ValueError` for invalid passwords. Violations return
-`422`, including all unmet `PasswordPolicy` requirements. A custom `register_schema` controls
-request parsing, but the configured policy still runs in the service path.
+`require_uppercase`, `require_lowercase`, `require_digit` and `require_special` are off by
+default. A special character is anything that isn't a letter or a digit, spaces included. There's
+no maximum length: the SHA-256 pre-hash makes a long password as cheap to hash as a short one.
+
+A password that fails gets a `422` in FastAPI's validation-error format, one entry per unmet
+rule at the password field (`password` on `/register`, `new_password` everywhere else):
+
+```json
+{"detail": [
+  {"type": "string_too_short", "loc": ["body", "new_password"],
+   "msg": "String should have at least 12 characters", "ctx": {"min_length": 12}},
+  {"type": "password_policy", "loc": ["body", "new_password"],
+   "msg": "Password should contain a digit", "ctx": {"requirement": "digit"}}
+]}
+```
+
+The rejected password isn't echoed back, and OpenAPI shows the minimum length and the rules on
+each password field.
+
+### Extra checks
+
+For anything beyond the built-in rules, add `validators`: sync or async functions that raise
+`ValueError` with the message to show. They run in order once the built-in rules pass and stop at
+the first failure, so a breached-password lookup never runs for a password that's too short:
+
+```python
+from crudauth import CRUDAuth, PasswordContext, PasswordPolicy
+
+async def not_breached(password: str) -> None:
+    if await breach_count(password):
+        raise ValueError("This password has appeared in a data breach")
+
+def not_personal(password: str, context: PasswordContext) -> None:
+    lowered = password.lower()
+    for value in (context.username, context.email and context.email.split("@")[0]):
+        if value and value.lower() in lowered:
+            raise ValueError("Password should not contain your username or email")
+
+auth = CRUDAuth(
+    ...,
+    password_policy=PasswordPolicy(min_length=12, validators=[not_breached, not_personal]),
+)
+```
+
+A validator that takes a second required argument also gets a `PasswordContext`: the `source`
+(`"register"`, `"set"`, `"change"` or `"reset"`), the account's `username` and `email`, and the
+`user` row (`None` on registration). One with an optional second parameter gets only the
+password.
+
+### What the policy covers
+
+The policy runs in CRUDAuth's routes, on a custom `register_schema` too, and in
+`EmailFlowService.reset_password` when you call it directly. Code that sets a password itself
+with `get_password_hash` should check it first:
+
+```python
+await auth.validate_password(new_password, user=user, source="change", field="new_password")
+```
+
+Tightening the policy doesn't affect existing passwords. Login never checks it, so users keep
+signing in and meet the new rules the next time they set a password.
 
 ## Setting a password on an OAuth-only account
 

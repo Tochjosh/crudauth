@@ -27,7 +27,8 @@ curl -X POST http://localhost:8000/register \
   -d '{"email": "alice@example.com", "username": "alice", "password": "hunter2..."}'
 ```
 
-`password` enforces `MIN_PASSWORD_LENGTH` (8). A value longer than its `String(n)` column is
+`password` must meet the [password policy](passwords.md#password-policy), 8 characters by
+default. A value longer than its `String(n)` column is
 rejected before anything is written, whether it comes from the default body or a custom
 `register_schema`, with a `422` in FastAPI's validation-error format: one `string_too_long` entry
 per field, like the password rule's `string_too_short`. An email is measured the way it's
