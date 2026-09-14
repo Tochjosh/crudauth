@@ -13,7 +13,7 @@ async def me(user: Principal = Depends(auth.current_user())):
 import inspect
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING, Annotated, Any, Callable, Sequence
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal, Sequence
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, Field
@@ -29,7 +29,7 @@ from .constants import (
     OAUTH_STATE_TTL_SECONDS,
     USED_TOKEN_TTL_SECONDS,
 )
-from .core import AuthContext, AuthRuntime, CookieConfig, Transport
+from .core import AuthRuntime, CookieConfig, Transport
 from .email.channel import DeliveryChannel
 from .email.router import build_email_router
 from .email.service import EmailFlowService
@@ -52,9 +52,11 @@ from .ratelimit import (
     LockoutPolicy,
     MemoryRateLimiterBackend,
     RateLimit,
+    RateLimitResolver,
 )
 from .ratelimit.constants import RATE_LIMIT_NAMESPACE
 from .repository import REGISTRATION_ALLOWED_FIELDS, UserRepository
+from .resolution import PrincipalResolver
 from .storage import get_session_storage
 from .sudo import SudoConfig, SudoManager
 from .storage.constants import BACKEND_MEMORY
@@ -70,6 +72,20 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger("crudauth")
 
 __all__ = ["CRUDAuth"]
+
+
+def _accepts_two_arguments(callback: Callable[..., Any]) -> bool:
+    """Whether a rate-limit key callback takes ``(request, principal)`` rather than ``(request)``."""
+    try:
+        params = inspect.signature(callback).parameters
+    except (ValueError, TypeError):
+        return False
+    required_positional = sum(
+        1
+        for p in params.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
+    )
+    return required_positional >= 2
 
 
 class _SetPasswordIn(BaseModel):
@@ -136,6 +152,8 @@ class CRUDAuth:
         column_map: dict[str, str] | None = None,
         identity: IdentityConfig | None = None,
         oauth: dict[str, Any] | None = None,
+        oauth_paths: dict[str, str] | None = None,
+        oauth_response_mode: Literal["redirect", "json"] = "redirect",
         email: Any = None,
         channels: list[DeliveryChannel] | None = None,
         hooks: AuthHooks | None = None,
@@ -167,6 +185,17 @@ class CRUDAuth:
                 column names when they differ (e.g. ``{"hashed_password": "pw_hash"}``).
             oauth: ``{provider_name: OAuthCredentials}`` to enable OAuth login;
                 requires ``redirect_base_url`` and a session transport.
+            oauth_paths: Optional OAuth router paths: ``prefix``,
+                ``authorize_path``, and ``callback_path``. Defaults to
+                ``{"prefix": "/oauth", "authorize_path": "/{provider}/authorize",
+                "callback_path": "/{provider}/callback"}``. Both paths must contain
+                ``{provider}``. The provider redirect URI is ``redirect_base_url``
+                plus ``prefix`` plus the callback path, so ``redirect_base_url``
+                must include any prefix the app adds when mounting the router.
+            oauth_response_mode: ``"redirect"`` (default) or ``"json"``. In JSON
+                mode ``authorize`` returns ``{"url": ...}`` and ``callback``
+                returns ``{"user": ..., "csrf_token": ..., "redirect_to": ...}``
+                with the session cookies set, or a ``400`` on failure.
             email: An [EmailConfig][crudauth.email.config.EmailConfig] to enable
                 verify/reset/change flows over email (the built-in delivery
                 channel); ``None`` disables email delivery. Either ``email`` or
@@ -266,6 +295,7 @@ class CRUDAuth:
             rate_limiter=rate_limiter or MemoryRateLimiterBackend(),
             trusted_proxy_hops=trusted_proxy_hops,
         )
+        self._principals = PrincipalResolver(self.runtime)
         self._session_transport = next(
             (t for t in self.transports if isinstance(t, SessionTransport)), None
         )
@@ -289,7 +319,7 @@ class CRUDAuth:
         self._oauth_service: OAuthAccountService | None = None
         self._oauth_state_storage: AbstractSessionStorage[Any] | None = None
         if oauth:
-            self._build_oauth(oauth, redirect_base_url)
+            self._build_oauth(oauth, redirect_base_url, oauth_paths, oauth_response_mode)
 
         if warn_on_memory_backend:
             self._warn_on_memory_backend()
@@ -472,6 +502,13 @@ class CRUDAuth:
         """
         return self._oauth_service
 
+    @property
+    def oauth_router(self) -> APIRouter:
+        """The configured OAuth routes, for apps keeping their own auth routes."""
+        if self._oauth_router is None:
+            raise RuntimeError("OAuth is not configured")
+        return self._oauth_router
+
     # --- email wiring --------------------------------------------------------
     def _build_email(
         self, email: Any, channels: list[DeliveryChannel] | None, algorithm: str
@@ -496,7 +533,13 @@ class CRUDAuth:
         self.runtime.email_service = self._email_service
 
     # --- oauth wiring --------------------------------------------------------
-    def _build_oauth(self, oauth: dict[str, Any], redirect_base_url: str | None) -> None:
+    def _build_oauth(
+        self,
+        oauth: dict[str, Any],
+        redirect_base_url: str | None,
+        oauth_paths: dict[str, str] | None = None,
+        oauth_response_mode: Literal["redirect", "json"] = "redirect",
+    ) -> None:
         if self._session_transport is None:
             raise ValueError(
                 "OAuth establishes a session on callback; add a SessionTransport to transports=[...]."
@@ -504,6 +547,17 @@ class CRUDAuth:
         if not redirect_base_url:
             raise ValueError("redirect_base_url is required when oauth=... is configured")
 
+        default_paths = {
+            "prefix": "/oauth",
+            "authorize_path": "/{provider}/authorize",
+            "callback_path": "/{provider}/callback",
+        }
+        unknown_paths = sorted(set(oauth_paths or {}) - set(default_paths))
+        if unknown_paths:
+            raise ValueError(
+                f"Unknown oauth_paths key(s) {unknown_paths}; expected {sorted(default_paths)}."
+            )
+        paths = {**default_paths, **(oauth_paths or {})}
         providers = {}
         for name, creds in oauth.items():
             if not self.repo.has(f"{name}_id"):
@@ -513,7 +567,11 @@ class CRUDAuth:
                     f"'{name}_id: Mapped[str | None] = mapped_column(unique=True, index=True, "
                     f"default=None)') or map it via column_map=."
                 )
-            redirect_uri = f"{redirect_base_url.rstrip('/')}/oauth/{name}/callback"
+            callback_route = paths["callback_path"].replace("{provider}", name)
+            route = "/".join(
+                part.strip("/") for part in (paths["prefix"], callback_route) if part.strip("/")
+            )
+            redirect_uri = f"{redirect_base_url.rstrip('/')}/{route}"
             providers[name] = OAuthProviderFactory.create_provider(
                 name,
                 client_id=creds.client_id,
@@ -537,6 +595,8 @@ class CRUDAuth:
             account_service=self._oauth_service,
             session_manager=self.sessions,
             default_redirect=redirect_base_url,
+            response_mode=oauth_response_mode,
+            **paths,
         )
 
     # --- sudo wiring ---------------------------------------------------------
@@ -555,33 +615,23 @@ class CRUDAuth:
         )
 
     # --- the current_user() factory -----------------------------------------
-    async def _resolve_principal(
-        self, request: Request, db: Any, selected: list[Transport]
+    async def resolve_principal(
+        self, request: Request, update_activity: bool = False
     ) -> Principal | None:
-        """Run the transport loop once per request, per transport selection.
+        """Resolve the request principal outside FastAPI dependency injection.
 
-        Cached on ``request.state`` so multiple gates over the same selection in
-        one request (e.g. ``current_user()`` plus a ``KeyBy.USER`` rate limit,
-        which calls ``current_user()`` internally) share a single authentication
-        - one transport loop, one user load, one CSRF check - instead of running
-        it once per dependency. Gates (superuser/scopes/check) are still applied
-        per call by the caller, on the shared principal.
+        This is intended for middleware and other request-level code. It tries
+        transports in configured order, returns ``None`` for anonymous or
+        invalid credentials, does not enforce CSRF, and does not slide sessions
+        unless ``update_activity=True``. A later ``current_user()`` in the same
+        request reuses the result, reloading the user through its own session.
+
+        It opens its own DB session by calling the ``session`` dependency
+        directly, so FastAPI's ``dependency_overrides`` don't apply to it.
         """
-        cache = getattr(request.state, "_crudauth_principals", None)
-        if cache is None:
-            cache = {}
-            request.state._crudauth_principals = cache
-        key = tuple(t.name for t in selected)
-        if key in cache:
-            return cache[key]
-        ctx = AuthContext(request=request, db=db, runtime=self.runtime)
-        principal: Principal | None = None
-        for t in selected:
-            principal = await t.authenticate(request, ctx)
-            if principal is not None:
-                break
-        cache[key] = principal
-        return principal
+        return await self._principals.resolve_outside_dependencies(
+            request, self.transports, update_activity=update_activity
+        )
 
     async def authenticate_password(
         self, db: Any, identifier: str, password: str, *, request: Request
@@ -685,7 +735,7 @@ class CRUDAuth:
         async def dependency(
             request: Request, db: Annotated[Any, Depends(self.session)]
         ) -> Principal | None:
-            principal = await self._resolve_principal(request, db, selected)
+            principal = await self._principals.resolve(request, db, selected)
 
             if principal is None:
                 if optional:
@@ -757,15 +807,20 @@ class CRUDAuth:
     def rate_limit(
         self,
         action: str,
-        limit: RateLimit | None = None,
+        limit: RateLimit | RateLimitResolver | None = None,
         *,
-        key: "KeyBy | Callable[[Request], str]" = KeyBy.IP,
+        key: "KeyBy | Callable[..., str]" = KeyBy.IP,
+        transport: str | list[str] | None = None,
     ) -> Callable[..., Any]:
         """Build a FastAPI dependency that throttles an endpoint.
 
-        Resolves the limit (explicit ``limit`` → ``rate_limits=`` override →
-        :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS`), keys by IP, user, or a
-        custom function, writes ``X-RateLimit-*`` headers, and raises
+        ``limit`` is a ``RateLimit`` or a sync/async function of ``(request, principal)``
+        returning one (``None`` for no limit). Without it, the ``rate_limits=`` override
+        or :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS` entry for ``action`` applies.
+        ``key`` picks who shares a budget: a ``KeyBy`` member, ``key(request)``, or
+        ``key(request, principal)``. ``transport`` narrows which credentials identify the
+        caller, as on [current_user][crudauth.crud_auth.CRUDAuth.current_user]. Writes
+        ``X-RateLimit-*`` headers and raises
         [RateLimitException][crudauth.exceptions.RateLimitException] (429) when the caller exceeds the window.
 
         Example:
@@ -779,34 +834,75 @@ class CRUDAuth:
             raise ValueError(
                 f"No rate limit configured for action {action!r}; pass limit=RateLimit(...)."
             )
+        selected = self._select_transports(transport)
 
         if key is KeyBy.USER:
-            user_dep = self.current_user()
+            user_dep = self.current_user(transport=transport)
 
             async def by_user(
-                response: Response, principal: Annotated[Principal, Depends(user_dep)]
+                request: Request,
+                response: Response,
+                principal: Annotated[Principal, Depends(user_dep)],
             ) -> None:
-                await self._apply_rate_limit(response, action, str(principal.user_id), resolved)
+                ident = str(principal.user_id)
+                await self._apply_rate_limit(request, response, action, ident, resolved, principal)
 
             return by_user
 
+        trusted_hops = self.runtime.trusted_proxy_hops
+        needs_principal = callable(resolved)
+
         if key is KeyBy.IP:
 
-            async def by_ip(request: Request, response: Response) -> None:
-                ip = get_client_ip(request, self.runtime.trusted_proxy_hops)
-                await self._apply_rate_limit(response, action, ip, resolved)
+            def ident_for(request: Request, principal: Principal | None) -> str:
+                return get_client_ip(request, trusted_hops)
 
-            return by_ip
+        elif key is KeyBy.USER_OR_IP:
+            needs_principal = True
 
-        keyfn = key
+            def ident_for(request: Request, principal: Principal | None) -> str:
+                if principal is not None:
+                    return f"user:{principal.user_id}"
+                return f"ip:{get_client_ip(request, trusted_hops)}"
 
-        async def by_custom(request: Request, response: Response) -> None:
-            await self._apply_rate_limit(response, action, keyfn(request), resolved)
+        elif callable(key):
+            key_callback = key
+            takes_principal = _accepts_two_arguments(key_callback)
+            needs_principal = needs_principal or takes_principal
 
-        return by_custom
+            def ident_for(request: Request, principal: Principal | None) -> str:
+                if takes_principal:
+                    return key_callback(request, principal)
+                return key_callback(request)
+
+        else:
+            raise ValueError(f"Unsupported rate limit key: {key!r}")
+
+        if not needs_principal:
+
+            async def without_principal(request: Request, response: Response) -> None:
+                ident = ident_for(request, None)
+                await self._apply_rate_limit(request, response, action, ident, resolved, None)
+
+            return without_principal
+
+        async def with_principal(
+            request: Request, response: Response, db: Annotated[Any, Depends(self.session)]
+        ) -> None:
+            principal = await self._principals.resolve(request, db, selected, enforce_csrf=False)
+            ident = ident_for(request, principal)
+            await self._apply_rate_limit(request, response, action, ident, resolved, principal)
+
+        return with_principal
 
     async def _apply_rate_limit(
-        self, response: Response, action: str, ident: str, limit: RateLimit
+        self,
+        request: Request,
+        response: Response,
+        action: str,
+        ident: str,
+        limit: RateLimit | RateLimitResolver,
+        principal: Principal | None,
     ) -> None:
         """Run the window check, set ``X-RateLimit-*`` headers, raise 429 if over.
 
@@ -815,23 +911,41 @@ class CRUDAuth:
             dependency raises, so the limit headers are also attached to the
             ``RateLimitException`` on the over-limit path.
         """
+        effective: RateLimit | None
+        if callable(limit):
+            result = limit(request, principal)
+            if inspect.isawaitable(result):
+                result = await result
+            effective = result
+        else:
+            effective = limit
+        if effective is None:
+            return
         backend = self.runtime.rate_limiter
-        if backend is None or limit.disabled:
+        if backend is None or effective.disabled:
             return
         count, limited, retry_after = await backend.increment_and_check(
-            f"{RATE_LIMIT_NAMESPACE}:{action}:{ident}", limit.times, limit.seconds, fail_open=True
+            f"{RATE_LIMIT_NAMESPACE}:{action}:{ident}",
+            effective.times,
+            effective.seconds,
+            fail_open=True,
         )
-        response.headers["X-RateLimit-Limit"] = str(limit.times)
-        response.headers["X-RateLimit-Remaining"] = str(max(0, limit.times - count))
+        response.headers["X-RateLimit-Limit"] = str(effective.times)
+        response.headers["X-RateLimit-Remaining"] = str(max(0, effective.times - count))
         if limited:
             raise RateLimitException(
                 "Too many requests. Try again later.",
                 retry_after=retry_after,
                 headers={
-                    "X-RateLimit-Limit": str(limit.times),
+                    "X-RateLimit-Limit": str(effective.times),
                     "X-RateLimit-Remaining": "0",
                 },
             )
+
+    @property
+    def rate_limiter(self) -> "RateLimiterBackend | None":
+        """The configured rate-limit backend."""
+        return self.runtime.rate_limiter
 
     # --- shared routes -------------------------------------------------------
     def _shared_router(self) -> APIRouter:

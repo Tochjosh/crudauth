@@ -155,6 +155,8 @@ class AuthContext:
     request: Request
     db: "AsyncSession"
     runtime: AuthRuntime
+    enforce_csrf: bool = True
+    update_activity: bool = True
     _cache: dict[Any, Any] = field(default_factory=dict)
 
     @property
@@ -241,6 +243,18 @@ class Transport(ABC):
         hard-fail the request (e.g. a session cookie that fails CSRF).
         """
         raise NotImplementedError
+
+    async def revalidate(self, request: Request, principal: Principal, ctx: AuthContext) -> bool:
+        """Re-check a principal this transport resolved earlier in the same request.
+
+        Called when a later ``current_user()`` reuses a principal that was
+        resolved with fewer checks, e.g. by ``auth.resolve_principal`` in
+        middleware. ``ctx.enforce_csrf`` and ``ctx.update_activity`` say which
+        checks are still missing. Return ``False`` if the credential is no longer
+        valid; raise, like ``authenticate``, for one that must hard-fail. The
+        default has nothing to re-check.
+        """
+        return True
 
     def contributes_routes(self) -> APIRouter | None:
         """Return an `APIRouter` of endpoints this transport adds, or ``None``."""

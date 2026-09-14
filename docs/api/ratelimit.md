@@ -5,6 +5,8 @@ pluggable backend. Use `redis_rate_limiter(...)` in production.
 
 ::: crudauth.ratelimit.RateLimit
 
+::: crudauth.ratelimit.RateLimitResolver
+
 ::: crudauth.ratelimit.KeyBy
 
 ::: crudauth.ratelimit.LockoutPolicy

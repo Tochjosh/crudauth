@@ -69,7 +69,7 @@ bodies are shaped to the factor (`{"email": ...}` or `{"phone": ...}`). ([Email 
 
 ## OAuth
 
-Mounted per provider in `oauth={...}` (needs a `SessionTransport` + `redirect_base_url`). ([OAuth](../guides/auth/oauth.md))
+Mounted per provider in `oauth={...}` (needs a `SessionTransport` + `redirect_base_url`). The paths below are the defaults; `oauth_paths` and `oauth_response_mode` change the paths and switch both routes to JSON responses. ([OAuth](../guides/auth/oauth.md#custom-paths-and-json-responses))
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
