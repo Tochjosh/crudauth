@@ -29,7 +29,7 @@ from .constants import (
     OAUTH_STATE_TTL_SECONDS,
     USED_TOKEN_TTL_SECONDS,
 )
-from .core import AuthContext, AuthRuntime, CookieConfig, Transport
+from .core import AuthRuntime, CookieConfig, Transport
 from .email.channel import DeliveryChannel
 from .email.router import build_email_router
 from .email.service import EmailFlowService
@@ -55,6 +55,7 @@ from .ratelimit import (
 )
 from .ratelimit.constants import RATE_LIMIT_NAMESPACE
 from .repository import REGISTRATION_ALLOWED_FIELDS, UserRepository
+from .resolution import PrincipalResolver
 from .storage import get_session_storage
 from .sudo import SudoConfig, SudoManager
 from .storage.constants import BACKEND_MEMORY
@@ -266,6 +267,7 @@ class CRUDAuth:
             rate_limiter=rate_limiter or MemoryRateLimiterBackend(),
             trusted_proxy_hops=trusted_proxy_hops,
         )
+        self._principals = PrincipalResolver(self.runtime)
         self._session_transport = next(
             (t for t in self.transports if isinstance(t, SessionTransport)), None
         )
@@ -555,119 +557,6 @@ class CRUDAuth:
         )
 
     # --- the current_user() factory -----------------------------------------
-    async def _resolve_principal(
-        self,
-        request: Request,
-        db: Any,
-        selected: list[Transport],
-        *,
-        enforce_csrf: bool = True,
-        update_activity: bool = True,
-    ) -> Principal | None:
-        """Run the transport loop once per request, per transport selection.
-
-        Cached on ``request.state`` so multiple gates over the same selection in
-        one request (e.g. ``current_user()`` plus a ``KeyBy.USER`` rate limit,
-        which calls ``current_user()`` internally) share a single authentication
-        - one transport loop, one user load, one CSRF check - instead of running
-        it once per dependency. Gates (superuser/scopes/check) are still applied
-        per call by the caller, on the shared principal.
-
-        The cache stores only identity snapshots (no ORM user object), so a
-        middleware-resolved principal can be safely rehydrated through a route's
-        own DB session without detached-instance errors.
-        """
-        cache = getattr(request.state, "_crudauth_principals", None)
-        if cache is None:
-            cache = {}
-            request.state._crudauth_principals = cache
-        key = tuple(t.name for t in selected)
-
-        if key in cache:
-            snapshot = cache[key]
-            if snapshot is None:
-                return None
-
-            # Rehydrate: load the user through the route's DB session.
-            user = await self.repo.get_by_id(db, snapshot["user_id"])
-            if user is None or not self.repo.is_active(user):
-                return None
-
-            cached_principal = Principal(
-                user_id=snapshot["user_id"],
-                scopes=snapshot["scopes"],
-                transport=snapshot["transport"],
-                user=user,
-                is_superuser=snapshot["is_superuser"],
-                email_verified=snapshot["email_verified"],
-                recovery_verified=snapshot["recovery_verified"],
-                metadata=snapshot["metadata"],
-            )
-
-            # When upgrading from middleware (csrf_enforced=False) on an unsafe
-            # method, enforce CSRF now via the session transport.
-            if (
-                enforce_csrf
-                and not snapshot.get("csrf_enforced")
-                and request.method.upper() in ("POST", "PUT", "PATCH", "DELETE")
-            ):
-                for t in selected:
-                    if isinstance(t, SessionTransport) and t.manager is not None:
-                        session_id = snapshot["metadata"].get("session_id")
-                        if session_id:
-                            session = await t.manager.validate_session(
-                                session_id, update_activity=update_activity
-                            )
-                            if session is None:
-                                return None
-                            await t._enforce_csrf(request, session_id)
-                        break
-            return cached_principal
-
-        ctx = AuthContext(
-            request=request,
-            db=db,
-            runtime=self.runtime,
-            enforce_csrf=enforce_csrf,
-            update_activity=update_activity,
-        )
-        principal: Principal | None = None
-        for t in selected:
-            principal = await t.authenticate(request, ctx)
-            if principal is not None:
-                break
-
-        # Only cache successful results; never cache None so a later
-        # dependency still raises 401 for tampered/missing credentials.
-        if principal is not None:
-            cache[key] = {
-                "user_id": principal.user_id,
-                "scopes": principal.scopes,
-                "transport": principal.transport,
-                "is_superuser": principal.is_superuser,
-                "email_verified": principal.email_verified,
-                "recovery_verified": principal.recovery_verified,
-                "metadata": dict(principal.metadata),
-                "csrf_enforced": enforce_csrf,
-            }
-        return principal
-
-    async def _open_session(self) -> tuple[Any, Callable[[], Any] | None]:
-        """Open a DB session from the configured dependency, handling all shapes."""
-        provided = self.session()
-        close: Callable[[], Any] | None = None
-        if inspect.isawaitable(provided):
-            db = await provided
-        elif inspect.isasyncgen(provided):
-            db = await anext(provided)
-            close = provided.aclose
-        elif inspect.isgenerator(provided):
-            db = next(provided)
-            close = provided.close
-        else:
-            db = provided
-        return db, close
-
     async def resolve_principal(
         self, request: Request, update_activity: bool = False
     ) -> Principal | None:
@@ -676,29 +565,15 @@ class CRUDAuth:
         This is intended for middleware and other request-level code. It tries
         transports in configured order, returns ``None`` for anonymous or
         invalid credentials, does not enforce CSRF, and does not slide sessions
-        unless ``update_activity=True``. The result shares the cache used by
-        ``current_user()``.
+        unless ``update_activity=True``. A later ``current_user()`` in the same
+        request reuses the result, reloading the user through its own session.
+
+        It opens its own DB session by calling the ``session`` dependency
+        directly, so FastAPI's ``dependency_overrides`` don't apply to it.
         """
-        selected = self.transports
-        db, close = await self._open_session()
-        try:
-            try:
-                return await self._resolve_principal(
-                    request,
-                    db,
-                    selected,
-                    enforce_csrf=False,
-                    update_activity=update_activity,
-                )
-            except UnauthorizedException:
-                # Don't cache - current_user() must re-run the transport
-                # so tampered credentials raise 401 instead of returning None.
-                return None
-        finally:
-            if close is not None:
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
+        return await self._principals.resolve_outside_dependencies(
+            request, self.transports, update_activity=update_activity
+        )
 
     async def authenticate_password(
         self, db: Any, identifier: str, password: str, *, request: Request
@@ -802,7 +677,7 @@ class CRUDAuth:
         async def dependency(
             request: Request, db: Annotated[Any, Depends(self.session)]
         ) -> Principal | None:
-            principal = await self._resolve_principal(request, db, selected)
+            principal = await self._principals.resolve(request, db, selected)
 
             if principal is None:
                 if optional:
