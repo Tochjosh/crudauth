@@ -52,6 +52,7 @@ from .ratelimit import (
     LockoutPolicy,
     MemoryRateLimiterBackend,
     RateLimit,
+    RateLimitResolver,
 )
 from .ratelimit.constants import RATE_LIMIT_NAMESPACE
 from .repository import REGISTRATION_ALLOWED_FIELDS, UserRepository
@@ -71,6 +72,20 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger("crudauth")
 
 __all__ = ["CRUDAuth"]
+
+
+def _accepts_two_arguments(callback: Callable[..., Any]) -> bool:
+    """Whether a rate-limit key callback takes ``(request, principal)`` rather than ``(request)``."""
+    try:
+        params = inspect.signature(callback).parameters
+    except (ValueError, TypeError):
+        return False
+    required_positional = sum(
+        1
+        for p in params.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
+    )
+    return required_positional >= 2
 
 
 class _SetPasswordIn(BaseModel):
@@ -792,15 +807,20 @@ class CRUDAuth:
     def rate_limit(
         self,
         action: str,
-        limit: RateLimit | None = None,
+        limit: RateLimit | RateLimitResolver | None = None,
         *,
-        key: "KeyBy | Callable[[Request], str]" = KeyBy.IP,
+        key: "KeyBy | Callable[..., str]" = KeyBy.IP,
+        transport: str | list[str] | None = None,
     ) -> Callable[..., Any]:
         """Build a FastAPI dependency that throttles an endpoint.
 
-        Resolves the limit (explicit ``limit`` → ``rate_limits=`` override →
-        :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS`), keys by IP, user, or a
-        custom function, writes ``X-RateLimit-*`` headers, and raises
+        ``limit`` is a ``RateLimit`` or a sync/async function of ``(request, principal)``
+        returning one (``None`` for no limit). Without it, the ``rate_limits=`` override
+        or :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS` entry for ``action`` applies.
+        ``key`` picks who shares a budget: a ``KeyBy`` member, ``key(request)``, or
+        ``key(request, principal)``. ``transport`` narrows which credentials identify the
+        caller, as on [current_user][crudauth.crud_auth.CRUDAuth.current_user]. Writes
+        ``X-RateLimit-*`` headers and raises
         [RateLimitException][crudauth.exceptions.RateLimitException] (429) when the caller exceeds the window.
 
         Example:
@@ -814,34 +834,75 @@ class CRUDAuth:
             raise ValueError(
                 f"No rate limit configured for action {action!r}; pass limit=RateLimit(...)."
             )
+        selected = self._select_transports(transport)
 
         if key is KeyBy.USER:
-            user_dep = self.current_user()
+            user_dep = self.current_user(transport=transport)
 
             async def by_user(
-                response: Response, principal: Annotated[Principal, Depends(user_dep)]
+                request: Request,
+                response: Response,
+                principal: Annotated[Principal, Depends(user_dep)],
             ) -> None:
-                await self._apply_rate_limit(response, action, str(principal.user_id), resolved)
+                ident = str(principal.user_id)
+                await self._apply_rate_limit(request, response, action, ident, resolved, principal)
 
             return by_user
 
+        trusted_hops = self.runtime.trusted_proxy_hops
+        needs_principal = callable(resolved)
+
         if key is KeyBy.IP:
 
-            async def by_ip(request: Request, response: Response) -> None:
-                ip = get_client_ip(request, self.runtime.trusted_proxy_hops)
-                await self._apply_rate_limit(response, action, ip, resolved)
+            def ident_for(request: Request, principal: Principal | None) -> str:
+                return get_client_ip(request, trusted_hops)
 
-            return by_ip
+        elif key is KeyBy.USER_OR_IP:
+            needs_principal = True
 
-        keyfn = key
+            def ident_for(request: Request, principal: Principal | None) -> str:
+                if principal is not None:
+                    return f"user:{principal.user_id}"
+                return f"ip:{get_client_ip(request, trusted_hops)}"
 
-        async def by_custom(request: Request, response: Response) -> None:
-            await self._apply_rate_limit(response, action, keyfn(request), resolved)
+        elif callable(key):
+            key_callback = key
+            takes_principal = _accepts_two_arguments(key_callback)
+            needs_principal = needs_principal or takes_principal
 
-        return by_custom
+            def ident_for(request: Request, principal: Principal | None) -> str:
+                if takes_principal:
+                    return key_callback(request, principal)
+                return key_callback(request)
+
+        else:
+            raise ValueError(f"Unsupported rate limit key: {key!r}")
+
+        if not needs_principal:
+
+            async def without_principal(request: Request, response: Response) -> None:
+                ident = ident_for(request, None)
+                await self._apply_rate_limit(request, response, action, ident, resolved, None)
+
+            return without_principal
+
+        async def with_principal(
+            request: Request, response: Response, db: Annotated[Any, Depends(self.session)]
+        ) -> None:
+            principal = await self._principals.resolve(request, db, selected, enforce_csrf=False)
+            ident = ident_for(request, principal)
+            await self._apply_rate_limit(request, response, action, ident, resolved, principal)
+
+        return with_principal
 
     async def _apply_rate_limit(
-        self, response: Response, action: str, ident: str, limit: RateLimit
+        self,
+        request: Request,
+        response: Response,
+        action: str,
+        ident: str,
+        limit: RateLimit | RateLimitResolver,
+        principal: Principal | None,
     ) -> None:
         """Run the window check, set ``X-RateLimit-*`` headers, raise 429 if over.
 
@@ -850,23 +911,41 @@ class CRUDAuth:
             dependency raises, so the limit headers are also attached to the
             ``RateLimitException`` on the over-limit path.
         """
+        effective: RateLimit | None
+        if callable(limit):
+            result = limit(request, principal)
+            if inspect.isawaitable(result):
+                result = await result
+            effective = result
+        else:
+            effective = limit
+        if effective is None:
+            return
         backend = self.runtime.rate_limiter
-        if backend is None or limit.disabled:
+        if backend is None or effective.disabled:
             return
         count, limited, retry_after = await backend.increment_and_check(
-            f"{RATE_LIMIT_NAMESPACE}:{action}:{ident}", limit.times, limit.seconds, fail_open=True
+            f"{RATE_LIMIT_NAMESPACE}:{action}:{ident}",
+            effective.times,
+            effective.seconds,
+            fail_open=True,
         )
-        response.headers["X-RateLimit-Limit"] = str(limit.times)
-        response.headers["X-RateLimit-Remaining"] = str(max(0, limit.times - count))
+        response.headers["X-RateLimit-Limit"] = str(effective.times)
+        response.headers["X-RateLimit-Remaining"] = str(max(0, effective.times - count))
         if limited:
             raise RateLimitException(
                 "Too many requests. Try again later.",
                 retry_after=retry_after,
                 headers={
-                    "X-RateLimit-Limit": str(limit.times),
+                    "X-RateLimit-Limit": str(effective.times),
                     "X-RateLimit-Remaining": "0",
                 },
             )
+
+    @property
+    def rate_limiter(self) -> "RateLimiterBackend | None":
+        """The configured rate-limit backend."""
+        return self.runtime.rate_limiter
 
     # --- shared routes -------------------------------------------------------
     def _shared_router(self) -> APIRouter:

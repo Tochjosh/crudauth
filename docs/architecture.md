@@ -64,7 +64,7 @@ so a phone-recovery app drives them with a phone number.
 
 When a route depends on `current_user()`, the `PrincipalResolver` (`resolution.py`) runs the
 transport loop once and caches the result on `request.state`, so combining gates (and a
-`KeyBy.USER` rate limit that resolves the user internally) does one authentication, not several:
+rate limit that reads the principal) does one authentication, not several:
 
 1. Each selected transport is tried in order. A transport returns `None` when its credential
    is **absent** (move on) but raises for one that's **present but invalid** (a tampered
