@@ -17,7 +17,7 @@ from ..constants import (
     DEFAULT_VERIFY_TTL_HOURS,
     SECONDS_PER_HOUR,
 )
-from ..exceptions import BadRequestException, DuplicateValueException
+from ..exceptions import BadRequestException, DuplicateValueException, UnprocessableEntityException
 from ..hooks import AuthHooks, HookContext
 from ..ratelimit import RateLimit
 from ..repository import UserRepository
@@ -366,6 +366,9 @@ class EmailFlowService:
         if not verify_password(password, self.repo.get(user, "hashed_password", "")):
             raise BadRequestException("Incorrect password")
         new_email_c = canonical_email(new_email)
+        limit = self.repo.exceeds_length("email", new_email_c)
+        if limit is not None:
+            raise UnprocessableEntityException(f"Email must be at most {limit} characters")
         if new_email_c == canonical_email(self.repo.get(user, "email")):
             raise BadRequestException("New email matches current email")
         if not await self._email_within_limit(CHANGE_ACTION, new_email_c):

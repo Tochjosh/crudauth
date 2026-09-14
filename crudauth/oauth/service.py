@@ -116,6 +116,12 @@ class OAuthAccountService:
                 f"The {info.provider} account did not provide an email address, "
                 "which is required to create an account."
             )
+        limit = self.repo.exceeds_length("email", canonical_email(info.email))
+        if limit is not None:
+            raise BadRequestException(
+                f"The {info.provider} email address is longer than the {limit} characters "
+                "this app accepts."
+            )
         user = await self._create_user(info, db)
         return user, True
 

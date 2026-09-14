@@ -94,8 +94,8 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
         data = auth.repo.filter_registration_data(data)
         login_values = {f: data.pop(f) for f in login_fields}
         for field, value in {**login_values, **data}.items():
-            limit = auth.repo.string_length(field)
-            if isinstance(value, str) and limit is not None and len(value) > limit:
+            limit = auth.repo.exceeds_length(field, value)
+            if limit is not None:
                 label = field.replace("_", " ").capitalize()
                 raise UnprocessableEntityException(f"{label} must be at most {limit} characters")
 

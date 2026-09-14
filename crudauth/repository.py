@@ -139,6 +139,13 @@ class UserRepository:
             return None
         return column.type.length
 
+    def exceeds_length(self, logical: str, value: Any) -> int | None:
+        """Return the column length when ``value`` is a string longer than it, else ``None``."""
+        limit = self.string_length(logical)
+        if isinstance(value, str) and limit is not None and len(value) > limit:
+            return limit
+        return None
+
     # --- reads ---------------------------------------------------------------
     def _coerce_id(self, user_id: Any) -> Any:
         """Coerce ``user_id`` to the PK's Python type.
