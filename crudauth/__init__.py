@@ -37,6 +37,7 @@ from .exceptions import (
     SudoLockoutError,
     UnauthorizedException,
     UnprocessableEntityException,
+    ValueTooLongException,
 )
 from .crud_auth import CRUDAuth, SessionInfo
 from .email.service import EmailFlowService
@@ -106,6 +107,7 @@ __all__ = [
     "UnauthorizedException",
     "UnprocessableEntityException",
     "DuplicateValueException",
+    "ValueTooLongException",
     "RateLimitException",
     "SudoLockoutError",
     "CSRFException",

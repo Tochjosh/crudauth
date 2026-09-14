@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import String, Text, TypeDecorator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from crudauth.repository import UserRepository
+
+
+class Nickname(TypeDecorator):
+    impl = String(5)
+    cache_ok = True
 
 
 class Base(DeclarativeBase):
@@ -21,6 +27,16 @@ class Account(Base):
     username: Mapped[str] = mapped_column(unique=True)
     pw_hash: Mapped[str] = mapped_column()
     is_admin: Mapped[bool] = mapped_column(default=False)
+
+
+class SizedAccount(Base):
+    __tablename__ = "sized_accounts"
+
+    account_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email_address: Mapped[str] = mapped_column(String(80), unique=True)
+    username: Mapped[str] = mapped_column(String(12), unique=True)
+    nickname: Mapped[str | None] = mapped_column(Nickname, default=None)
+    bio: Mapped[str | None] = mapped_column(Text, default=None)
 
 
 COLUMN_MAP = {
@@ -100,3 +116,28 @@ def test_column_map_translation(UserModel) -> None:
     assert repo.col("email") == "email"
     repo2 = UserRepository(UserModel, column_map={"hashed_password": "email"})
     assert repo2.col("hashed_password") == "email"
+
+
+def test_string_length_reads_the_resolved_column() -> None:
+    repo = UserRepository(SizedAccount, column_map={"id": "account_id", "email": "email_address"})
+    assert repo.string_length("email") == 80
+    assert repo.string_length("username") == 12
+    assert repo.string_length("bio") is None
+    assert repo.string_length("missing") is None
+
+
+def test_exceeds_length_reports_the_column_limit() -> None:
+    repo = UserRepository(SizedAccount, column_map={"id": "account_id", "email": "email_address"})
+    assert repo.exceeds_length("username", "a" * 13) == 12
+    assert repo.exceeds_length("username", "a" * 12) is None
+    assert repo.exceeds_length("nickname", "sixsix") == 5
+    assert repo.exceeds_length("bio", "a" * 10_000) is None
+    assert repo.exceeds_length("username", 10**20) is None
+
+
+def test_exceeds_length_measures_the_canonical_email() -> None:
+    repo = UserRepository(SizedAccount, column_map={"id": "account_id", "email": "email_address"})
+    fits_once_canonical = "  " + "A" * 75 + "@X.CO  "
+    assert repo.exceeds_length("email", fits_once_canonical) is None
+    assert repo.exceeds_length("email_address", fits_once_canonical) is None
+    assert repo.exceeds_length("email", "a" * 76 + "@x.co") == 80
