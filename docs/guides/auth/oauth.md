@@ -55,8 +55,9 @@ On a successful callback, CRUDAuth finds or creates the user:
   provider's username, given name, display name, or email local-part, reduced to lowercase
   letters, digits, and single underscores, and cut to your `username` column's length (32 when
   the column has no length). A taken username gets `_1`, `_2`, ... and then a random suffix,
-  still within that length. To set your own columns on that user (a required `name`, a default
-  tier), use `new_user_fields` / `new_user_defaults`, which run on this path too; see
+  still within that length. A provider email longer than your `email` column fails the sign-in
+  with `400` instead of reaching the insert. To set your own columns on that user (a required
+  `name`, a default tier), use `new_user_fields` / `new_user_defaults`, which run on this path too; see
   [Registration](../accounts/registration.md#setting-columns-the-server-controls).
 
 This linking logic lives in `auth.oauth` (an `OAuthAccountService`, or `None` when OAuth isn't
