@@ -58,7 +58,8 @@ auth = CRUDAuth(
 
 `new_user_defaults` merges first, then `new_user_fields`, so a derived value can override a constant.
 `ctx.suggested_name` is the OAuth display name, falling back to the email local-part, so the same
-callback does the right thing on both signup paths.
+callback does the right thing on both signup paths. It isn't truncated, so slice it when your column
+is shorter than a provider's display name can be (`ctx.suggested_name[:50]`).
 
 ## See it in action
 
