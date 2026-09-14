@@ -13,10 +13,10 @@ async def me(user: Principal = Depends(auth.current_user())):
 import inspect
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal, Sequence
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal, Sequence, cast
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 from .register import build_register_route
 from .constants import (
@@ -25,7 +25,6 @@ from .constants import (
     DEFAULT_LOGIN_LOCKOUT_BASE_SECONDS,
     DEFAULT_LOGIN_LOCKOUT_MAX_SECONDS,
     DEFAULT_LOGIN_MAX_ATTEMPTS,
-    MIN_PASSWORD_LENGTH,
     OAUTH_STATE_TTL_SECONDS,
     USED_TOKEN_TTL_SECONDS,
 )
@@ -45,6 +44,7 @@ from .identity import IdentityConfig
 from .oauth import OAuthAccountService, OAuthProviderFactory
 from .oauth.router import build_oauth_router
 from .principal import Principal
+from .password import PasswordContext, PasswordPolicy, PasswordSource
 from .provisioning import NewUserFields
 from .ratelimit import (
     DEFAULT_RATE_LIMITS,
@@ -63,7 +63,13 @@ from .storage.constants import BACKEND_MEMORY
 from .transports.bearer.transport import BearerTransport
 from .transports.session.constants import REMEMBER_ME_META_KEY
 from .transports.session.transport import SessionTransport
-from .utils import get_client_ip, get_password_hash, is_unusable_password, verify_password
+from .utils import (
+    get_client_ip,
+    get_password_hash,
+    is_unusable_password,
+    takes_two_arguments,
+    verify_password,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .ratelimit import RateLimiterBackend
@@ -74,27 +80,13 @@ logger = logging.getLogger("crudauth")
 __all__ = ["CRUDAuth"]
 
 
-def _accepts_two_arguments(callback: Callable[..., Any]) -> bool:
-    """Whether a rate-limit key callback takes ``(request, principal)`` rather than ``(request)``."""
-    try:
-        params = inspect.signature(callback).parameters
-    except (ValueError, TypeError):
-        return False
-    required_positional = sum(
-        1
-        for p in params.values()
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
-    )
-    return required_positional >= 2
-
-
 class _SetPasswordIn(BaseModel):
-    new_password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
+    new_password: str
 
 
 class _ChangePasswordIn(BaseModel):
     current_password: str
-    new_password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
+    new_password: str
 
 
 class SessionInfo(BaseModel):
@@ -169,6 +161,7 @@ class CRUDAuth:
         trusted_proxy_hops: int = 0,
         sudo: SudoConfig | None = None,
         warn_on_memory_backend: bool = True,
+        password_policy: PasswordPolicy | None = None,
     ):
         """Configure the auth surface.
 
@@ -256,6 +249,9 @@ class CRUDAuth:
                 per-process, so under multiple workers it silently breaks; set
                 ``False`` to silence once you've accepted that (e.g. single-worker
                 dev).
+            password_policy: The [PasswordPolicy][crudauth.password.PasswordPolicy] every
+                new password must meet on registration, set, change and reset. The
+                default requires at least 8 characters.
 
         Raises:
             ValueError: If ``SECRET_KEY`` is empty; if ``oauth`` or ``sudo`` is
@@ -266,6 +262,7 @@ class CRUDAuth:
         if not SECRET_KEY:
             raise ValueError("SECRET_KEY is required")
         self.session = session
+        self.password_policy = password_policy or PasswordPolicy()
         self.identity = identity or IdentityConfig()
         self.repo = UserRepository(
             user_model,
@@ -462,6 +459,27 @@ class CRUDAuth:
         )
 
     # --- public: session manager --------------------------------------------
+    async def validate_password(
+        self,
+        password: str,
+        *,
+        user: Any = None,
+        source: PasswordSource = "set",
+        field: str = "password",
+    ) -> None:
+        """Check ``password`` against ``password_policy`` before your own code hashes it.
+
+        Raises [PasswordPolicyException][crudauth.exceptions.PasswordPolicyException]
+        (422) at ``field`` when it fails. Pass the ``user`` it's for so validators
+        taking a [PasswordContext][crudauth.password.PasswordContext] see its username
+        and email.
+        """
+        if user is None:
+            context = PasswordContext(source=source)
+        else:
+            context = PasswordContext.for_user(self.repo, source, user)
+        await self.password_policy.enforce(password, context, field=field)
+
     @property
     def sessions(self):
         """The [SessionManager][crudauth.transports.session.manager.SessionManager] of the configured session transport."""
@@ -529,6 +547,7 @@ class CRUDAuth:
             session_manager=self.sessions if self._session_transport else None,
             rate_limiter=self.runtime.rate_limiter,
             rate_limits=self._rate_limits,
+            password_policy=self.password_policy,
         )
         self.runtime.email_service = self._email_service
 
@@ -867,7 +886,7 @@ class CRUDAuth:
 
         elif callable(key):
             key_callback = key
-            takes_principal = _accepts_two_arguments(key_callback)
+            takes_principal = takes_two_arguments(key_callback)
             needs_principal = needs_principal or takes_principal
 
             def ident_for(request: Request, principal: Principal | None) -> str:
@@ -951,6 +970,13 @@ class CRUDAuth:
     def _shared_router(self) -> APIRouter:
         router = APIRouter(tags=["auth"])
         router.include_router(build_register_route(self, self._register_schema))
+        password_field = (self.password_policy.body_field(), ...)
+        SetPasswordModel = create_model(
+            "_SetPasswordIn", __base__=_SetPasswordIn, new_password=password_field
+        )
+        ChangePasswordModel = create_model(
+            "_ChangePasswordIn", __base__=_ChangePasswordIn, new_password=password_field
+        )
 
         @router.get("/me")
         async def me(user: Annotated[Principal, Depends(self.current_user())]):
@@ -966,7 +992,7 @@ class CRUDAuth:
 
         @router.post("/set-password")
         async def set_password(
-            body: _SetPasswordIn,
+            body: SetPasswordModel,  # type: ignore[valid-type]
             principal: Annotated[Principal, Depends(self.current_user())],
             db: Annotated[Any, Depends(self.session)],
         ):
@@ -989,13 +1015,15 @@ class CRUDAuth:
                 requires first-password establishment to be browser-only.
             """
             user = principal.user
+            new_password = cast(_SetPasswordIn, body).new_password
             if not is_unusable_password(self.repo.get(user, "hashed_password", "")):
                 raise BadRequestException(
                     "Account already has a password; use the password reset flow to change it."
                 )
-            await self.repo.update(
-                db, user, {"hashed_password": get_password_hash(body.new_password)}
+            await self.validate_password(
+                new_password, user=user, source="set", field="new_password"
             )
+            await self.repo.update(db, user, {"hashed_password": get_password_hash(new_password)})
             return {"detail": "Password set."}
 
         @router.post(
@@ -1003,7 +1031,7 @@ class CRUDAuth:
             dependencies=[Depends(self.rate_limit("change_password", key=KeyBy.USER))],
         )
         async def change_password(
-            body: _ChangePasswordIn,
+            body: ChangePasswordModel,  # type: ignore[valid-type]
             request: Request,
             principal: Annotated[Principal, Depends(self.current_user())],
             db: Annotated[Any, Depends(self.session)],
@@ -1029,10 +1057,14 @@ class CRUDAuth:
                 raise BadRequestException(
                     "Account has no password; use /set-password to create one."
                 )
-            if not verify_password(body.current_password, current_hash):
+            change = cast(_ChangePasswordIn, body)
+            if not verify_password(change.current_password, current_hash):
                 raise UnauthorizedException("Current password is incorrect.")
+            await self.validate_password(
+                change.new_password, user=user, source="change", field="new_password"
+            )
             await self.repo.update(
-                db, user, {"hashed_password": get_password_hash(body.new_password)}
+                db, user, {"hashed_password": get_password_hash(change.new_password)}
             )
             await self.repo.increment_token_version(db, user)
             if self.sessions is not None:

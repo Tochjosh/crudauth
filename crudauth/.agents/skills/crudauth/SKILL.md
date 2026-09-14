@@ -156,6 +156,13 @@ the PK) are never settable through any of these. A client value longer than its 
 `422` on `/register` and `/email/change-request`, and an over-long provider email fails OAuth signup with
 `400`, before anything is written.
 
+New passwords (`/register`, `/set-password`, `/change-password`, `/password/reset-confirm`, and a direct
+`EmailFlowService.reset_password`) must meet `password_policy=PasswordPolicy(min_length=8, require_uppercase=...,
+require_lowercase=..., require_digit=..., require_special=..., validators=[...])`, failing with a validation-shaped
+`422` per unmet rule. A validator raises `ValueError`; one taking `(password, context)` gets a `PasswordContext`
+(`source`, `username`, `email`, `user`). Before hashing a password in your own code, call
+`await auth.validate_password(password, user=user, source="change")`.
+
 ---
 
 ## OAuth

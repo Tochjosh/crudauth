@@ -19,6 +19,7 @@ __all__ = [
     "UnprocessableEntityException",
     "DuplicateValueException",
     "ValueTooLongException",
+    "PasswordPolicyException",
     "RateLimitException",
     "SudoLockoutError",
     "CSRFException",
@@ -83,6 +84,21 @@ class ValueTooLongException(CustomException):
                 for field, limit in limits.items()
             ],
         )
+
+
+class PasswordPolicyException(CustomException):
+    """A ``422`` in FastAPI's validation-error format, one entry per unmet password rule."""
+
+    def __init__(self, field: str, errors: list[dict[str, Any]]):
+        self.errors = [
+            {
+                "type": error["type"],
+                "loc": ["body", field],
+                **{key: value for key, value in error.items() if key != "type"},
+            }
+            for error in errors
+        ]
+        super().__init__(status_code=422, detail=self.errors)
 
 
 class RateLimitException(CustomException):

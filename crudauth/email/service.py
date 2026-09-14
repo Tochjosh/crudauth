@@ -21,6 +21,7 @@ from ..exceptions import BadRequestException, DuplicateValueException, ValueTooL
 from ..hooks import AuthHooks, HookContext
 from ..ratelimit import RateLimit
 from ..repository import UserRepository
+from ..password import PasswordContext, PasswordPolicy
 from ..storage.base import AbstractSessionStorage
 from ..transports.bearer.tokens import (
     create_signed_token,
@@ -91,8 +92,10 @@ class EmailFlowService:
         verify_ttl_hours: int | None = None,
         reset_ttl_hours: int | None = None,
         change_ttl_hours: int | None = None,
+        password_policy: PasswordPolicy | None = None,
     ):
         self.repo = repo
+        self.password_policy = password_policy or PasswordPolicy()
         self.secret_key = secret_key
         self.hooks = hooks
         self.algorithm = algorithm
@@ -317,6 +320,8 @@ class EmailFlowService:
 
         Raises:
             BadRequestException: If the token is invalid, expired, or already used.
+            PasswordPolicyException: If ``new_password`` fails the password policy. The
+                token isn't used up, so the user can retry with a stronger password.
 
         Note:
             A reset is attacker-eviction: it often follows a compromise, so any
@@ -330,11 +335,14 @@ class EmailFlowService:
         sub = verify_signed_token(token, self.secret_key, RESET, algorithm=self.algorithm)
         if sub is None:
             raise BadRequestException("Invalid or expired token")
-        if not await self._consume(token, self.reset_ttl_hours * SECONDS_PER_HOUR):
-            raise BadRequestException("Token already used")
         user = await self.repo.get_by_id(db, sub)
         if user is None:
             raise BadRequestException("Invalid or expired token")
+        await self.password_policy.enforce(
+            new_password, PasswordContext.for_user(self.repo, "reset", user), field="new_password"
+        )
+        if not await self._consume(token, self.reset_ttl_hours * SECONDS_PER_HOUR):
+            raise BadRequestException("Token already used")
         await self.repo.update(db, user, {"hashed_password": get_password_hash(new_password)})
         await self.repo.increment_token_version(db, user)
         if self.session_manager is not None:

@@ -33,6 +33,7 @@ from .exceptions import (
     DuplicateValueException,
     ForbiddenException,
     NotFoundException,
+    PasswordPolicyException,
     RateLimitException,
     SudoLockoutError,
     UnauthorizedException,
@@ -46,6 +47,7 @@ from .identity import IdentityConfig
 from .models.mixin import AuthUserMixin, make_auth_identity
 from .oauth import OAuthAccountService, OAuthCredentials
 from .principal import Principal
+from .password import PasswordContext, PasswordPolicy
 from .provisioning import NewUserContext, NewUserFields
 from .repository import UserRepository
 from .sudo import SudoConfig, SudoManager
@@ -86,6 +88,8 @@ __all__ = [
     "Transport",
     "AuthContext",
     "CookieConfig",
+    "PasswordPolicy",
+    "PasswordContext",
     "SudoConfig",
     # toolbox: reusable building blocks (use the wired services off `auth`, or
     # construct/type them directly). Token issuance is intentionally not exported
@@ -108,6 +112,7 @@ __all__ = [
     "UnprocessableEntityException",
     "DuplicateValueException",
     "ValueTooLongException",
+    "PasswordPolicyException",
     "RateLimitException",
     "SudoLockoutError",
     "CSRFException",

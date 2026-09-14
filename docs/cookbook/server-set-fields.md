@@ -21,12 +21,12 @@ If the user types the value at signup (a display name, say), add it to your `reg
 opt the column into the write allowlist:
 
 ```python
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 class Register(BaseModel):
     email: str
     username: str
-    password: str = Field(min_length=8)
+    password: str
     display_name: str
 
 auth = CRUDAuth(

@@ -6,7 +6,7 @@ import httpx
 from fastapi import FastAPI
 from starlette.requests import Request
 
-from crudauth import CRUDAuth, CookieConfig, SessionTransport
+from crudauth import CRUDAuth, CookieConfig, PasswordContext, PasswordPolicy, SessionTransport
 from crudauth.repository import UserRepository
 from crudauth.utils import get_password_hash, make_unusable_password
 
@@ -17,12 +17,13 @@ def _request() -> Request:
     return Request({"type": "http", "method": "GET", "headers": [], "client": ("1.2.3.4", 1234)})
 
 
-def _build(get_session, UserModel):
+def _build(get_session, UserModel, password_policy=None):
     auth = CRUDAuth(
         session=get_session,
         user_model=UserModel,
         SECRET_KEY=SECRET,
         transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+        password_policy=password_policy,
     )
     app = FastAPI()
     app.include_router(auth.router)
@@ -103,3 +104,56 @@ async def test_set_password_enforces_min_length(get_session, UserModel, sessionm
         )
         assert r.status_code == 422
     await auth.shutdown()
+
+
+async def test_set_password_enforces_the_policy_with_the_user_context(
+    get_session, UserModel, sessionmaker
+) -> None:
+    contexts: list[PasswordContext] = []
+
+    def record(password: str, context: PasswordContext) -> None:
+        contexts.append(context)
+
+    app, auth = _build(get_session, UserModel, PasswordPolicy(min_length=12, validators=[record]))
+    await auth.initialize()
+    repo = UserRepository(UserModel)
+    uid = await _make_user(
+        repo, sessionmaker, username="sp", password_hash=make_unusable_password()
+    )
+    sid, csrf = await auth.sessions.create_session(_request(), user_id=uid)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test", cookies={"session_id": sid}
+    ) as c:
+        weak = await c.post(
+            "/set-password", json={"new_password": "tenchars10"}, headers={"X-CSRF-Token": csrf}
+        )
+        strong = await c.post(
+            "/set-password", json={"new_password": "twelve-chars"}, headers={"X-CSRF-Token": csrf}
+        )
+    await auth.shutdown()
+
+    assert weak.status_code == 422
+    assert [error["loc"] for error in weak.json()["detail"]] == [["body", "new_password"]]
+    assert strong.status_code == 200, strong.text
+    assert [(c.source, c.username, c.email) for c in contexts] == [("set", "sp", "sp@x.com")]
+
+
+async def test_set_password_refuses_an_existing_password_before_the_policy(
+    get_session, UserModel, sessionmaker
+) -> None:
+    app, auth = _build(get_session, UserModel, PasswordPolicy(min_length=12))
+    await auth.initialize()
+    repo = UserRepository(UserModel)
+    uid = await _make_user(
+        repo, sessionmaker, username="has", password_hash=get_password_hash("pw1234567890")
+    )
+    sid, csrf = await auth.sessions.create_session(_request(), user_id=uid)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test", cookies={"session_id": sid}
+    ) as c:
+        r = await c.post(
+            "/set-password", json={"new_password": "tenchars10"}, headers={"X-CSRF-Token": csrf}
+        )
+    await auth.shutdown()
+
+    assert r.status_code == 400
