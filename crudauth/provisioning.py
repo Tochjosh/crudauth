@@ -60,19 +60,18 @@ class NewUserContext:
     db: AsyncSession
     register_data: dict[str, Any] | None = None
     oauth: OAuthUserInfo | None = None
-    name_max_length: int | None = None
 
     @property
     def suggested_name(self) -> str:
         """A display name to default to: the OAuth name, else the email local-part,
-        else the username - so it stays useful across email and email-less shapes."""
+        else the username - so it stays useful across email and email-less shapes.
+
+        It isn't truncated; slice it to fit a length-limited column."""
         if self.oauth is not None and self.oauth.name:
-            value = self.oauth.name
-        elif self.email:
-            value = self.email.split("@")[0]
-        else:
-            value = self.username
-        return (value[: self.name_max_length] if self.name_max_length else value).rstrip()
+            return self.oauth.name
+        if self.email:
+            return self.email.split("@")[0]
+        return self.username
 
 
 NewUserFields = Callable[
