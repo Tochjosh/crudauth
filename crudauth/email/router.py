@@ -8,12 +8,11 @@ drive them over HTTP with a phone number. Change-email is email-specific and onl
 mounts when the model actually has an email column.
 """
 
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, EmailStr, Field, create_model
+from pydantic import BaseModel, EmailStr, create_model
 
-from ..constants import MIN_PASSWORD_LENGTH
 from ..principal import Principal
 from ..ratelimit import KeyBy
 from .service import EmailFlowService
@@ -27,7 +26,7 @@ class _TokenIn(BaseModel):
 
 class _ResetIn(BaseModel):
     token: str
-    new_password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
+    new_password: str
 
 
 class _ChangeIn(BaseModel):
@@ -61,6 +60,9 @@ def build_email_router(*, auth: Any, service: EmailFlowService) -> APIRouter:
     field_type: Any = EmailStr if factor == "email" else str
     fields: dict[str, Any] = {factor: (field_type, ...)}
     RecoveryRequestModel = create_model("RecoveryRequestIn", **fields)
+    ResetModel = create_model(
+        "_ResetIn", __base__=_ResetIn, new_password=(service.password_policy.body_field(), ...)
+    )
     channel_noun = "email" if factor == "email" else "message"
 
     @router.post(
@@ -94,10 +96,13 @@ def build_email_router(*, auth: Any, service: EmailFlowService) -> APIRouter:
         return {"detail": f"If an account exists, a password reset {channel_noun} has been sent."}
 
     @router.post("/password/reset-confirm")
-    async def reset(body: _ResetIn, db: Annotated[Any, Depends(db_dep)]):
+    async def reset(
+        body: ResetModel,  # type: ignore[valid-type]
+        db: Annotated[Any, Depends(db_dep)],
+    ):
         """Reset the password from a valid token and evict the user's other sessions."""
-        await auth.validate_password(body.new_password)
-        await service.reset_password(db, body.token, body.new_password)
+        reset_body = cast(_ResetIn, body)
+        await service.reset_password(db, reset_body.token, reset_body.new_password)
         return {"detail": "Password reset successfully."}
 
     if service.repo.has("email"):
