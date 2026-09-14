@@ -118,3 +118,11 @@ def test_string_length_reads_the_resolved_column() -> None:
     assert repo.string_length("username") == 12
     assert repo.string_length("bio") is None
     assert repo.string_length("missing") is None
+
+
+def test_exceeds_length_reports_the_column_limit() -> None:
+    repo = UserRepository(SizedAccount, column_map={"id": "account_id", "email": "email_address"})
+    assert repo.exceeds_length("username", "a" * 13) == 12
+    assert repo.exceeds_length("username", "a" * 12) is None
+    assert repo.exceeds_length("bio", "a" * 10_000) is None
+    assert repo.exceeds_length("username", 10**20) is None
