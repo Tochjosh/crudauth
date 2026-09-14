@@ -54,6 +54,7 @@ from .utils import (
     get_password_hash,
     is_unusable_password,
     make_unusable_password,
+    safe_redirect_path,
     verify_password,
 )
 
@@ -97,6 +98,7 @@ __all__ = [
     "verify_password",
     "is_unusable_password",
     "make_unusable_password",
+    "safe_redirect_path",
     # exceptions
     "BadRequestException",
     "NotFoundException",

@@ -33,9 +33,9 @@ class RateLimit:
         return self.times == 0
 
 
-RateLimitResolver = Callable[[Any, Any], RateLimit | None] | Callable[
-    [Any, Any], Awaitable[RateLimit | None]
-]
+RateLimitResolver = (
+    Callable[[Any, Any], RateLimit | None] | Callable[[Any, Any], Awaitable[RateLimit | None]]
+)
 
 
 class KeyBy(str, Enum):

@@ -393,7 +393,7 @@ async def test_user_keyed_rate_limit_shares_authentication(
         calls["n"] = 0
         r = await c.get("/shared")
         assert r.status_code == 200
-        assert calls["n"] == 2  # each dependency rehydrates through its own DB session
+        assert calls["n"] == 1  # one shared auth, not one per dependency
     await auth.shutdown()
 
 

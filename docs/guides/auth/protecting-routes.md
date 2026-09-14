@@ -119,9 +119,14 @@ async def audit(request: Request, call_next):
 
 This method returns `None` for anonymous or invalid credentials, does not enforce CSRF, and does
 not slide session activity by default. Pass `update_activity=True` when middleware should count
-the request as session activity. Its result is cached on `request.state` and reused by a later
-`current_user()` dependency; that dependency still applies its normal CSRF and authorization
-checks.
+the request as session activity.
+
+A later `current_user()` dependency in the same request reuses the result: it reloads the user
+through its own DB session, and still applies its CSRF check, the session activity update and its
+authorization gates. Invalid credentials aren't cached, so that dependency still rejects them.
+
+`resolve_principal` opens its own DB session by calling your `session` dependency directly, so
+FastAPI's `dependency_overrides` don't apply to it.
 
 ## Protecting a whole router
 

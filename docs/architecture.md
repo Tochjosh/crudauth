@@ -19,8 +19,8 @@ wrong layer.
 
 **Framework spine** is the set of ports plus the composition root: `crud_auth.py`
 (`CRUDAuth`, the one object you configure and mount), `core.py` (the `Transport` port and the
-shared runtime types), `principal.py`, `repository.py`, `identity.py` (the account-shape
-contract), and `hooks.py`. `CRUDAuth` is the only module allowed to import from every layer.
+shared runtime types), `resolution.py` (the per-request principal resolver), `principal.py`,
+`repository.py`, `identity.py` (the account-shape contract), and `hooks.py`. `CRUDAuth` is the only module allowed to import from every layer.
 
 **Cross-cutting leaves** depend on nothing internal: `constants.py`, `exceptions.py`,
 `utils.py`. The registration gating contract (`REGISTRATION_ALLOWED_FIELDS`) lives in
@@ -62,9 +62,9 @@ so a phone-recovery app drives them with a phone number.
   <img src="assets/diagrams/request-flow-dark.png#only-dark" alt="A request arrives with a cookie or token; the transport loop validates the credential, enforces CSRF, and resolves the user into one Principal cached on request.state; the gates (superuser, scopes, check) then authorize it" width="100%">
 </p>
 
-When a route depends on `current_user()`, CRUDAuth runs the transport loop once and caches the
-result on `request.state`, so combining gates (and a `KeyBy.USER` rate limit that resolves the
-user internally) does one authentication, not several:
+When a route depends on `current_user()`, the `PrincipalResolver` (`resolution.py`) runs the
+transport loop once and caches the result on `request.state`, so combining gates (and a
+`KeyBy.USER` rate limit that resolves the user internally) does one authentication, not several:
 
 1. Each selected transport is tried in order. A transport returns `None` when its credential
    is **absent** (move on) but raises for one that's **present but invalid** (a tampered
@@ -73,6 +73,11 @@ user internally) does one authentication, not several:
    applies, resolves your user row, and returns a `Principal`.
 3. The gates you asked for (`superuser`, `verified`, `scopes`, `check`) run on that shared
    `Principal`, per call.
+
+Middleware can resolve first with `auth.resolve_principal`, which skips CSRF and, by default,
+the session activity update. When a route then reuses that principal, the resolver reloads the
+user through the route's DB session and calls the transport's `revalidate` to apply the checks
+that were skipped. Failed resolutions are never cached.
 
 ## Adding things
 
@@ -86,7 +91,9 @@ user internally) does one authentication, not several:
 - **A rate-limit or storage backend:** add `backends/<name>.py` implementing the subsystem's
   `base.py`. Callers reach it through the port.
 - **A transport:** add a package under `transports/` whose class implements the `Transport`
-  port from `core.py`, and pass an instance in `transports=[...]`.
+  port from `core.py`, and pass an instance in `transports=[...]`. Implement `revalidate` too
+  if a principal reused later in the request needs re-checking, as the session transport does
+  for CSRF and session activity.
 - **A delivery channel:** implement the `DeliveryChannel` port (`email/channel.py`) and pass an
   instance in `channels=[...]`, so recovery tokens route over SMS, push, or your own transport. It
   is a port owned by a feature rather than a top-level subsystem.
