@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import String, Text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -21,6 +22,15 @@ class Account(Base):
     username: Mapped[str] = mapped_column(unique=True)
     pw_hash: Mapped[str] = mapped_column()
     is_admin: Mapped[bool] = mapped_column(default=False)
+
+
+class SizedAccount(Base):
+    __tablename__ = "sized_accounts"
+
+    account_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email_address: Mapped[str] = mapped_column(String(80), unique=True)
+    username: Mapped[str] = mapped_column(String(12), unique=True)
+    bio: Mapped[str | None] = mapped_column(Text, default=None)
 
 
 COLUMN_MAP = {
@@ -100,3 +110,11 @@ def test_column_map_translation(UserModel) -> None:
     assert repo.col("email") == "email"
     repo2 = UserRepository(UserModel, column_map={"hashed_password": "email"})
     assert repo2.col("hashed_password") == "email"
+
+
+def test_string_length_reads_the_resolved_column() -> None:
+    repo = UserRepository(SizedAccount, column_map={"id": "account_id", "email": "email_address"})
+    assert repo.string_length("email") == 80
+    assert repo.string_length("username") == 12
+    assert repo.string_length("bio") is None
+    assert repo.string_length("missing") is None
