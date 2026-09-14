@@ -46,16 +46,18 @@ auth = CRUDAuth(..., register_extra_fields={"full_name", "locale"})
 To also accept those fields in the request body, supply a custom `register_schema`:
 
 ```python
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr
 
 class RegisterIn(BaseModel):
     email: EmailStr
     username: str
-    password: str = Field(min_length=8)
+    password: str
     full_name: str | None = None
 
 auth = CRUDAuth(..., register_schema=RegisterIn, register_extra_fields={"full_name"})
 ```
+
+The password policy runs on a custom schema too, so `password` doesn't need its own length rule.
 
 A field declared in the schema but not opted into `register_extra_fields` is dropped (with a
 startup warning). CRUDAuth's privileged fields (`is_superuser`, `email_verified`, ...) can

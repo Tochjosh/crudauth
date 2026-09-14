@@ -44,14 +44,14 @@ and the routes match the model. Second, a registration body without email, becau
 
 ```python title="main.py"
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from crudauth import CRUDAuth, IdentityConfig
 from myapp.db import get_session
 from myapp.models import User
 
 class Register(BaseModel):
     username: str
-    password: str = Field(min_length=8)
+    password: str
 
 auth = CRUDAuth(
     session=get_session, user_model=User, SECRET_KEY="change-me",
