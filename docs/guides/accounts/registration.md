@@ -28,8 +28,10 @@ curl -X POST http://localhost:8000/register \
 ```
 
 `password` enforces `MIN_PASSWORD_LENGTH` (8). A value longer than its `String(n)` column is
-rejected with `422` before anything is written, whether it comes from the default body or a
-custom `register_schema`. On success the `on_after_register` hook fires, and if email
+rejected before anything is written, whether it comes from the default body or a custom
+`register_schema`, with a `422` in FastAPI's validation-error format: one `string_too_long` entry
+per field, like the password rule's `string_too_short`. An email is measured the way it's
+stored, trimmed and lowercased. On success the `on_after_register` hook fires, and if email
 verification is configured, a verification email is sent.
 
 ## Persisting extra fields
