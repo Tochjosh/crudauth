@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from .constants import MIN_PASSWORD_LENGTH
 from .exceptions import PasswordPolicyException
@@ -138,6 +138,8 @@ class PasswordPolicy:
                     result = validator(password)
                 if inspect.isawaitable(result):
                     await result
+            except ValidationError as exc:
+                return [{"type": "password_policy", "msg": error["msg"]} for error in exc.errors()]
             except ValueError as exc:
                 return [
                     {

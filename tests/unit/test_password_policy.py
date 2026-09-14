@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import BaseModel, field_validator
 
 from crudauth import PasswordContext, PasswordPolicy, PasswordPolicyException
 
@@ -102,6 +103,25 @@ async def test_validators_taking_two_arguments_receive_the_context() -> None:
         {"type": "password_policy", "msg": "Password should not contain your username"}
     ]
     assert received == ["unset", CONTEXT]
+
+
+async def test_pydantic_validation_errors_keep_only_their_messages() -> None:
+    class Phrase(BaseModel):
+        value: str
+
+        @field_validator("value")
+        @classmethod
+        def no_spaces(cls, value: str) -> str:
+            if " " in value:
+                raise ValueError("no spaces allowed")
+            return value
+
+    def as_phrase(password: str) -> None:
+        Phrase(value=password)
+
+    errors = await PasswordPolicy(validators=[as_phrase]).check("has a space", CONTEXT)
+
+    assert errors == [{"type": "password_policy", "msg": "Value error, no spaces allowed"}]
 
 
 async def test_errors_other_than_value_error_propagate() -> None:
