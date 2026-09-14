@@ -82,4 +82,6 @@ class Principal:
 - **App policy (welcome email, trial grant):** don't inline it in a route; register an `AuthHooks`
   callback (`on_after_register`, `on_after_login`, ...) so it fires uniformly across every path.
 - **Per-user rate limit:** `auth.rate_limit(action, key=KeyBy.USER)` resolves the user via the same
-  cached authentication, so it composes with `current_user` without a second lookup.
+  cached authentication, so it composes with `current_user` without a second lookup. Use
+  `KeyBy.USER_OR_IP` to fall back to the client IP for anonymous callers, and pass a function of
+  `(request, principal)` as the limit to pick a `RateLimit` (or `None` for no limit) per request.
