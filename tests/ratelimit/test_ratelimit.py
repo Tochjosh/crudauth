@@ -226,7 +226,9 @@ async def test_rate_limit_keyed_by_custom_callable(get_session, UserModel) -> No
     await auth.shutdown()
 
 
-async def test_rate_limit_accepts_dynamic_limits_and_two_argument_keys(get_session, UserModel) -> None:
+async def test_rate_limit_accepts_dynamic_limits_and_two_argument_keys(
+    get_session, UserModel
+) -> None:
     auth = CRUDAuth(
         session=get_session,
         user_model=UserModel,
@@ -243,7 +245,9 @@ async def test_rate_limit_accepts_dynamic_limits_and_two_argument_keys(get_sessi
         seen.append(principal)
         return request.headers.get("X-Tenant", "anon")
 
-    @app.get("/dynamic", dependencies=[Depends(auth.rate_limit("dynamic", dynamic, key=by_request))])
+    @app.get(
+        "/dynamic", dependencies=[Depends(auth.rate_limit("dynamic", dynamic, key=by_request))]
+    )
     async def dynamic_route() -> dict:
         return {"ok": True}
 
@@ -270,7 +274,8 @@ async def test_user_or_ip_uses_public_principal_and_trusted_ip(get_session, User
     app = FastAPI()
 
     @app.get(
-        "/mixed", dependencies=[Depends(auth.rate_limit("mixed", RateLimit(1, 100), key=KeyBy.USER_OR_IP))]
+        "/mixed",
+        dependencies=[Depends(auth.rate_limit("mixed", RateLimit(1, 100), key=KeyBy.USER_OR_IP))],
     )
     async def mixed() -> dict:
         return {"ok": True}
@@ -284,6 +289,146 @@ async def test_user_or_ip_uses_public_principal_and_trusted_ip(get_session, User
         assert (await c.get("/mixed", headers={"X-Forwarded-For": "5.6.7.8"})).status_code == 200
     await auth.shutdown()
     assert auth.rate_limiter is auth.runtime.rate_limiter
+
+
+async def _register_and_login(client) -> str:
+    await client.post(
+        "/register", json={"email": "a@x.com", "username": "alice", "password": "pw123456"}
+    )
+    login = await client.post("/login", data={"username": "alice", "password": "pw123456"})
+    return login.json()["csrf_token"]
+
+
+async def test_user_or_ip_keys_authenticated_user_across_ips(get_session, UserModel) -> None:
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+        trusted_proxy_hops=1,
+    )
+    app = FastAPI()
+    app.include_router(auth.router)
+
+    @app.get(
+        "/mixed",
+        dependencies=[Depends(auth.rate_limit("mixed", RateLimit(1, 100), key=KeyBy.USER_OR_IP))],
+    )
+    async def mixed() -> dict:
+        return {"ok": True}
+
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        await _register_and_login(c)
+        assert (await c.get("/mixed", headers={"X-Forwarded-For": "1.2.3.4"})).status_code == 200
+        assert (await c.get("/mixed", headers={"X-Forwarded-For": "5.6.7.8"})).status_code == 429
+    await auth.shutdown()
+
+
+async def test_user_or_ip_limit_shares_authentication_and_keeps_csrf(
+    get_session, UserModel, monkeypatch
+) -> None:
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+    )
+    calls = {"n": 0}
+    real = auth.repo.get_by_id
+
+    async def counting(db, uid):
+        calls["n"] += 1
+        return await real(db, uid)
+
+    monkeypatch.setattr(auth.repo, "get_by_id", counting)
+
+    app = FastAPI()
+    app.include_router(auth.router)
+    limit = Depends(auth.rate_limit("mixed", RateLimit(100, 60), key=KeyBy.USER_OR_IP))
+
+    @app.get("/mixed", dependencies=[limit])
+    async def read(user: Principal = Depends(auth.current_user())):
+        return {"id": user.user_id}
+
+    @app.post("/mixed", dependencies=[limit])
+    async def write(user: Principal = Depends(auth.current_user())):
+        return {"id": user.user_id}
+
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        csrf = await _register_and_login(c)
+        calls["n"] = 0
+        assert (await c.get("/mixed")).status_code == 200
+        assert calls["n"] == 1
+        assert (await c.post("/mixed")).status_code == 403
+        assert (await c.post("/mixed", headers={"X-CSRF-Token": csrf})).status_code == 200
+    await auth.shutdown()
+
+
+async def test_key_with_optional_second_parameter_receives_only_the_request(
+    get_session, UserModel
+) -> None:
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+    )
+    app = FastAPI()
+    received: list[object] = []
+
+    def by_tenant(request, extra="unset") -> str:
+        received.append(extra)
+        return request.headers.get("X-Tenant", "anon")
+
+    @app.get(
+        "/tenant",
+        dependencies=[Depends(auth.rate_limit("tenant", RateLimit(5, 60), key=by_tenant))],
+    )
+    async def tenant() -> dict:
+        return {"ok": True}
+
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        assert (await c.get("/tenant")).status_code == 200
+    await auth.shutdown()
+    assert received == ["unset"]
+
+
+async def test_static_ip_limit_does_not_open_a_session(sessionmaker, UserModel) -> None:
+    opened = {"n": 0}
+
+    async def counting_session():
+        opened["n"] += 1
+        async with sessionmaker() as session:
+            yield session
+
+    auth = CRUDAuth(
+        session=counting_session,
+        user_model=UserModel,
+        SECRET_KEY="test-secret-key-0123456789-0123456789",
+        transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+    )
+    app = FastAPI()
+
+    @app.get("/static", dependencies=[Depends(auth.rate_limit("static", RateLimit(5, 60)))])
+    async def static() -> dict:
+        return {"ok": True}
+
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        assert (await c.get("/static")).status_code == 200
+    await auth.shutdown()
+    assert opened["n"] == 0
 
 
 async def test_rate_limit_disabled_with_times_zero(get_session, UserModel) -> None:
