@@ -810,14 +810,17 @@ class CRUDAuth:
         limit: RateLimit | RateLimitResolver | None = None,
         *,
         key: "KeyBy | Callable[..., str]" = KeyBy.IP,
+        transport: str | list[str] | None = None,
     ) -> Callable[..., Any]:
         """Build a FastAPI dependency that throttles an endpoint.
 
-        Resolves the limit (explicit ``limit`` → ``rate_limits=`` override →
-        :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS`), or calls an async/sync
-        resolver with ``(request, principal)``. Keys by IP, user, user-or-IP, or
-        a custom function (which may accept that optional principal), writes
-        ``X-RateLimit-*`` headers, and raises
+        ``limit`` is a ``RateLimit`` or a sync/async function of ``(request, principal)``
+        returning one (``None`` for no limit). Without it, the ``rate_limits=`` override
+        or :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS` entry for ``action`` applies.
+        ``key`` picks who shares a budget: a ``KeyBy`` member, ``key(request)``, or
+        ``key(request, principal)``. ``transport`` narrows which credentials identify the
+        caller, as on [current_user][crudauth.crud_auth.CRUDAuth.current_user]. Writes
+        ``X-RateLimit-*`` headers and raises
         [RateLimitException][crudauth.exceptions.RateLimitException] (429) when the caller exceeds the window.
 
         Example:
@@ -831,9 +834,10 @@ class CRUDAuth:
             raise ValueError(
                 f"No rate limit configured for action {action!r}; pass limit=RateLimit(...)."
             )
+        selected = self._select_transports(transport)
 
         if key is KeyBy.USER:
-            user_dep = self.current_user()
+            user_dep = self.current_user(transport=transport)
 
             async def by_user(
                 request: Request,
@@ -885,9 +889,7 @@ class CRUDAuth:
         async def with_principal(
             request: Request, response: Response, db: Annotated[Any, Depends(self.session)]
         ) -> None:
-            principal = await self._principals.resolve(
-                request, db, self.transports, enforce_csrf=False
-            )
+            principal = await self._principals.resolve(request, db, selected, enforce_csrf=False)
             ident = ident_for(request, principal)
             await self._apply_rate_limit(request, response, action, ident, resolved, principal)
 
