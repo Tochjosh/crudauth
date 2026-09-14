@@ -47,13 +47,16 @@ only** (open-redirect hardened).
      unverified provider email matching an existing account is refused ("sign in with your existing
      method to link"), the account-takeover defense.
    - **otherwise** → a new user, created with `email_verified` taken from the provider (a Google user
-     usually arrives verified), an unusable password, and a unique username derived from the profile.
+     usually arrives verified), an unusable password, and a unique username derived from the profile,
+     cut to the `username` column's length (32 when unbounded), with `_1`, `_2`, ... then a random
+     suffix on collision.
 
 ## Provisioning OAuth users
 
 `new_user_fields` / `new_user_defaults` run on the OAuth create path too. The callback's
 `NewUserContext` has `email`, `username`, `source="oauth"`, the live `db`, and the provider profile, plus
-`ctx.suggested_name` (provider display name, email local-part fallback):
+`ctx.suggested_name` (provider display name, email local-part fallback; not truncated, so slice it for a
+length-limited column):
 
 ```python
 auth = CRUDAuth(..., new_user_defaults={"tier": "free"},

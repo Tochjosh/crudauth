@@ -17,10 +17,44 @@ async def contact(...):
     ...
 ```
 
-`RateLimit(times, seconds)` is the budget (5 per 60s above). Key it by client IP (the
-default), by authenticated user (`key=KeyBy.USER`), or by a function of the request. It writes
-`X-RateLimit-*` headers and raises a `RateLimitException` (`429` with `Retry-After`) when the
-caller is over budget.
+`RateLimit(times, seconds)` is the budget (5 per 60s above). It writes `X-RateLimit-*`
+headers and raises a `RateLimitException` (`429` with `Retry-After`) when the caller is over
+budget. `key` decides who shares a budget:
+
+- `KeyBy.IP` (the default): the client IP.
+- `KeyBy.USER`: the authenticated user. Unauthenticated requests get `401`.
+- `KeyBy.USER_OR_IP`: the user when the request is authenticated, otherwise the client IP.
+- A function of the request, `key(request)`, or of the request and the principal (`None` when
+  anonymous), `key(request, principal)`. The principal is passed only when the function takes
+  two required positional arguments.
+
+The limit can depend on the request as well. Pass a function instead of a `RateLimit`: it
+receives the request and the principal, may be sync or async, and returns a `RateLimit`, or
+`None` for no limit on that request:
+
+```python
+async def plan_limit(request: Request, principal: Principal | None) -> RateLimit | None:
+    if principal is None:
+        return RateLimit(20, 60)
+    if principal.is_superuser:
+        return None
+    return RateLimit(200, 60)
+
+@app.get("/search", dependencies=[Depends(auth.rate_limit("search", plan_limit, key=KeyBy.USER_OR_IP))])
+async def search(...):
+    ...
+```
+
+The principal comes from the same cached authentication `current_user()` uses, so a route
+with both authenticates once, and `current_user()` still enforces CSRF. `transport=` narrows
+which credentials identify the caller, as it does on `current_user()`; give both the same
+value so they keep sharing that authentication. Like `current_user(optional=True)`, a limit
+that reads the principal treats a missing or expired credential as anonymous but rejects a
+tampered one with `401`.
+
+A limit that doesn't need the principal (a fixed `RateLimit` keyed by IP or by
+`key(request)`) doesn't touch the database. For your own throttling logic,
+`auth.rate_limiter` is the configured backend.
 
 The built-in account actions (`register`, the email/password requests) ship with defaults.
 Override them per action with `rate_limits={...}` on `CRUDAuth`:

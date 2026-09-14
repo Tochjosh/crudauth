@@ -64,7 +64,9 @@ class NewUserContext:
     @property
     def suggested_name(self) -> str:
         """A display name to default to: the OAuth name, else the email local-part,
-        else the username - so it stays useful across email and email-less shapes."""
+        else the username - so it stays useful across email and email-less shapes.
+
+        It isn't truncated; slice it to fit a length-limited column."""
         if self.oauth is not None and self.oauth.name:
             return self.oauth.name
         if self.email:

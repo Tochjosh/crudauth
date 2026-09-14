@@ -186,11 +186,14 @@ class SessionTransport(Transport):
         if not session_id:
             return None
 
-        session = await self.manager.validate_session(session_id)
+        session = await self.manager.validate_session(
+            session_id, update_activity=ctx.update_activity
+        )
         if session is None:
             return None
 
-        await self._enforce_csrf(request, session_id)
+        if ctx.enforce_csrf:
+            await self._enforce_csrf(request, session_id)
 
         user = await ctx.resolve_user(session.user_id)
         if user is None or not ctx.repo.is_active(user):
@@ -202,6 +205,18 @@ class SessionTransport(Transport):
             scopes=(),
             metadata={"session_id": session_id},
         )
+
+    async def revalidate(self, request: Request, principal: Principal, ctx: AuthContext) -> bool:
+        """Slide the session and enforce CSRF when an earlier resolution in this request skipped them."""
+        assert self.manager is not None
+        session_id = principal.metadata.get("session_id")
+        if not session_id:
+            return True
+        if ctx.update_activity and await self.manager.validate_session(session_id) is None:
+            return False
+        if ctx.enforce_csrf:
+            await self._enforce_csrf(request, session_id)
+        return True
 
     async def _enforce_csrf(self, request: Request, session_id: str) -> None:
         """Require a valid synchronizer-token header on unsafe methods.

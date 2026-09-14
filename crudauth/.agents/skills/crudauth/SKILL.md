@@ -152,7 +152,9 @@ Full flows, endpoints, the `kind` values, and the security rules: `references/em
 `register_extra_fields={"display_name"}`. For server-set columns (a default tier, a derived name),
 use `new_user_defaults={...}` (constants) or `new_user_fields=callback` (derived; runs on `/register`
 **and** OAuth signup). Privileged fields (`is_superuser`, `email_verified`, `token_version`, oauth ids,
-the PK) are never settable through any of these.
+the PK) are never settable through any of these. A client value longer than its `String(n)` column gets
+`422` on `/register` and `/email/change-request`, and an over-long provider email fails OAuth signup with
+`400`, before anything is written.
 
 ---
 

@@ -1,16 +1,17 @@
 """Builds the ``/oauth/{provider}/authorize`` and ``/oauth/{provider}/callback`` routes."""
 
-from typing import TYPE_CHECKING, Annotated, Any
-from urllib.parse import urlsplit
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, Query, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from ..constants import OAUTH_STATE_TTL_SECONDS
 from ..core import AuthRuntime
 from ..exceptions import BadRequestException
 from ..hooks import HookContext
 from ..storage.base import AbstractSessionStorage
+from ..utils import safe_redirect_path
 from .constants import OAUTH_STATE_COOKIE_NAME
 from .provider import AbstractOAuthProvider, _require_httpx
 from .schemas import OAuthState
@@ -22,6 +23,18 @@ if TYPE_CHECKING:  # pragma: no cover
 __all__ = ["build_oauth_router"]
 
 
+def _user_payload(user: Any, repo: Any) -> dict[str, Any]:
+    """The identity fields ``/me`` returns, for the JSON callback response."""
+    return jsonable_encoder(
+        {
+            "user_id": repo.user_id(user),
+            "username": repo.get(user, "username"),
+            "email": repo.get(user, "email"),
+            "is_superuser": repo.is_superuser(user),
+        }
+    )
+
+
 def build_oauth_router(
     *,
     runtime: AuthRuntime,
@@ -30,6 +43,10 @@ def build_oauth_router(
     account_service: OAuthAccountService,
     session_manager: "SessionManager",
     default_redirect: str = "/",
+    prefix: str = "/oauth",
+    authorize_path: str = "/{provider}/authorize",
+    callback_path: str = "/{provider}/callback",
+    response_mode: Literal["redirect", "json"] = "redirect",
 ) -> APIRouter:
     """Build the ``/oauth/{provider}/authorize`` and ``/callback`` router.
 
@@ -43,28 +60,15 @@ def build_oauth_router(
             absent or not a safe same-origin path.
 
     Returns:
-        An `APIRouter` mounted under ``/oauth``.
+        An `APIRouter` mounted under ``prefix``.
     """
-    router = APIRouter(prefix="/oauth", tags=["oauth"])
+    if response_mode not in ("redirect", "json"):
+        raise ValueError("response_mode must be 'redirect' or 'json'")
+    for path_template in (authorize_path, callback_path):
+        if "{provider}" not in path_template:
+            raise ValueError(f"OAuth path {path_template!r} must contain '{{provider}}'")
+    router = APIRouter(prefix=prefix, tags=["oauth"])
     db_dep = runtime.db_dependency
-
-    def _safe_redirect(target: str | None) -> str:
-        """Only allow same-origin relative paths, to block open-redirect abuse.
-
-        Accepts a target only when it is a single-slash-rooted relative path with
-        no scheme and no host. Rejected: absolute URLs (``https://evil.com``),
-        protocol-relative (``//evil.com``), backslash tricks (``/\\evil.com``,
-        which several browsers normalize to ``//evil.com``), and anything with
-        control characters. Anything rejected falls back to ``default_redirect``.
-        """
-        if not target or not target.startswith("/") or target.startswith("//"):
-            return default_redirect
-        if "\\" in target or any(ord(c) < 0x20 for c in target):
-            return default_redirect
-        parts = urlsplit(target)
-        if parts.scheme or parts.netloc:
-            return default_redirect
-        return target
 
     def _provider(name: str) -> AbstractOAuthProvider:
         provider = providers.get(name)
@@ -72,23 +76,39 @@ def build_oauth_router(
             raise BadRequestException(f"Unknown or unconfigured OAuth provider: {name!r}")
         return provider
 
-    def _error_redirect() -> RedirectResponse:
-        """Redirect to the post-login default with an ``error`` marker.
+    def _set_state_cookie(response: Any, state_value: str) -> None:
+        response.set_cookie(
+            OAUTH_STATE_COOKIE_NAME,
+            state_value,
+            max_age=OAUTH_STATE_TTL_SECONDS,
+            httponly=True,
+            secure=session_manager.cookie_secure,
+            samesite="lax",
+            path=session_manager.cookie_path,
+        )
 
-        Used for any non-success callback (provider error, malformed callback,
-        token/userinfo failure) so the browser lands on a clean page instead of a
-        422/500. Also clears the state-binding cookie.
-        """
+    def _clear_state_cookie(response: Any) -> None:
+        response.delete_cookie(OAUTH_STATE_COOKIE_NAME, path=session_manager.cookie_path)
+
+    def _error_response() -> Any:
+        """Return a JSON 400 or redirect with error marker."""
+        if response_mode == "json":
+            resp = JSONResponse({"detail": "oauth_failed"}, status_code=400)
+            _clear_state_cookie(resp)
+            return resp
         sep = "&" if "?" in default_redirect else "?"
         redirect = RedirectResponse(
             url=f"{default_redirect}{sep}error=oauth_failed", status_code=307
         )
-        redirect.delete_cookie(OAUTH_STATE_COOKIE_NAME, path=session_manager.cookie_path)
+        _clear_state_cookie(redirect)
         return redirect
 
-    @router.get("/{provider}/authorize")
-    async def authorize(provider: str, redirect_to: Annotated[str | None, Query()] = None):
-        """Start the OAuth flow: stash state + PKCE and 307-redirect to the provider.
+    @router.get(authorize_path)
+    async def authorize(
+        provider: str,
+        redirect_to: Annotated[str | None, Query()] = None,
+    ):
+        """Start the OAuth flow: stash state + PKCE and redirect to the provider.
 
         ``redirect_to`` is where the callback sends the browser afterwards (only
         same-origin relative paths are honored).
@@ -111,30 +131,25 @@ def build_oauth_router(
         await state_storage.create(
             state, session_id=auth_data["state"], expiration=OAUTH_STATE_TTL_SECONDS
         )
+        if response_mode == "json":
+            result = JSONResponse({"url": auth_data["url"]})
+            _set_state_cookie(result, auth_data["state"])
+            return result
         redirect = RedirectResponse(url=auth_data["url"], status_code=307)
-        redirect.set_cookie(
-            OAUTH_STATE_COOKIE_NAME,
-            auth_data["state"],
-            max_age=OAUTH_STATE_TTL_SECONDS,
-            httponly=True,
-            secure=session_manager.cookie_secure,
-            samesite="lax",
-            path=session_manager.cookie_path,
-        )
+        _set_state_cookie(redirect, auth_data["state"])
         return redirect
 
-    @router.get("/{provider}/callback")
+    @router.get(callback_path)
     async def callback(
         provider: str,
         request: Request,
-        response: Response,
         db: Annotated[Any, Depends(db_dep)],
         code: Annotated[str | None, Query()] = None,
         state: Annotated[str | None, Query()] = None,
         error: Annotated[str | None, Query()] = None,
     ):
         """Handle the provider callback: verify state/PKCE, link-or-create the
-        user, start a session, and 307-redirect to the validated target.
+        user, start a session, and redirect to the validated target.
 
         Note:
             The ``state`` must match the browser-bound cookie set at
@@ -143,8 +158,8 @@ def build_oauth_router(
             both redeem the same state+code pair.
 
         Note:
-            Non-success callbacks redirect to the post-login default with
-            ``?error=oauth_failed`` rather than surfacing a 422/500: a
+            Non-success callbacks return a JSON 400 (in JSON mode) or redirect
+            to the post-login default with ``?error=oauth_failed``: a
             provider-reported ``?error=...`` (e.g. the user declined), a malformed
             callback (missing ``code``/``state``), a token-exchange or userinfo
             HTTP failure, a missing ``access_token`` (some providers, e.g. GitHub,
@@ -154,7 +169,7 @@ def build_oauth_router(
         """
         prov = _provider(provider)
         if error or not code or not state:
-            return _error_redirect()
+            return _error_response()
         bound = request.cookies.get(OAUTH_STATE_COOKIE_NAME)
         if not bound or bound != state:
             raise BadRequestException("Invalid or expired OAuth state")
@@ -167,11 +182,11 @@ def build_oauth_router(
             token = await prov.exchange_code(code, code_verifier=state_data.code_verifier)
             access_token = token.get("access_token")
             if not access_token:
-                return _error_redirect()
+                return _error_response()
             raw = await prov.get_user_info(access_token)
             info = await prov.process_user_info(raw)
         except (httpx.HTTPError, ValueError, KeyError):
-            return _error_redirect()
+            return _error_response()
 
         user, created = await account_service.get_or_create_user(info, db)
 
@@ -187,16 +202,27 @@ def build_oauth_router(
             user_id=runtime.repo.user_id(user),
             metadata={"login_type": "oauth", "oauth_provider": provider},
         )
-        redirect_url = _safe_redirect(state_data.redirect_to)
-        redirect = RedirectResponse(url=redirect_url, status_code=307)
-        session_manager.set_session_cookies(redirect, session_id, csrf)
-        redirect.delete_cookie(OAUTH_STATE_COOKIE_NAME, path=session_manager.cookie_path)
+        redirect_url = safe_redirect_path(state_data.redirect_to, default=default_redirect)
 
         await runtime.hooks.run_after_login(
             runtime.repo.to_dict(user),
             request=request,
             context=HookContext(transport="oauth", request=request),
         )
+        if response_mode == "json":
+            result = JSONResponse(
+                {
+                    "user": _user_payload(user, runtime.repo),
+                    "csrf_token": csrf,
+                    "redirect_to": redirect_url,
+                }
+            )
+            session_manager.set_session_cookies(result, session_id, csrf)
+            _clear_state_cookie(result)
+            return result
+        redirect = RedirectResponse(url=redirect_url, status_code=307)
+        session_manager.set_session_cookies(redirect, session_id, csrf)
+        _clear_state_cookie(redirect)
         return redirect
 
     return router
