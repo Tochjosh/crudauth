@@ -185,9 +185,7 @@ In-memory backends aren't shared across workers (crudauth warns at startup). Use
 lifespan:
 
 ```python
-from crudauth.ratelimit import redis_rate_limiter
-auth = CRUDAuth(..., transports=[SessionTransport(backend="redis", redis_url=REDIS_URL)],
-                rate_limiter=redis_rate_limiter(REDIS_URL))
+auth = CRUDAuth(..., redis_url=REDIS_URL)  # or redis_client=<your async client>; every store follows
 
 @asynccontextmanager
 async def lifespan(app):

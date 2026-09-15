@@ -53,13 +53,15 @@ from .ratelimit import (
     MemoryRateLimiterBackend,
     RateLimit,
     RateLimitResolver,
+    redis_rate_limiter,
 )
 from .ratelimit.constants import RATE_LIMIT_NAMESPACE
 from .repository import REGISTRATION_ALLOWED_FIELDS, UserRepository
 from .resolution import PrincipalResolver
-from .storage import get_session_storage
+from .storage import MemorySessionStorage, get_session_storage
+from .storage.backends.redis import redis_client_from_url
 from .sudo import SudoConfig, SudoManager
-from .storage.constants import BACKEND_MEMORY
+from .storage.constants import BACKEND_MEMORY, BACKEND_REDIS
 from .transports.bearer.transport import BearerTransport
 from .transports.session.constants import REMEMBER_ME_META_KEY
 from .transports.session.transport import SessionTransport
@@ -157,6 +159,8 @@ class CRUDAuth:
         new_user_fields: NewUserFields | None = None,
         new_user_defaults: dict[str, Any] | None = None,
         rate_limiter: "RateLimiterBackend | None" = None,
+        redis_url: str | None = None,
+        redis_client: Any = None,
         rate_limits: dict[str, RateLimit] | None = None,
         trusted_proxy_hops: int = 0,
         sudo: SudoConfig | None = None,
@@ -232,6 +236,16 @@ class CRUDAuth:
             rate_limiter: Backend for lockout/throttles; defaults to an in-process
                 [MemoryRateLimiterBackend][crudauth.ratelimit.backends.memory.MemoryRateLimiterBackend]. Use
                 ``redis_rate_limiter(...)`` in production.
+            redis_url: Redis URL for every server-side store: sessions and CSRF
+                tokens, the one-time-token and OAuth-state stores, and the default
+                rate limiter. A part configured directly (a ``SessionTransport``
+                with its own ``backend``/``redis_url``/``redis_client``, or
+                ``rate_limiter=``) keeps its own setting. Mutually exclusive with
+                ``redis_client``.
+            redis_client: An existing async Redis client to use the same way as
+                ``redis_url``, with either ``decode_responses`` setting. The caller
+                owns it, so ``shutdown()`` doesn't close it. Mutually exclusive with
+                ``redis_url``.
             rate_limits: Per-action overrides merged over
                 :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS`.
             trusted_proxy_hops: Number of trusted reverse proxies in front of the
@@ -261,6 +275,8 @@ class CRUDAuth:
         """
         if not SECRET_KEY:
             raise ValueError("SECRET_KEY is required")
+        if redis_client is not None and redis_url is not None:
+            raise ValueError("redis_url and redis_client are mutually exclusive")
         self.session = session
         self.password_policy = password_policy or PasswordPolicy()
         self.identity = identity or IdentityConfig()
@@ -280,6 +296,8 @@ class CRUDAuth:
         self._warn_on_register_extra_fields(register_extra_fields)
         self._warn_on_privileged_register_fields(register_schema)
         self._rate_limits: dict[str, RateLimit] = {**DEFAULT_RATE_LIMITS, **(rate_limits or {})}
+        self._owned_redis = redis_client_from_url(redis_url) if redis_url is not None else None
+        shared_redis = redis_client if redis_client is not None else self._owned_redis
 
         self.runtime = AuthRuntime(
             secret_key=SECRET_KEY,
@@ -289,8 +307,14 @@ class CRUDAuth:
             db_dependency=session,
             algorithm=algorithm,
             cookie_config=cookies or CookieConfig(),
-            rate_limiter=rate_limiter or MemoryRateLimiterBackend(),
+            rate_limiter=rate_limiter
+            or (
+                redis_rate_limiter(client=shared_redis)
+                if shared_redis is not None
+                else MemoryRateLimiterBackend()
+            ),
             trusted_proxy_hops=trusted_proxy_hops,
+            redis_client=shared_redis,
         )
         self._principals = PrincipalResolver(self.runtime)
         self._session_transport = next(
@@ -430,9 +454,11 @@ class CRUDAuth:
             )
 
     # --- backend detection ---------------------------------------------------
-    def _backend_config(self) -> tuple[str, str | None]:
-        if self._session_transport is not None:
-            return self._session_transport.backend, self._session_transport.redis_url
+    def _backend_config(self) -> tuple[str, Any]:
+        if self.runtime.redis_client is not None:
+            return BACKEND_REDIS, self.runtime.redis_client
+        if self._session_transport is not None and self._session_transport.backend is not None:
+            return self._session_transport.backend, self._session_transport.redis_client
         return BACKEND_MEMORY, None
 
     def _warn_on_memory_backend(self) -> None:
@@ -445,17 +471,21 @@ class CRUDAuth:
         memory: list[str] = []
         if isinstance(self.runtime.rate_limiter, MemoryRateLimiterBackend):
             memory.append("rate limiter (lockout/throttle counters)")
-        if self._backend_config()[0] == BACKEND_MEMORY:
-            memory.append("sessions/CSRF and one-time-token/OAuth-state stores")
+        if any(
+            isinstance(t, SessionTransport) and t.backend == BACKEND_MEMORY for t in self.transports
+        ):
+            memory.append("sessions/CSRF")
+        stores = (self._email_token_store, self._oauth_state_storage)
+        if any(isinstance(store, MemorySessionStorage) for store in stores):
+            memory.append("one-time-token/OAuth-state stores")
         if not memory:
             return
         logger.warning(
             "crudauth: using in-memory backend(s) - %s. In-memory state is per-process, so "
-            "under multiple workers it is NOT shared: lockout counters, sessions/CSRF, and "
-            "single-use token/OAuth-state atomicity weaken silently. Use redis in production "
-            "(redis_rate_limiter(...) and SessionTransport(backend='redis')), or pass "
+            "under multiple workers it is NOT shared and those guarantees weaken silently. "
+            "Pass redis_url= or redis_client= to CRUDAuth in production, or "
             "warn_on_memory_backend=False to silence.",
-            " and ".join(memory),
+            ", ".join(memory),
         )
 
     # --- public: session manager --------------------------------------------
@@ -531,9 +561,9 @@ class CRUDAuth:
     def _build_email(
         self, email: Any, channels: list[DeliveryChannel] | None, algorithm: str
     ) -> None:
-        backend, redis_url = self._backend_config()
+        backend, redis_client = self._backend_config()
         token_store = get_session_storage(
-            backend, prefix="used_token:", expiration=USED_TOKEN_TTL_SECONDS, redis_url=redis_url
+            backend, prefix="used_token:", expiration=USED_TOKEN_TTL_SECONDS, client=redis_client
         )
         self._email_token_store = token_store
         self._email_service = EmailFlowService(
@@ -599,9 +629,9 @@ class CRUDAuth:
                 scopes=creds.scopes,
             )
 
-        backend, redis_url = self._backend_config()
+        backend, redis_client = self._backend_config()
         state_storage = get_session_storage(
-            backend, prefix="oauth_state:", expiration=OAUTH_STATE_TTL_SECONDS, redis_url=redis_url
+            backend, prefix="oauth_state:", expiration=OAUTH_STATE_TTL_SECONDS, client=redis_client
         )
         self._oauth_state_storage = state_storage
         self._oauth_service = OAuthAccountService(
@@ -1248,3 +1278,5 @@ class CRUDAuth:
             await self._email_token_store.close()
         if self.runtime.rate_limiter is not None:
             await self.runtime.rate_limiter.close()
+        if self._owned_redis is not None:
+            await self._owned_redis.aclose()

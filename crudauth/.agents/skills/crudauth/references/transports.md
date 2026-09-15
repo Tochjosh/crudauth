@@ -13,8 +13,8 @@ SessionTransport(cookies=CookieConfig(secure=True, samesite="lax"), backend="mem
 
 Adds `/login` (form-encoded `username` + `password`; `username` accepts any configured login field),
 `/logout`, and the server-side session record. Mutating requests must echo the CSRF token from the
-session cookie. `backend="redis"` (with `redis_url=`) moves sessions, CSRF, and the one-time-token /
-OAuth-state stores to Redis.
+session cookie. Sessions and CSRF follow `CRUDAuth(redis_url=...)` / `CRUDAuth(redis_client=...)`;
+`redis_url=`, `redis_client=` or `backend="memory"` on the transport overrides that for its own storage.
 
 - Cookies are `secure=True` by default — serve over HTTPS. A session cookie may **never** be
   `SameSite=None` (rejected at construction).

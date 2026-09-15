@@ -25,7 +25,8 @@ from ...exceptions import CSRFException
 from ...hooks import HookContext
 from ...principal import Principal
 from ...storage import get_session_storage
-from ...storage.constants import BACKEND_MEMORY
+from ...storage.backends.redis import redis_client_from_url
+from ...storage.constants import BACKEND_MEMORY, BACKEND_REDIS
 from ...utils import get_client_ip
 from .constants import (
     CSRF_HEADER_NAME,
@@ -49,8 +50,14 @@ class SessionTransport(Transport):
     ``SameSite=None`` (rejected at construction).
 
     Args:
-        backend: ``"memory"`` (default) or ``"redis"`` for shared/persistent state.
-        redis_url: Connection URL when ``backend="redis"``.
+        backend: Where sessions and CSRF tokens live, ``"memory"`` or ``"redis"``. Left
+            unset, it's Redis when this transport or [CRUDAuth][crudauth.crud_auth.CRUDAuth]
+            has a ``redis_url`` or ``redis_client``, and memory otherwise.
+        redis_url: Redis URL for this transport's sessions and CSRF tokens, overriding
+            ``CRUDAuth``'s. The transport opens one client for it and closes it on shutdown.
+        redis_client: Existing async Redis client for this transport, overriding
+            ``CRUDAuth``'s. The caller owns it, so ``auth.shutdown()`` doesn't close it.
+            Mutually exclusive with ``redis_url``.
         csrf: Enforce the synchronizer-token header on unsafe methods (default ``True``).
         cookies: Per-transport [CookieConfig][crudauth.core.CookieConfig] override.
         login_max_attempts: Failed logins before the escalating lockout trips.
@@ -68,7 +75,8 @@ class SessionTransport(Transport):
         ```python
         CRUDAuth(
             session=get_session, user_model=User, SECRET_KEY=...,
-            transports=[SessionTransport(backend="redis", redis_url=..., csrf=True)],
+            redis_url=...,
+            transports=[SessionTransport(session_timeout_minutes=30, csrf=True)],
         )
         ```
     """
@@ -78,8 +86,9 @@ class SessionTransport(Transport):
     def __init__(
         self,
         *,
-        backend: str = BACKEND_MEMORY,
+        backend: str | None = None,
         redis_url: str | None = None,
+        redis_client: Any = None,
         csrf: bool = True,
         max_sessions_per_user: int = DEFAULT_MAX_SESSIONS_PER_USER,
         session_timeout_minutes: int = DEFAULT_SESSION_TIMEOUT_MINUTES,
@@ -93,8 +102,18 @@ class SessionTransport(Transport):
         on_login_success: Literal["clear_all", "clear_user_only"] = "clear_all",
         management_routes: bool = False,
     ):
+        if redis_url is not None and redis_client is not None:
+            raise ValueError("redis_url and redis_client are mutually exclusive")
+        backend = backend.lower() if backend else None
+        if backend == BACKEND_MEMORY and (redis_url is not None or redis_client is not None):
+            raise ValueError("backend='memory' can't be combined with redis_url or redis_client")
+        self._backend = backend
+        self._redis_url = redis_url
+        self._redis_client = redis_client
         self.backend = backend
         self.redis_url = redis_url
+        self.redis_client = redis_client
+        self._owned_client: Any = None
         self.csrf_enabled = csrf
         self.max_sessions_per_user = max_sessions_per_user
         self.session_timeout_minutes = session_timeout_minutes
@@ -133,11 +152,20 @@ class SessionTransport(Transport):
                 "protection). Use 'lax' or 'strict'."
             )
         timeout_seconds = self.session_timeout_minutes * SECONDS_PER_MINUTE
+        client = self._redis_client
+        if client is None and self._redis_url is not None:
+            client = self._owned_client = redis_client_from_url(self._redis_url)
+        elif client is None and self._backend != BACKEND_MEMORY:
+            client = runtime.redis_client
+        backend = self._backend or (BACKEND_REDIS if client is not None else BACKEND_MEMORY)
+        if backend == BACKEND_REDIS and client is None:
+            client = self._owned_client = redis_client_from_url()
+        self.backend, self.redis_client = backend, client
         session_storage = get_session_storage(
             self.backend,
             prefix=SESSION_STORAGE_PREFIX,
             expiration=timeout_seconds,
-            redis_url=self.redis_url,
+            client=self.redis_client,
         )
         csrf_storage = None
         if self.csrf_enabled:
@@ -145,7 +173,7 @@ class SessionTransport(Transport):
                 self.backend,
                 prefix=CSRF_STORAGE_PREFIX,
                 expiration=timeout_seconds,
-                redis_url=self.redis_url,
+                client=self.redis_client,
             )
 
         self.manager = SessionManager(
@@ -168,9 +196,11 @@ class SessionTransport(Transport):
             await self.manager.initialize()
 
     async def shutdown(self) -> None:
-        """Close the session manager's storage connections."""
+        """Close the session manager's storage connections, and the client built from ``redis_url``."""
         if self.manager is not None:
             await self.manager.shutdown()
+        if self._owned_client is not None:
+            await self._owned_client.aclose()
 
     # --- authn ---------------------------------------------------------------
     async def authenticate(self, request: Request, ctx: AuthContext) -> Principal | None:

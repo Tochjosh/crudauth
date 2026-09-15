@@ -18,10 +18,9 @@ from crudauth import CRUDAuth, SessionTransport, CookieConfig
 
 auth = CRUDAuth(
     session=get_session, user_model=User, SECRET_KEY="change-me",
+    redis_url="redis://localhost:6379/0",
     transports=[
         SessionTransport(
-            backend="redis",
-            redis_url="redis://localhost:6379",
             session_timeout_minutes=30,
             max_sessions_per_user=5,
             cookies=CookieConfig(secure=True, samesite="lax"),
