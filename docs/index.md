@@ -53,6 +53,7 @@
 
 - **Python 3.10+**
 - **FastAPI**, **SQLAlchemy 2.0+**, **Pydantic v2** (installed as dependencies)
+- **Redis 7.0+** (or a compatible server such as Valkey) if you use the Redis backends
 
 ## Quick Start
 

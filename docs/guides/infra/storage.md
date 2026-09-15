@@ -21,7 +21,9 @@ deployments.
 
 Pass a Redis URL to `CRUDAuth` and every store moves to Redis: sessions and CSRF tokens, the
 lockout and throttle counters, and the one-time-token and OAuth-state stores. CRUDAuth opens one
-client for the URL, shares it across all of them, and closes it in `auth.shutdown()`.
+client for the URL, shares it across all of them, and closes it in `auth.shutdown()`. The Redis
+backends need Redis 7.0 or newer, or a compatible server such as Valkey 7.2+; `auth.initialize()`
+raises a `RuntimeError` saying so when the server is older.
 
 ```python
 from crudauth import CRUDAuth

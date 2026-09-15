@@ -16,6 +16,7 @@ auth = CRUDAuth(..., redis_url=REDIS_URL)  # sessions, CSRF, tokens, OAuth state
 ```
 
 - crudauth opens one client for the URL, shares it across every store, and closes it on shutdown.
+  The Redis backends need Redis 7.0+ (or Valkey).
 - `redis_client=` instead of `redis_url=` reuses an app-built async client (any `decode_responses`,
   `RedisCluster` included); crudauth never closes a client it didn't build.
 - Configuring a part directly overrides the default for that part:
