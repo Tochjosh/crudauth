@@ -117,6 +117,49 @@ async def test_initialize_fails_loudly_on_redis_older_than_7(monkeypatch) -> Non
         await RedisSessionStorage(client=client).initialize()
 
 
+async def test_initialize_passes_other_redis_errors_through(monkeypatch) -> None:
+    client = fakeredis.aioredis.FakeRedis()
+
+    async def read_only_replica(*args: Any, **kwargs: Any) -> Any:
+        raise ResponseError("You can't write against a read only replica.")
+
+    monkeypatch.setattr(client, "expire", read_only_replica)
+
+    with pytest.raises(ResponseError, match="read only replica"):
+        await RedisSessionStorage(client=client).initialize()
+
+
+async def test_a_session_write_fails_loudly_on_redis_older_than_7(
+    get_session, UserModel, monkeypatch
+) -> None:
+    client = fakeredis.aioredis.FakeRedis()
+    manager = _manager(get_session, UserModel, client)
+
+    class RejectedPipeline:
+        async def __aenter__(self) -> RejectedPipeline:
+            return self
+
+        async def __aexit__(self, *exc_info: Any) -> None:
+            return None
+
+        def sadd(self, *args: Any) -> None:
+            return None
+
+        def expire(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        async def execute(self) -> None:
+            raise ResponseError(
+                "Command # 2 (EXPIRE session_users:1 5400 NX) of pipeline caused error: "
+                "wrong number of arguments for 'expire' command"
+            )
+
+    monkeypatch.setattr(client, "pipeline", lambda **kwargs: RejectedPipeline())
+
+    with pytest.raises(RuntimeError, match="needs Redis 7.0 or newer"):
+        await manager.create_session(_request(), user_id=1)
+
+
 async def test_activity_puts_a_session_back_into_a_lost_index(get_session, UserModel) -> None:
     client = fakeredis.aioredis.FakeRedis()
     manager = _manager(get_session, UserModel, client)
