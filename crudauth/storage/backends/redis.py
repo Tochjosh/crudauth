@@ -1,4 +1,4 @@
-"""Redis storage backend (production). Requires ``crudauth[redis]``."""
+"""Redis storage backend (production). Requires ``crudauth[redis]`` and Redis 7.0+."""
 
 from __future__ import annotations
 
@@ -29,13 +29,17 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
 
     Layout:
         * ``{prefix}{session_id}`` -> serialized model (TTL = expiration)
-        * ``{prefix_root}_users:{user_id}`` -> SET of session ids (TTL = expiration + 1h)
+        * ``{prefix_root}_users:{user_id}`` -> SET of session ids (TTL = the longest
+          member's expiration + 1h, only ever extended)
 
     Note:
         No transaction spans more than one key, so the backend works on Redis
-        Cluster. The user index is written before a record and cleaned after it,
-        so it never misses a live session; a leftover member points at a record
-        that no longer exists and is skipped when sessions are listed.
+        Cluster, and a live session is never missing from its owner's index: the
+        index is written before a record, an index entry is only removed with the
+        record it points at, and every activity update puts the session back in the
+        index and extends the index's TTL. A leftover entry points at a record that
+        no longer exists and is skipped when sessions are listed. Needs Redis 7.0+
+        for ``EXPIRE NX``/``GT``.
 
     Note:
         Pass an existing ``client=`` to share one connection pool with other
@@ -63,8 +67,28 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
     def _user_key(self, user_id: Any) -> str:
         return f"{self.user_sessions_prefix}{user_id}"
 
+    async def _index(self, user_id: Any, session_id: str, ttl: int) -> None:
+        ukey = self._user_key(user_id)
+        index_ttl = ttl + USER_INDEX_TTL_BUFFER_SECONDS
+        async with self.client.pipeline(transaction=True) as pipe:
+            pipe.sadd(ukey, session_id)
+            pipe.expire(ukey, index_ttl, nx=True)
+            pipe.expire(ukey, index_ttl, gt=True)
+            await pipe.execute()
+
     async def initialize(self) -> None:
+        """Check the connection, failing loudly on a server older than Redis 7.0."""
         await self.client.ping()
+        from redis.exceptions import ResponseError
+
+        try:
+            await self.client.expire(f"{self.prefix}redis-version-check", 1, nx=True)
+        except ResponseError as exc:
+            raise RuntimeError(
+                "crudauth's Redis session storage needs Redis 7.0 or newer (or Valkey 7.2+): "
+                f"it uses EXPIRE NX and GT, and this server rejected them ({exc}). "
+                "Upgrade the Redis server."
+            ) from exc
 
     async def close(self) -> None:
         if self._owns_client:
@@ -78,11 +102,7 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
         payload = data.model_dump_json().encode()
         user_id = getattr(data, "user_id", None)
         if user_id is not None:
-            ukey = self._user_key(user_id)
-            async with self.client.pipeline(transaction=True) as pipe:
-                pipe.sadd(ukey, sid)
-                pipe.expire(ukey, ttl + USER_INDEX_TTL_BUFFER_SECONDS)
-                await pipe.execute()
+            await self._index(user_id, sid, ttl)
         await self.client.set(self.get_key(sid), payload, ex=ttl)
         return sid
 
@@ -99,15 +119,24 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
         reset_expiration: bool = True,
         expiration: int | None = None,
     ) -> bool:
+        """Overwrite a live session; ``False`` when it no longer exists.
+
+        Note:
+            The write is ``SET ... XX``, so a session deleted concurrently (a
+            logout-all racing a request) stays deleted instead of being re-created.
+        """
         key = self.get_key(session_id)
-        if not await self.client.exists(key):
-            return False
         payload = data.model_dump_json().encode()
         ttl = expiration if expiration is not None else self.expiration
         if reset_expiration:
-            await self.client.set(key, payload, ex=ttl)
+            written = await self.client.set(key, payload, ex=ttl, xx=True)
         else:
-            await self.client.set(key, payload, keepttl=True)
+            written = await self.client.set(key, payload, keepttl=True, xx=True)
+        if not written:
+            return False
+        user_id = getattr(data, "user_id", None)
+        if user_id is not None:
+            await self._index(user_id, session_id, ttl)
         return True
 
     async def delete(self, session_id: str, user_id: Any = None) -> bool:
@@ -119,6 +148,11 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
             only a cookie), the record is read once to find the owner so the
             user index stays consistent. The index assumes a ``user_id``-bearing
             model; for other models nothing is read or indexed.
+
+        Note:
+            The index entry is removed only when a record was actually deleted, so
+            a delete that runs between a new session's index write and its record
+            write can't leave that session live but unindexed.
         """
         key = self.get_key(session_id)
         if user_id is None:
@@ -129,7 +163,7 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
                 except Exception:
                     user_id = None
         deleted = await self.client.delete(key)
-        if user_id is not None:
+        if deleted and user_id is not None:
             await self.client.srem(self._user_key(user_id), session_id)
         return bool(deleted)
 
