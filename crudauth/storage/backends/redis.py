@@ -67,14 +67,30 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
     def _user_key(self, user_id: Any) -> str:
         return f"{self.user_sessions_prefix}{user_id}"
 
+    @staticmethod
+    def _raise_if_redis_too_old(exc: Exception) -> None:
+        message = str(exc).lower()
+        if "wrong number of arguments" in message or "syntax error" in message:
+            raise RuntimeError(
+                "crudauth's Redis session storage needs Redis 7.0 or newer (or Valkey 7.2+): "
+                f"it uses EXPIRE NX and GT, and this server rejected them ({exc}). "
+                "Upgrade the Redis server."
+            ) from exc
+
     async def _index(self, user_id: Any, session_id: str, ttl: int) -> None:
+        from redis.exceptions import ResponseError
+
         ukey = self._user_key(user_id)
         index_ttl = ttl + USER_INDEX_TTL_BUFFER_SECONDS
-        async with self.client.pipeline(transaction=True) as pipe:
-            pipe.sadd(ukey, session_id)
-            pipe.expire(ukey, index_ttl, nx=True)
-            pipe.expire(ukey, index_ttl, gt=True)
-            await pipe.execute()
+        try:
+            async with self.client.pipeline(transaction=True) as pipe:
+                pipe.sadd(ukey, session_id)
+                pipe.expire(ukey, index_ttl, nx=True)
+                pipe.expire(ukey, index_ttl, gt=True)
+                await pipe.execute()
+        except ResponseError as exc:
+            self._raise_if_redis_too_old(exc)
+            raise
 
     async def initialize(self) -> None:
         """Check the connection, failing loudly on a server older than Redis 7.0."""
@@ -84,11 +100,8 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
         try:
             await self.client.expire(f"{self.prefix}redis-version-check", 1, nx=True)
         except ResponseError as exc:
-            raise RuntimeError(
-                "crudauth's Redis session storage needs Redis 7.0 or newer (or Valkey 7.2+): "
-                f"it uses EXPIRE NX and GT, and this server rejected them ({exc}). "
-                "Upgrade the Redis server."
-            ) from exc
+            self._raise_if_redis_too_old(exc)
+            raise
 
     async def close(self) -> None:
         if self._owns_client:
