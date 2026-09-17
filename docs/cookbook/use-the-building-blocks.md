@@ -31,7 +31,9 @@ What you get off `auth`:
 | `auth.rate_limit(...)` / `auth.require_sudo()` | the other dependencies |
 
 Plus the pure functions, exported from the package root: `get_password_hash`, `verify_password`,
-`is_unusable_password`, `make_unusable_password`.
+`is_unusable_password`, `make_unusable_password`, and `get_password_hash_async` /
+`verify_password_async`, which run the bcrypt work in a worker thread so an async route doesn't
+block the event loop.
 
 ## Your own login, with the real hardening
 

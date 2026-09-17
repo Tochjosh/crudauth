@@ -20,9 +20,8 @@ from .exceptions import RateLimitException, UnauthorizedException
 from .principal import Principal
 from .utils import (
     canonical_identifier,
-    dummy_verify_password,
     get_client_ip,
-    verify_password,
+    verify_and_update_password_async,
 )
 
 logger = logging.getLogger("crudauth")
@@ -119,6 +118,8 @@ class AuthRuntime:
         so it can't be sidestepped), timing-equalized verification (no
         user-enumeration oracle), and the disabled-account check. Returns the user
         row on success - the caller then establishes a session or mints a token.
+        A stored hash made before Unicode normalization is replaced with a
+        normalized one on a successful login.
 
         Raises:
             RateLimitException: The lockout is engaged for this IP/identifier.
@@ -146,14 +147,15 @@ class AuthRuntime:
                     "Too many login attempts. Try again later.", retry_after=retry_after
                 )
         user = await self.repo.resolve_login(db, identifier)
-        if user is None:
-            dummy_verify_password(password)
-            raise UnauthorizedException("Incorrect username or password")
-        if not verify_password(password, self.repo.get(user, "hashed_password", "")):
+        hashed_password = None if user is None else self.repo.get(user, "hashed_password")
+        verified, new_hash = await verify_and_update_password_async(password, hashed_password)
+        if user is None or not verified:
             raise UnauthorizedException("Incorrect username or password")
         if not self.repo.is_active(user):
             logger.warning("login denied: account disabled (user_id=%s)", self.repo.user_id(user))
             raise UnauthorizedException("Incorrect username or password")
+        if new_hash is not None:
+            await self.repo.update(db, user, {"hashed_password": new_hash})
         if self.lockout is not None:
             await self.lockout.check_and_record(ip, login_id, success=True)
         return user

@@ -26,7 +26,7 @@ from ..repository import UserRepository
 from ..password import PasswordContext, PasswordPolicy
 from ..storage.base import AbstractSessionStorage
 from ..transports.bearer.tokens import create_signed_token, verify_signed_token_full
-from ..utils import canonical_email, get_password_hash, verify_password
+from ..utils import canonical_email, get_password_hash_async, verify_password_async
 from .channel import DeliveryChannel, DeliveryIntent, EmailChannel
 from .config import EmailConfig
 from .constants import (
@@ -389,7 +389,9 @@ class EmailFlowService:
         )
         if not await self._consume(token, self.reset_ttl_hours * SECONDS_PER_HOUR):
             raise BadRequestException("Token already used")
-        await self.repo.update(db, user, {"hashed_password": get_password_hash(new_password)})
+        await self.repo.update(
+            db, user, {"hashed_password": await get_password_hash_async(new_password)}
+        )
         await self.repo.increment_token_version(db, user)
         if self.session_manager is not None:
             await self.session_manager.terminate_all_user_sessions(
@@ -417,7 +419,7 @@ class EmailFlowService:
             is already taken the token is silently skipped, so the response can't
             be used to probe which emails exist.
         """
-        if not verify_password(password, self.repo.get(user, "hashed_password", "")):
+        if not await verify_password_async(password, self.repo.get(user, "hashed_password")):
             raise BadRequestException("Incorrect password")
         new_email_c = canonical_email(new_email)
         limit = self.repo.exceeds_length("email", new_email_c)

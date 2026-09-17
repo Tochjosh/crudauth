@@ -19,9 +19,36 @@ for the sender.
 ## Storage
 
 Passwords are hashed with bcrypt, after a SHA-256 pre-hash so bcrypt's 72-byte ceiling never
-silently truncates a long password. Verification returns `False` for a malformed stored hash
-instead of raising, so a corrupted row is a clean "invalid password", not a 500. You never
-handle the plaintext beyond the route that receives it.
+silently truncates a long password. Verification returns `False` for a missing, malformed or
+unusable stored hash instead of raising, so a corrupted row is a clean "invalid password", not a
+500, and it still pays a full bcrypt verification, so an OAuth-only account answers a login in
+the same time as one with a password. You never handle the plaintext beyond the route that
+receives it.
+
+Every password is Unicode-normalized (NFKC) before it's hashed or verified, as NIST SP 800-63B
+recommends. An `é` typed as one precomposed character on one device and as `e` plus a combining
+accent on another is the same password. Hashes created before normalization keep verifying: the
+password is checked as typed when its normalized form doesn't match, and a successful login
+replaces that hash with a normalized one.
+
+bcrypt is deliberately slow, so the built-in routes hash and verify in a worker thread and the
+event loop keeps serving other requests meanwhile. In your own async routes, use the async
+counterparts:
+
+```python
+from crudauth import get_password_hash_async, verify_password_async
+
+if not await verify_password_async(body.current_password, auth.repo.get(user, "hashed_password")):
+    raise UnauthorizedException("Incorrect password")
+await auth.repo.update(
+    db, user, {"hashed_password": await get_password_hash_async(body.new_password)}
+)
+```
+
+`get_password_hash` and `verify_password` do the same work synchronously, for scripts and sync
+code. `crudauth.utils.verify_and_update_password_async` also returns the replacement hash for a
+pre-normalization match, for a login you verify yourself instead of through
+`auth.authenticate_password`.
 
 ## Password policy
 
@@ -41,6 +68,8 @@ auth = CRUDAuth(
 `require_uppercase`, `require_lowercase`, `require_digit` and `require_special` are off by
 default. A special character is anything that isn't a letter or a digit, spaces included. There's
 no maximum length: the SHA-256 pre-hash makes a long password as cheap to hash as a short one.
+The rules and validators see the normalized password, the form that gets hashed, so `e` plus a
+combining accent counts as one character and `²` counts as the digit `2`.
 
 A password that fails gets a `422` in FastAPI's validation-error format, one entry per unmet
 rule at the password field (`password` on `/register`, `new_password` everywhere else):
@@ -91,7 +120,7 @@ password.
 
 The policy runs in CRUDAuth's routes, on a custom `register_schema` too, and in
 `EmailFlowService.reset_password` when you call it directly. Code that sets a password itself
-with `get_password_hash` should check it first:
+with `get_password_hash_async` should check it first:
 
 ```python
 await auth.validate_password(new_password, user=user, source="change", field="new_password")

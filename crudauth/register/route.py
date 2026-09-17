@@ -17,7 +17,7 @@ from ..exceptions import DuplicateValueException, ValueTooLongException
 from ..hooks import HookContext
 from ..password import PasswordContext
 from ..provisioning import NewUserContext, resolve_new_user_fields
-from ..utils import get_client_ip, get_password_hash
+from ..utils import get_client_ip, get_password_hash_async
 
 __all__ = ["RegisterIn", "build_register_route"]
 
@@ -117,7 +117,7 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
         await auth._apply_rate_limit(
             request, response, "register", ip, auth._rate_limits["register"], None
         )
-        hashed_password = get_password_hash(password)
+        hashed_password = await get_password_hash_async(password)
         unique_values = {
             field: value
             for field, value in {**login_values, **data}.items()

@@ -255,13 +255,13 @@ async def test_concurrent_sudo_guesses_share_the_attempt_cap(
 
         monkeypatch.setattr(backend, name, yielding)
     checked: list[str] = []
-    real_verify = sudo_module.verify_password
+    real_verify = sudo_module.verify_password_async
 
-    def counting_verify(password: str, hashed: str) -> bool:
+    async def counting_verify(password: str, hashed: str | None) -> bool:
         checked.append(password)
-        return real_verify(password, hashed)
+        return await real_verify(password, hashed)
 
-    monkeypatch.setattr(sudo_module, "verify_password", counting_verify)
+    monkeypatch.setattr(sudo_module, "verify_password_async", counting_verify)
     async with sessionmaker() as db:
         user = await auth.repo.create(
             db,

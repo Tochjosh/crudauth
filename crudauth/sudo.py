@@ -24,7 +24,7 @@ from .ratelimit.constants import SUDO_NAMESPACE
 from .transports.session.constants import SUDO_ELEVATED_UNTIL_META_KEY
 from .transports.session.schemas import SessionData
 from .transports.session.transport import SessionTransport
-from .utils import verify_password
+from .utils import verify_password_async
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import Request
@@ -121,8 +121,7 @@ class SudoManager:
         if attempt > self.config.max_attempts:
             await self._lock(session_id, user_id)
 
-        hashed = self.repo.get(user, "hashed_password", "") or ""
-        if not verify_password(password, hashed):
+        if not await verify_password_async(password, self.repo.get(user, "hashed_password")):
             if attempt >= self.config.max_attempts:
                 await self._lock(session_id, user_id)
             raise UnauthorizedException("Incorrect password")

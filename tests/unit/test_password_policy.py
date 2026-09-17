@@ -59,8 +59,21 @@ async def test_enforce_raises_a_validation_shaped_422_at_the_field() -> None:
 
 async def test_digit_rule_needs_a_decimal_digit() -> None:
     policy = PasswordPolicy(require_digit=True)
-    assert await policy.check("password²²", CONTEXT) != []
+    assert await policy.check("password፩፩", CONTEXT) != []
     assert await policy.check("password22", CONTEXT) == []
+
+
+async def test_rules_and_validators_see_the_normalized_password() -> None:
+    seen: list[str] = []
+
+    def record(password: str) -> None:
+        seen.append(password)
+
+    policy = PasswordPolicy(min_length=8, require_digit=True, validators=[record])
+
+    assert await policy.check("cafe\u0301123", CONTEXT) != []
+    assert await policy.check("\ufb03ciency²", CONTEXT) == []
+    assert seen == ["fficiency2"]
 
 
 async def test_validators_run_after_the_rules_pass_and_stop_at_the_first_failure() -> None:

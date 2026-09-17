@@ -68,10 +68,10 @@ from .transports.session.manager import SessionManager
 from .transports.session.transport import SessionTransport
 from .utils import (
     get_client_ip,
-    get_password_hash,
+    get_password_hash_async,
     is_unusable_password,
     takes_two_arguments,
-    verify_password,
+    verify_password_async,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -1067,7 +1067,9 @@ class CRUDAuth:
             await self.validate_password(
                 new_password, user=user, source="set", field="new_password"
             )
-            await self.repo.update(db, user, {"hashed_password": get_password_hash(new_password)})
+            await self.repo.update(
+                db, user, {"hashed_password": await get_password_hash_async(new_password)}
+            )
             return {"detail": "Password set."}
 
         @router.post(
@@ -1102,13 +1104,13 @@ class CRUDAuth:
                     "Account has no password; use /set-password to create one."
                 )
             change = cast(_ChangePasswordIn, body)
-            if not verify_password(change.current_password, current_hash):
+            if not await verify_password_async(change.current_password, current_hash):
                 raise UnauthorizedException("Current password is incorrect.")
             await self.validate_password(
                 change.new_password, user=user, source="change", field="new_password"
             )
             await self.repo.update(
-                db, user, {"hashed_password": get_password_hash(change.new_password)}
+                db, user, {"hashed_password": await get_password_hash_async(change.new_password)}
             )
             await self.repo.increment_token_version(db, user)
             sessions = self._session_manager

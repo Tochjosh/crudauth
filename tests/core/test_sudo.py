@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import httpx
 import pytest
 from fastapi import Depends, FastAPI, Request
@@ -14,7 +16,7 @@ from crudauth.repository import UserRepository
 from crudauth.transports.bearer.transport import BearerTransport
 from crudauth.transports.session.constants import SUDO_ELEVATED_UNTIL_META_KEY
 from crudauth.transports.session.schemas import SessionData
-from crudauth.utils import get_password_hash
+from crudauth.utils import get_password_hash, make_unusable_password
 
 SECRET = "test-secret-key-0123456789-0123456789"
 PASSWORD = "rightpw123"
@@ -60,14 +62,14 @@ def _build(get_session, UserModel, *, sudo: SudoConfig | None = SudoConfig()):
     return app, auth
 
 
-async def _make_user(repo, sessionmaker, *, username="u"):
+async def _make_user(repo, sessionmaker, *, username="u", hashed_password=None):
     async with sessionmaker() as db:
         user = await repo.create(
             db,
             {
                 "email": f"{username}@x.com",
                 "username": username,
-                "hashed_password": get_password_hash(PASSWORD),
+                "hashed_password": hashed_password or get_password_hash(PASSWORD),
             },
         )
         return repo.user_id(user)
@@ -122,6 +124,29 @@ async def test_wrong_password_is_401(get_session, UserModel, sessionmaker) -> No
     async with await _client(app, sid) as c:
         r = await c.post("/sudo", json={"password": "nope"}, headers={"X-CSRF-Token": csrf})
         assert r.status_code == 401
+    await auth.shutdown()
+
+
+async def test_sudo_on_an_account_without_a_password_costs_a_full_verification(
+    get_session, UserModel, sessionmaker
+) -> None:
+    app, auth = _build(get_session, UserModel)
+    await auth.initialize()
+    repo = UserRepository(UserModel)
+    real_id = await _make_user(repo, sessionmaker, username="real")
+    oauth_id = await _make_user(
+        repo, sessionmaker, username="oauth", hashed_password=make_unusable_password()
+    )
+    elapsed = {}
+    for uid in (real_id, oauth_id):
+        sid, csrf = await auth.sessions.create_session(_request(), user_id=uid)
+        async with await _client(app, sid) as c:
+            await c.post("/sudo", json={"password": "warm-up"}, headers={"X-CSRF-Token": csrf})
+            start = time.perf_counter()
+            r = await c.post("/sudo", json={"password": "nope"}, headers={"X-CSRF-Token": csrf})
+            elapsed[uid] = time.perf_counter() - start
+            assert r.status_code == 401
+    assert elapsed[oauth_id] > elapsed[real_id] / 2
     await auth.shutdown()
 
 

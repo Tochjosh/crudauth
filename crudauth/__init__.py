@@ -56,10 +56,12 @@ from .transports import BearerTransport, SessionTransport
 from .transports.session.manager import SessionManager
 from .utils import (
     get_password_hash,
+    get_password_hash_async,
     is_unusable_password,
     make_unusable_password,
     safe_redirect_path,
     verify_password,
+    verify_password_async,
 )
 
 __version__ = version("crudauth")
@@ -101,7 +103,9 @@ __all__ = [
     "EmailFlowService",
     "OAuthAccountService",
     "get_password_hash",
+    "get_password_hash_async",
     "verify_password",
+    "verify_password_async",
     "is_unusable_password",
     "make_unusable_password",
     "safe_redirect_path",

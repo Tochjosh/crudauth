@@ -11,7 +11,7 @@ from pydantic import Field, ValidationError
 
 from .constants import MIN_PASSWORD_LENGTH
 from .exceptions import PasswordPolicyException
-from .utils import takes_two_arguments
+from .utils import normalize_password, takes_two_arguments
 
 if TYPE_CHECKING:  # pragma: no cover
     from .repository import UserRepository
@@ -126,7 +126,11 @@ class PasswordPolicy:
         ]
 
     async def check(self, password: str, context: PasswordContext) -> list[dict[str, Any]]:
-        """Return one error per unmet built-in rule, or the first failing validator's error."""
+        """Return one error per unmet built-in rule, or the first failing validator's error.
+
+        Rules and validators see the NFKC-normalized password, the form that gets hashed.
+        """
+        password = normalize_password(password)
         errors = self._rule_errors(password)
         if errors:
             return errors
