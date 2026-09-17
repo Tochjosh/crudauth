@@ -19,9 +19,10 @@ auth = CRUDAuth(
 )
 ```
 
-`OAuthCredentials(client_id, client_secret, scopes=None)`. Built-in providers: `"google"`, `"github"`
-(they self-register on import). `AuthUserMixin` includes `google_id` / `github_id`; a custom shape
-needs `oauth=True`.
+`OAuthCredentials(client_id, client_secret="", scopes=None)`; leave `client_secret` empty for a
+public (PKCE-only) client. Built-in providers: `"google"`, `"github"` (they self-register on import,
+and raise at startup without a secret). `AuthUserMixin` includes `google_id` / `github_id`; a custom
+shape needs `oauth=True`.
 
 ## Endpoints and the button
 
@@ -74,4 +75,5 @@ that, both doors work.
 Implement the `AbstractOAuthProvider` port (`provider.py`: pass the three endpoints + scopes +
 `provider_name`, implement `process_user_info(raw) -> OAuthUserInfo`, set `email_verified` honestly),
 register it with `OAuthProviderFactory.register_provider("name", YourProvider)`, then pass its
-credentials in `oauth={"name": OAuthCredentials(...)}` like a built-in.
+credentials in `oauth={"name": OAuthCredentials(...)}` like a built-in. Set
+`requires_client_secret = True` on a provider that never accepts a public client.

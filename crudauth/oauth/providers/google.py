@@ -30,6 +30,8 @@ class GoogleOAuthProvider(AbstractOAuthProvider):
         offline access.
     """
 
+    requires_client_secret = True
+
     def __init__(
         self,
         client_id: str,

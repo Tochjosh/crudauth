@@ -28,6 +28,11 @@ This adds two routes per provider: `GET /oauth/{provider}/authorize` (start the 
 is `{redirect_base_url}/oauth/{provider}/callback`. Both the paths and the response format are
 configurable; see [Custom paths and JSON responses](#custom-paths-and-json-responses).
 
+CRUDAuth always uses PKCE. For a public client (one your identity provider registers without a
+secret), leave out `client_secret`: `OAuthCredentials(client_id="...")`. The token request then
+carries no client authentication, which providers configured for public clients expect. Google and
+GitHub always need a secret for a server-side callback, so they raise at startup without one.
+
 ## The flow
 
 <p align="center">
@@ -68,8 +73,10 @@ configured), so a hand-written callback can reuse it:
 ## Custom providers
 
 Add a provider by implementing the `AbstractOAuthProvider` port and registering it with
-`OAuthProviderFactory`, then pass its credentials in `oauth={...}` like the built-ins. See
-the [OAuth reference](../../api/oauth.md) for the port and factory.
+`OAuthProviderFactory`, then pass its credentials in `oauth={...}` like the built-ins. Set
+`requires_client_secret = True` on the class if the provider never accepts a public client, so a
+missing secret fails at startup instead of at the first login. See the
+[OAuth reference](../../api/oauth.md) for the port and factory.
 
 ## Custom paths and JSON responses
 

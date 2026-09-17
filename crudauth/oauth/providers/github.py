@@ -42,6 +42,8 @@ def _select_github_email(emails: list[dict[str, Any]]) -> tuple[str | None, bool
 
 
 class GitHubOAuthProvider(AbstractOAuthProvider):
+    requires_client_secret = True
+
     def __init__(
         self,
         client_id: str,
