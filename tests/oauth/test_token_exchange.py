@@ -1,66 +1,134 @@
-"""Token-exchange client authentication: confidential vs public clients."""
+"""Token exchange client authentication: confidential and public clients."""
 
 from __future__ import annotations
 
+from typing import Any
+from urllib.parse import parse_qs, parse_qsl, urlparse
+
 import httpx
+import pytest
+from fastapi import FastAPI
 
-from crudauth.oauth.providers.google import GoogleOAuthProvider
+from crudauth import CookieConfig, CRUDAuth, OAuthCredentials, SessionTransport
+from crudauth.oauth import AbstractOAuthProvider, OAuthProviderFactory, OAuthUserInfo
 
-
-def _fake_async_client(captured: dict):
-    """An httpx.AsyncClient stand-in that records the POST it receives."""
-
-    class FakeResponse:
-        def raise_for_status(self) -> None:
-            pass
-
-        def json(self) -> dict:
-            return {"access_token": "tok", "token_type": "Bearer"}
-
-    class FakeAsyncClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            return False
-
-        async def post(self, url, data=None, headers=None):
-            captured["url"] = url
-            captured["data"] = dict(data)
-            captured["headers"] = dict(headers or {})
-            return FakeResponse()
-
-    return FakeAsyncClient
+SECRET = "test-secret-key-0123456789-0123456789"
 
 
-# --- confidential client (has a secret): client auth rides in the body --------
-async def test_exchange_code_sends_secret_for_confidential_client(monkeypatch) -> None:
-    captured: dict = {}
-    monkeypatch.setattr(httpx, "AsyncClient", _fake_async_client(captured))
+class IdentityProvider(AbstractOAuthProvider):
+    def __init__(self, client_id, client_secret, redirect_uri, scopes=None):
+        super().__init__(
+            client_id,
+            client_secret,
+            redirect_uri,
+            scopes=scopes or ["openid", "email"],
+            authorize_endpoint="https://idp.example/authorize",
+            token_endpoint="https://idp.example/token",
+            userinfo_endpoint="https://idp.example/userinfo",
+            provider_name="stub",
+        )
 
-    prov = GoogleOAuthProvider("cid", "s3cret", "https://app/cb")
-    result = await prov.exchange_code("code-1", code_verifier="ver-1")
+    async def process_user_info(self, user_info: dict[str, Any]) -> OAuthUserInfo:
+        return OAuthUserInfo(
+            provider="stub",
+            provider_user_id=user_info["sub"],
+            email=user_info["email"],
+            email_verified=True,
+        )
 
-    assert result["access_token"] == "tok"
-    assert captured["data"]["client_secret"] == "s3cret"
-    assert captured["data"]["code_verifier"] == "ver-1"
-    assert captured["data"]["grant_type"] == "authorization_code"
+
+def _capture_provider_requests(monkeypatch) -> list[httpx.Request]:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(200, json={"access_token": "tok", "token_type": "Bearer"})
+        return httpx.Response(200, json={"sub": "idp-1", "email": "public@x.com"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    return requests
 
 
-# --- public client (no secret): the field must be absent, not empty -----------
-async def test_exchange_code_omits_secret_for_public_client(monkeypatch) -> None:
-    # A PKCE-only public client (token_endpoint_auth_method=none) must not send
-    # client authentication; several IdPs reject client_secret="" outright.
-    captured: dict = {}
-    monkeypatch.setattr(httpx, "AsyncClient", _fake_async_client(captured))
+def _form(request: httpx.Request) -> dict[str, str]:
+    return dict(parse_qsl(request.content.decode(), keep_blank_values=True))
 
-    prov = GoogleOAuthProvider("cid", "", "https://app/cb")
-    await prov.exchange_code("code-1", code_verifier="ver-1")
 
-    assert "client_secret" not in captured["data"]
-    assert captured["data"]["client_id"] == "cid"
-    assert captured["data"]["code_verifier"] == "ver-1"
-    assert captured["data"]["grant_type"] == "authorization_code"
+@pytest.mark.parametrize(
+    ("client_secret", "expected"),
+    [("s3cret", {"client_secret": "s3cret"}), ("", {})],
+)
+async def test_exchange_code_sends_the_secret_only_when_set(
+    monkeypatch, client_secret: str, expected: dict[str, str]
+) -> None:
+    requests = _capture_provider_requests(monkeypatch)
+    provider = IdentityProvider("cid", client_secret, "https://app/cb")
+
+    token = await provider.exchange_code("code-1", code_verifier="ver-1")
+
+    assert token["access_token"] == "tok"
+    assert _form(requests[0]) == {
+        "client_id": "cid",
+        "code": "code-1",
+        "redirect_uri": "https://app/cb",
+        "grant_type": "authorization_code",
+        "code_verifier": "ver-1",
+        **expected,
+    }
+
+
+async def test_public_client_signs_in_without_a_secret(get_session, UserModel, monkeypatch) -> None:
+    monkeypatch.setitem(OAuthProviderFactory._providers, "stub", IdentityProvider)
+    auth = CRUDAuth(
+        session=get_session,
+        user_model=UserModel,
+        SECRET_KEY=SECRET,
+        transports=[SessionTransport(cookies=CookieConfig(secure=False))],
+        oauth={"stub": OAuthCredentials(client_id="public-client")},
+        redirect_base_url="http://test",
+    )
+    app = FastAPI()
+    app.include_router(auth.router)
+    await auth.initialize()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        requests = _capture_provider_requests(monkeypatch)
+        authorize = await client.get("/oauth/stub/authorize")
+        state = parse_qs(urlparse(authorize.headers["location"]).query)["state"][0]
+        callback = await client.get(f"/oauth/stub/callback?code=abc&state={state}")
+        me = await client.get("/me")
+    await auth.shutdown()
+
+    assert callback.status_code == 307
+    assert me.json()["email"] == "public@x.com"
+    token_form = _form(requests[0])
+    assert token_form["client_id"] == "public-client"
+    assert "code_verifier" in token_form
+    assert "client_secret" not in token_form
+
+
+@pytest.mark.parametrize("provider", ["google", "github"])
+def test_providers_that_require_a_secret_fail_at_startup_without_one(
+    get_session, UserModel, provider: str
+) -> None:
+    with pytest.raises(ValueError, match="needs a client_secret"):
+        CRUDAuth(
+            session=get_session,
+            user_model=UserModel,
+            SECRET_KEY=SECRET,
+            oauth={provider: OAuthCredentials(client_id="id")},
+            redirect_base_url="http://test",
+        )
+
+
+def test_credentials_repr_hides_the_secret() -> None:
+    credentials = OAuthCredentials(client_id="id", client_secret="do-not-print")
+
+    assert "do-not-print" not in repr(credentials)
+    assert credentials.client_secret == "do-not-print"

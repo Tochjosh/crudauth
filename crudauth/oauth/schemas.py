@@ -15,10 +15,13 @@ def _utcnow() -> datetime:
 
 
 class OAuthCredentials(BaseModel):
-    """Client credentials for a provider, supplied via ``oauth={...}``."""
+    """Client credentials for a provider, supplied via ``oauth={...}``.
+
+    Leave ``client_secret`` empty for a public client (PKCE only).
+    """
 
     client_id: str
-    client_secret: str
+    client_secret: str = Field(default="", repr=False)
     scopes: list[str] | None = None
 
 

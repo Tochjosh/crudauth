@@ -38,6 +38,10 @@ class AbstractOAuthProvider(ABC):
     with [OAuthProviderFactory][crudauth.oauth.factory.OAuthProviderFactory]. Set ``email_verified`` honestly -
     auto-linking to an existing account requires a verified provider email.
 
+    Set ``requires_client_secret = True`` on a provider that never accepts a
+    public client, so a missing secret fails at startup instead of at the first
+    login.
+
     Note:
         A custom provider named ``"gitlab"`` requires a ``gitlab_id`` column on
         your user model (that's where its account id is stored and matched). Add
@@ -70,6 +74,8 @@ class AbstractOAuthProvider(ABC):
         ```
     """
 
+    requires_client_secret: bool = False
+
     def __init__(
         self,
         client_id: str,
@@ -82,6 +88,11 @@ class AbstractOAuthProvider(ABC):
         userinfo_endpoint: str,
         provider_name: str,
     ):
+        if self.requires_client_secret and not client_secret:
+            raise ValueError(
+                f"The {provider_name!r} OAuth provider needs a client_secret: "
+                "set OAuthCredentials(client_secret=...)."
+            )
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
@@ -165,11 +176,8 @@ class AbstractOAuthProvider(ABC):
             httpx.HTTPStatusError: If the token endpoint returns an error status.
 
         Note:
-            ``client_secret`` is included only when the provider actually has
-            one. A public client (PKCE-only, ``token_endpoint_auth_method=none``)
-            must not send client authentication - several IdPs reject an empty
-            ``client_secret`` outright - and its proof is the PKCE verifier,
-            which is sent either way.
+            ``client_secret`` is sent only when set, so a public client (PKCE
+            only) sends no client authentication.
         """
         httpx = _require_httpx()
         data = {
