@@ -9,16 +9,20 @@ from __future__ import annotations
 import re
 import secrets
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..exceptions import BadRequestException
+from ..exceptions import OAuthAccountException
 from ..provisioning import NewUserContext, NewUserFields, resolve_new_user_fields
 from ..repository import UserRepository
 from ..utils import canonical_email, make_unusable_password
 from .constants import (
+    EMAIL_MISSING,
+    EMAIL_TOO_LONG,
+    EMAIL_UNVERIFIED,
+    PROVIDER_ALREADY_LINKED,
     USERNAME_FALLBACK,
     USERNAME_MAX_LENGTH,
     USERNAME_MAX_SUFFIX_ATTEMPTS,
@@ -26,6 +30,9 @@ from .constants import (
     USERNAME_RANDOM_SUFFIX_BYTES,
 )
 from .schemas import OAuthUserInfo
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ..transports.session.manager import SessionManager
 
 __all__ = ["OAuthAccountService"]
 
@@ -42,7 +49,8 @@ class OAuthAccountService:
 
     The linking rules live here (lookup order: provider id → verified email →
     create), so a hand-written callback reuses them. Reachable as ``auth.oauth``
-    (``None`` when OAuth isn't configured).
+    (``None`` when OAuth isn't configured). ``session_manager`` is used to sign
+    out the sessions of an unverified account that a provider claims.
 
     Example:
         ```python
@@ -56,10 +64,13 @@ class OAuthAccountService:
         repo: UserRepository,
         new_user_fields: NewUserFields | None = None,
         new_user_defaults: dict[str, Any] | None = None,
+        *,
+        session_manager: "SessionManager | None" = None,
     ):
         self.repo = repo
         self.new_user_fields = new_user_fields
         self.new_user_defaults = new_user_defaults or {}
+        self.session_manager = session_manager
         self._username_max_length = repo.string_length("username") or USERNAME_MAX_LENGTH
 
     async def get_or_create_user(self, info: OAuthUserInfo, db: AsyncSession) -> tuple[Any, bool]:
@@ -70,60 +81,70 @@ class OAuthAccountService:
             inserted (provider-id and email-link hits return the existing user).
 
         Raises:
-            BadRequestException: When an unverified email matches an existing
-                account (see the linking Note), or no email is available to
-                create an account.
+            OAuthAccountException: When the provider gives no email, an
+                unverified email, an email longer than the ``email`` column, or
+                the matching account is already linked to a different account
+                of the same provider.
 
         Note:
-            Auto-linking to an *existing* account requires ``info.email_verified``.
-            Attaching a provider to an account on an unverified,
-            attacker-influenceable email is an account-takeover vector, so an
-            unverified email matching an existing account is refused and routed
-            to manual linking.
-
-        Note:
-            Creating a *new* account is deliberately allowed on an unverified
-            email - there is no existing account to hijack - but the row is
-            created with ``email_verified=False`` so it is never treated as
-            proven. Linking is the asymmetric case precisely because it touches
-            an account the OAuth user may not own.
+            Only a verified provider email links or creates an account. Linking
+            to an account whose own email was never verified claims it: its
+            password becomes unusable, its ``token_version`` is bumped, its
+            sessions are signed out, and its email is marked verified.
         """
         user = await self.repo.get_by_oauth(db, info.provider, info.provider_user_id)
         if user is not None:
             return user, False
 
-        if info.email:
-            existing = await self.repo.get_by_email(db, info.email)
-            if existing is not None:
-                if not info.email_verified:
-                    raise BadRequestException(
-                        "An account with this email already exists. "
-                        "Sign in with your existing method to link this provider."
-                    )
-                await self.repo.update(
-                    db,
-                    existing,
-                    {
-                        f"{info.provider}_id": info.provider_user_id,
-                        "oauth_provider": info.provider,
-                        "oauth_updated_at": datetime.now(timezone.utc),
-                    },
-                )
-                return existing, False
-
         if not info.email:
-            raise BadRequestException(
+            raise OAuthAccountException(
+                EMAIL_MISSING,
                 f"The {info.provider} account did not provide an email address, "
-                "which is required to create an account."
+                "which is required to sign in.",
             )
+        if not info.email_verified:
+            raise OAuthAccountException(
+                EMAIL_UNVERIFIED,
+                f"The {info.provider} account's email address isn't verified. "
+                f"Verify it with {info.provider} and try again.",
+            )
+
+        existing = await self.repo.get_by_email(db, info.email)
+        if existing is not None:
+            return await self._link(existing, info, db), False
+
         limit = self.repo.exceeds_length("email", canonical_email(info.email))
         if limit is not None:
-            raise BadRequestException(
+            raise OAuthAccountException(
+                EMAIL_TOO_LONG,
                 f"The {info.provider} email address is longer than the {limit} characters "
-                "this app accepts."
+                "this app accepts.",
             )
-        user = await self._create_user(info, db)
-        return user, True
+        return await self._create_user(info, db), True
+
+    async def _link(self, user: Any, info: OAuthUserInfo, db: AsyncSession) -> Any:
+        if self.repo.get(user, f"{info.provider}_id") is not None:
+            raise OAuthAccountException(
+                PROVIDER_ALREADY_LINKED,
+                f"This account is already linked to a different {info.provider} account.",
+            )
+        claimed = not self.repo.email_verified(user)
+        data: dict[str, Any] = {
+            f"{info.provider}_id": info.provider_user_id,
+            "oauth_provider": info.provider,
+            "oauth_updated_at": datetime.now(timezone.utc),
+        }
+        if claimed:
+            data["hashed_password"] = make_unusable_password()
+            data["email_verified"] = True
+        await self.repo.update(db, user, data)
+        if claimed:
+            await self.repo.increment_token_version(db, user)
+            if self.session_manager is not None:
+                await self.session_manager.terminate_all_user_sessions(
+                    self.repo.user_id(user), reason="oauth_account_claimed"
+                )
+        return user
 
     async def _create_user(self, info: OAuthUserInfo, db: AsyncSession) -> Any:
         """Provision a new OAuth-linked user (unusable password, provider id set).
@@ -139,7 +160,7 @@ class OAuthAccountService:
             "username": await self._unique_username(db, base),
             "email": canonical_email(info.email),
             "hashed_password": make_unusable_password(),
-            "email_verified": info.email_verified,
+            "email_verified": True,
             "oauth_provider": info.provider,
             f"{info.provider}_id": info.provider_user_id,
             "oauth_created_at": now,

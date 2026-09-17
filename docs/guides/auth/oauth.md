@@ -51,24 +51,53 @@ directly. It accepts only single-slash relative paths and falls back to `/` by d
 
 ## Account linking
 
-On a successful callback, CRUDAuth finds or creates the user:
+On a successful callback, CRUDAuth finds or creates the user. A returning provider account signs
+in to the user it's linked to. Otherwise the provider must report a verified email, or the sign-in
+fails with `email_unverified`:
 
-- If a user already exists with the provider's verified email, the provider account is linked
-  to it (the `{provider}_id` column is set). The user can then sign in by password or by that
-  provider.
+- If a user already exists with that email, the provider account is linked to it (the
+  `{provider}_id` column is set), and the user can sign in by password or by that provider. If that
+  user never verified its email, whoever registered it hasn't proven they own the address, so the
+  link also claims the account: the password becomes unusable, `token_version` is bumped, every
+  session is signed out, and the email is marked verified. The owner can set a password again with
+  a password reset. A user already linked to a different account of the same provider isn't
+  relinked (`provider_already_linked`).
 - Otherwise a new user is created from the provider profile. Its username comes from the
   provider's username, given name, display name, or email local-part, reduced to lowercase
   letters, digits, and single underscores, and cut to your `username` column's length (32 when
   the column has no length). A taken username gets `_1`, `_2`, ... and then a random suffix,
   still within that length. A provider email longer than your `email` column fails the sign-in
-  with `400` instead of reaching the insert. To set your own columns on that user (a required
+  (`email_too_long`) instead of reaching the insert. To set your own columns on that user (a required
   `name`, a default tier), use `new_user_fields` / `new_user_defaults`, which run on this path too; see
   [Registration](../accounts/registration.md#setting-columns-the-server-controls).
 
+A disabled user (`is_active` false) gets no session: the callback fails with `account_inactive`.
+
 This linking logic lives in `auth.oauth` (an `OAuthAccountService`, or `None` when OAuth isn't
 configured), so a hand-written callback can reuse it:
-`user, created = await auth.oauth.get_or_create_user(info, db)`. See
+`user, created = await auth.oauth.get_or_create_user(info, db)`. It raises
+[`OAuthAccountException`](../../api/exceptions.md) with the error code in `code`. See
 [Use the building blocks](../../cookbook/use-the-building-blocks.md).
+
+## Errors
+
+A failed callback redirects to `redirect_base_url` with `?error=<code>`, or returns `400` with
+`{"detail": "<code>"}` in JSON mode:
+
+| Code | Meaning |
+|------|---------|
+| `oauth_failed` | The provider reported an error or the user declined, the callback was malformed, or the token exchange or profile request failed. |
+| `email_missing` | The provider account has no email address. |
+| `email_unverified` | The provider reports the email as unverified. |
+| `email_too_long` | The email is longer than your `email` column. |
+| `provider_already_linked` | The matching user is linked to a different account of this provider. |
+| `account_inactive` | The user is disabled. |
+
+A callback whose `state` doesn't match the browser's state cookie returns `400` in both modes.
+The state is used up either way, so a retry starts again from `authorize`.
+
+`GET /oauth/{provider}/authorize` stores a state entry per request, so it's rate limited per IP
+(`oauth_authorize`, 30 per hour by default; tune it with `rate_limits=`).
 
 ## Custom providers
 
@@ -110,7 +139,7 @@ instead of `auth.router`. Mount one or the other, not both.
   The client then sends the browser to that URL.
 - `callback` returns `{"user": ..., "csrf_token": ..., "redirect_to": ...}` with the session
   cookies set. `user` has the same fields as `/me`. A failed callback returns `400` with
-  `{"detail": "oauth_failed"}` instead of redirecting.
+  `{"detail": "<code>"}` instead of redirecting (see [Errors](#errors)).
 
 The provider still sends the browser to the redirect URI, so in JSON mode that URI should be a
 frontend page: point `redirect_base_url` at the frontend, serve the callback path there, and

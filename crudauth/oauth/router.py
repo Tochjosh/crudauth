@@ -1,5 +1,6 @@
 """Builds the ``/oauth/{provider}/authorize`` and ``/oauth/{provider}/callback`` routes."""
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -8,11 +9,11 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from ..constants import OAUTH_STATE_TTL_SECONDS
 from ..core import AuthRuntime
-from ..exceptions import BadRequestException
+from ..exceptions import BadRequestException, OAuthAccountException
 from ..hooks import HookContext
 from ..storage.base import AbstractSessionStorage
 from ..utils import safe_redirect_path
-from .constants import OAUTH_STATE_COOKIE_NAME
+from .constants import ACCOUNT_INACTIVE, OAUTH_FAILED, OAUTH_STATE_COOKIE_NAME
 from .provider import AbstractOAuthProvider, _require_httpx
 from .schemas import OAuthState
 from .service import OAuthAccountService
@@ -42,6 +43,7 @@ def build_oauth_router(
     state_storage: AbstractSessionStorage[OAuthState],
     account_service: OAuthAccountService,
     session_manager: "SessionManager",
+    authorize_rate_limit: Callable[..., Any],
     default_redirect: str = "/",
     prefix: str = "/oauth",
     authorize_path: str = "/{provider}/authorize",
@@ -56,6 +58,8 @@ def build_oauth_router(
         state_storage: TTL'd store for the per-request OAuth state + PKCE.
         account_service: Links/provisions the user from the provider profile.
         session_manager: Establishes the session on a successful callback.
+        authorize_rate_limit: Dependency throttling ``authorize``, which writes
+            a state entry per request.
         default_redirect: Fallback post-login target when ``redirect_to`` is
             absent or not a safe same-origin path.
 
@@ -90,20 +94,18 @@ def build_oauth_router(
     def _clear_state_cookie(response: Any) -> None:
         response.delete_cookie(OAUTH_STATE_COOKIE_NAME, path=session_manager.cookie_path)
 
-    def _error_response() -> Any:
-        """Return a JSON 400 or redirect with error marker."""
+    def _error_response(code: str = OAUTH_FAILED) -> Any:
+        """Return a JSON 400 or redirect carrying the error ``code``."""
         if response_mode == "json":
-            resp = JSONResponse({"detail": "oauth_failed"}, status_code=400)
+            resp = JSONResponse({"detail": code}, status_code=400)
             _clear_state_cookie(resp)
             return resp
         sep = "&" if "?" in default_redirect else "?"
-        redirect = RedirectResponse(
-            url=f"{default_redirect}{sep}error=oauth_failed", status_code=307
-        )
+        redirect = RedirectResponse(url=f"{default_redirect}{sep}error={code}", status_code=307)
         _clear_state_cookie(redirect)
         return redirect
 
-    @router.get(authorize_path)
+    @router.get(authorize_path, dependencies=[Depends(authorize_rate_limit)])
     async def authorize(
         provider: str,
         redirect_to: Annotated[str | None, Query()] = None,
@@ -158,14 +160,13 @@ def build_oauth_router(
             both redeem the same state+code pair.
 
         Note:
-            Non-success callbacks return a JSON 400 (in JSON mode) or redirect
-            to the post-login default with ``?error=oauth_failed``: a
-            provider-reported ``?error=...`` (e.g. the user declined), a malformed
-            callback (missing ``code``/``state``), a token-exchange or userinfo
-            HTTP failure, a missing ``access_token`` (some providers, e.g. GitHub,
-            signal failure with HTTP 200 + an error body), or a userinfo payload
-            that breaks the provider's parser (``ValueError``/``KeyError``). The
-            intentional policy 400s (no email / unverified-link) still surface.
+            Non-success callbacks return a JSON 400 with the error code as
+            ``detail`` (in JSON mode) or redirect to the post-login default with
+            ``?error=<code>``. ``oauth_failed`` covers a provider-reported
+            ``?error=...``, a malformed callback, a token-exchange or userinfo
+            failure, and a payload the provider can't parse. Account resolution
+            reports the [OAuthAccountException][crudauth.exceptions.OAuthAccountException]
+            code, and a disabled account reports ``account_inactive``.
         """
         prov = _provider(provider)
         if error or not code or not state:
@@ -180,15 +181,20 @@ def build_oauth_router(
         httpx = _require_httpx()
         try:
             token = await prov.exchange_code(code, code_verifier=state_data.code_verifier)
-            access_token = token.get("access_token")
+            access_token = token.get("access_token") if isinstance(token, dict) else None
             if not access_token:
                 return _error_response()
             raw = await prov.get_user_info(access_token)
+            if not isinstance(raw, dict):
+                return _error_response()
             info = await prov.process_user_info(raw)
-        except (httpx.HTTPError, ValueError, KeyError):
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
             return _error_response()
 
-        user, created = await account_service.get_or_create_user(info, db)
+        try:
+            user, created = await account_service.get_or_create_user(info, db)
+        except OAuthAccountException as exc:
+            return _error_response(exc.code)
 
         if created:
             await runtime.hooks.run_after_register(
@@ -196,6 +202,8 @@ def build_oauth_router(
                 db=db,
                 context=HookContext(transport="oauth", request=request),
             )
+        if not runtime.repo.is_active(user):
+            return _error_response(ACCOUNT_INACTIVE)
 
         session_id, csrf = await session_manager.create_session(
             request,

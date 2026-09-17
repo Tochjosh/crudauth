@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...exceptions import BadRequestException
 from ..constants import (
     GOOGLE,
     GOOGLE_AUTHORIZE_ENDPOINT,
@@ -59,12 +58,12 @@ class GoogleOAuthProvider(AbstractOAuthProvider):
         """
         sub = user_info.get("sub")
         if sub is None:
-            raise BadRequestException("Google did not return a user id (sub).")
+            raise ValueError("Google did not return a user id (sub).")
         return OAuthUserInfo(
             provider=GOOGLE,
             provider_user_id=str(sub),
             email=user_info.get("email"),
-            email_verified=bool(user_info.get("email_verified", False)),
+            email_verified=user_info.get("email_verified") is True,
             name=user_info.get("name"),
             given_name=user_info.get("given_name"),
             family_name=user_info.get("family_name"),

@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from crudauth import CookieConfig, CRUDAuth, EmailConfig, EmailSender, SessionTransport
-from crudauth.exceptions import BadRequestException
+from crudauth.exceptions import OAuthAccountException
 from crudauth.models import AuthUserMixin
 from crudauth.oauth import OAuthAccountService, OAuthUserInfo
 from crudauth.repository import UserRepository
@@ -179,6 +179,7 @@ async def test_oauth_signup_rejects_an_email_longer_than_the_column(sized_sessio
         provider="google", provider_user_id="g-1", email=LONG_EMAIL, email_verified=True
     )
     async with sized_sessionmaker() as db:
-        with pytest.raises(BadRequestException):
+        with pytest.raises(OAuthAccountException) as exc:
             await service.get_or_create_user(info, db)
         assert await db.scalar(select(func.count()).select_from(SizedUser)) == 0
+    assert exc.value.code == "email_too_long"

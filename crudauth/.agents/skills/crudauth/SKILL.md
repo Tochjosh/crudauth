@@ -175,7 +175,7 @@ auth = CRUDAuth(..., transports=[SessionTransport()], redirect_base_url="https:/
 
 Adds `/oauth/{provider}/authorize` + `/oauth/{provider}/callback`. Needs a `SessionTransport`,
 `redirect_base_url`, and a `{provider}_id` column (`AuthUserMixin` has the built-ins). Auto-links to an
-existing account **only on a provider-verified email**. See `references/oauth.md`.
+existing account, or creates one, **only on a provider-verified email**. See `references/oauth.md`.
 
 ---
 
@@ -233,7 +233,7 @@ These are the load-bearing rules. Breaking one is a vulnerability, not a style n
 4. **`EmailContext` carries no user-controlled data and no bare token.** Don't put `username`/`email`
    into email HTML via the sender — that's an XSS surface crudauth deliberately avoids. Personalize in
    a `DeliveryChannel` (it owns escaping). The token reaches the sender only embedded in `context.link`.
-5. **OAuth links to an existing account only on a verified provider email.** Don't relax this; it's the
+5. **OAuth links or creates accounts only on a verified provider email.** Don't relax this; it's the
    account-takeover defense.
 
 ---

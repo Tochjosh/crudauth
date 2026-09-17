@@ -6,6 +6,14 @@ from __future__ import annotations
 GOOGLE = "google"
 GITHUB = "github"
 
+# Callback error codes, reported as ``?error=`` (redirect mode) or ``detail`` (JSON mode).
+OAUTH_FAILED = "oauth_failed"
+EMAIL_MISSING = "email_missing"
+EMAIL_UNVERIFIED = "email_unverified"
+EMAIL_TOO_LONG = "email_too_long"
+PROVIDER_ALREADY_LINKED = "provider_already_linked"
+ACCOUNT_INACTIVE = "account_inactive"
+
 # OAuth-generated-username shaping.
 USERNAME_MIN_LENGTH = 2
 USERNAME_MAX_LENGTH = 32

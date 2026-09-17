@@ -72,13 +72,16 @@ endpoint; a Google-first user simply has no password to begin with.
 
 ## 4. The rule that keeps linking safe
 
-The reason this coexistence is not an account-takeover hole: CRUDAuth links a provider to an
-existing account **only when the provider reports a verified email**. If someone points a Google
-account with an *unverified* `alice@example.com` at the callback, it does not link to Alice; it is
-refused with "sign in with your existing method to link this provider." An attacker can't attach
-their Google login to your account using an address they haven't proven they control. Linking is the
-one asymmetric operation (it touches an account the OAuth user may not own), and CRUDAuth treats it
-that way by default.
+The reason this coexistence is not an account-takeover hole: CRUDAuth uses a provider email
+**only when the provider reports it verified**. If someone points a Google account with an
+*unverified* `alice@example.com` at the callback, it neither links to Alice nor creates an account;
+the callback fails with `email_unverified`. An attacker can't attach their Google login to your
+account using an address they haven't proven they control.
+
+It also covers the opposite order. If an attacker registers `alice@example.com` with a password
+before Alice ever signs up, and never verifies it, Alice's verified Google sign-in claims that
+account: the attacker's password stops working, their sessions are signed out, and the email is
+marked verified. If Alice had verified the address herself, her password and sessions are kept.
 
 ## 5. Who has to verify their email
 

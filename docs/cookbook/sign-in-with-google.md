@@ -83,8 +83,10 @@ CRUDAuth runs the authorization-code flow, then finds or creates the user:
 
 - **Link:** if a user already exists with Google's verified email, the Google account is linked to
   it (`google_id` is set), and that user can sign in by password or by Google afterward.
-- **Create:** otherwise a new user is created from the Google profile, with `email_verified` taken
-  from Google, so a Google user usually arrives already verified.
+- **Create:** otherwise a new user is created from the Google profile, already verified.
+
+Google must report the email as verified for either; otherwise the callback redirects with
+`?error=email_unverified`. The [OAuth guide](../guides/auth/oauth.md#errors) lists every error code.
 
 ## 5. Set your own columns on new OAuth users
 
@@ -116,11 +118,12 @@ Two defenses you didn't write carry this flow, both on by default. The `state` i
 browser that started the login (a short-lived cookie the callback must match), so a captured or
 forged callback can't be replayed into someone else's session, and the post-login redirect is
 validated as a same-origin relative path so it can't become an open redirect. The one worth
-internalizing: CRUDAuth links a provider to an existing account *only* when the provider reports a
-verified email. An unverified, attacker-influenceable address can never claim an account it doesn't
-own; it is refused and routed to manual linking. Creating a *new* account on an unverified email is
-fine (there is nothing to hijack), and that row stays `email_verified=False` until proven. Linking
-is the asymmetric case, and that asymmetry is the whole defense.
+internalizing: CRUDAuth trusts a provider email *only* when the provider reports it verified, for
+linking and for creating alike. An unverified address could belong to anyone, so it neither links
+to an existing account nor creates one that the real owner would later recover by password reset
+while the provider login stayed attached. The reverse also holds: if someone registered a password
+account on your email and never verified it, your verified Google sign-in claims that account,
+disabling its password and signing out its sessions.
 
 ## Where to go next
 

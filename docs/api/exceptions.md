@@ -7,6 +7,8 @@ The HTTP exceptions CRUDAuth raises. All subclass `CustomException`, which is a 
 
 ::: crudauth.exceptions.BadRequestException
 
+::: crudauth.exceptions.OAuthAccountException
+
 ::: crudauth.exceptions.NotFoundException
 
 ::: crudauth.exceptions.ForbiddenException
