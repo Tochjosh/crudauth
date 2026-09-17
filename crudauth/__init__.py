@@ -42,7 +42,7 @@ from .exceptions import (
     ValueTooLongException,
 )
 from .crud_auth import CRUDAuth
-from .email.service import EmailFlowService
+from .email.service import EmailFlowResult, EmailFlowService
 from .hooks import AuthHooks, HookContext
 from .identity import IdentityConfig
 from .mfa import MfaConfig, MfaService
@@ -77,6 +77,7 @@ __all__ = [
     "BearerTransport",
     "OAuthCredentials",
     "EmailConfig",
+    "EmailFlowResult",
     "EmailSender",
     "EmailContext",
     "DeliveryChannel",

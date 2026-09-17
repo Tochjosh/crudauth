@@ -118,7 +118,7 @@ async def test_confirm_email_change_marks_verified(sessionmaker, UserModel) -> N
 
     token = sender.token_for("change_email")
     async with sessionmaker() as db:
-        updated = await svc.confirm_email_change(db, token)
+        updated, _ = await svc.confirm_email_change(db, token)
     assert repo.get(updated, "email") == "new@x.com"
     assert repo.email_verified(updated) is True
 

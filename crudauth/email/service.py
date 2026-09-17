@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
@@ -26,13 +26,19 @@ from ..repository import UserRepository
 from ..password import PasswordContext, PasswordPolicy
 from ..storage.base import AbstractSessionStorage
 from ..transports.bearer.tokens import create_signed_token, verify_signed_token_full
-from ..utils import canonical_email, get_password_hash_async, verify_password_async
+from ..utils import (
+    canonical_email,
+    get_password_hash_async,
+    safe_redirect_path,
+    verify_password_async,
+)
 from .channel import DeliveryChannel, DeliveryIntent, EmailChannel
 from .config import EmailConfig
 from .constants import (
     CHANGE,
     CHANGE_ACTION,
     EXISTING_ACCOUNT_ACTION,
+    REDIRECT_CLAIM,
     RESET,
     RESET_ACTION,
     STATE_CLAIM,
@@ -45,13 +51,27 @@ if TYPE_CHECKING:  # pragma: no cover
     from ..ratelimit import RateLimiterBackend
     from ..transports.session.manager import SessionManager
 
-__all__ = ["EmailFlowService"]
+__all__ = ["EmailFlowService", "EmailFlowResult"]
 
 logger = logging.getLogger("crudauth")
 
 
 class _UsedToken(BaseModel):
     used: bool = True
+
+
+class EmailFlowResult(NamedTuple):
+    """What a confirmed recovery flow produced.
+
+    Attributes:
+        user: The affected user row.
+        redirect_to: Where the app should send the person next - the
+            ``redirect_to`` they asked for when the link was requested, if it
+            survived validation, else ``None``.
+    """
+
+    user: Any
+    redirect_to: str | None
 
 
 class EmailFlowService:
@@ -190,6 +210,24 @@ class EmailFlowService:
         digest = hmac.new(self.secret_key.encode(), message, hashlib.sha256).hexdigest()
         return digest[:STATE_DIGEST_CHARS]
 
+    @staticmethod
+    def _redirect_claim(redirect_to: str | None) -> dict[str, str]:
+        """The ``redirect_to`` claim for a token, or nothing when it can't be honored.
+
+        A destination that isn't a same-origin relative path is dropped rather
+        than raised on: someone verifying their email must not be stopped because
+        the app asked to send them somewhere unsafe afterwards.
+        """
+        target = safe_redirect_path(redirect_to, default="") if redirect_to else ""
+        return {REDIRECT_CLAIM: target} if target else {}
+
+    @staticmethod
+    def _redirect_from(payload: dict[str, Any]) -> str | None:
+        """The destination a token carries, re-validated at redemption."""
+        claim = payload.get(REDIRECT_CLAIM)
+        target = safe_redirect_path(claim, default="") if isinstance(claim, str) else ""
+        return target or None
+
     def _mint_token(self, purpose: str, user: Any, expires_hours: int, **claims: Any) -> str:
         """Sign a ``purpose`` token for ``user``, bound to the account's current state."""
         return create_signed_token(
@@ -282,12 +320,23 @@ class EmailFlowService:
         )
 
     # --- recovery-factor verification ----------------------------------------
-    async def request_recovery_verification(self, db: AsyncSession, value: str) -> None:
+    async def request_recovery_verification(
+        self, db: AsyncSession, value: str, *, redirect_to: str | None = None
+    ) -> None:
         """Send a verification token for the contract's recovery factor.
 
         Idempotent; never reveals account existence. The user is looked up by the
         recovery factor (email for email recovery, phone for phone recovery) and
         the token is delivered to that factor's value over the configured channel.
+
+        Args:
+            db: Active async session.
+            value: The recovery value to look up and deliver to.
+            redirect_to: Where the app should send the person once they confirm.
+                It rides inside the signed token, so the emailed link is unchanged
+                and the destination survives the link being opened on another
+                device. Only a same-origin relative path is carried; anything else
+                is dropped and the flow proceeds without one.
         """
         factor = self.repo.recovery
         if factor is None:
@@ -297,7 +346,9 @@ class EmailFlowService:
         user = await self.repo.get_by_field(db, factor, value)
         if user is None or self.repo.recovery_verified(user):
             return
-        token = self._mint_token(VERIFY, user, self.verify_ttl_hours)
+        token = self._mint_token(
+            VERIFY, user, self.verify_ttl_hours, **self._redirect_claim(redirect_to)
+        )
         await self._deliver(
             DeliveryIntent(
                 kind="verify_email" if factor == "email" else "verify_recovery",
@@ -309,7 +360,7 @@ class EmailFlowService:
             db,
         )
 
-    async def confirm_recovery_verification(self, db: AsyncSession, token: str) -> Any:
+    async def confirm_recovery_verification(self, db: AsyncSession, token: str) -> EmailFlowResult:
         """Verify the signed token and mark the user's email verified (one-time-use).
 
         Args:
@@ -317,13 +368,14 @@ class EmailFlowService:
             token: The signed verification token from the emailed link.
 
         Returns:
-            The verified user row.
+            The verified user row and the ``redirect_to`` the request carried, as
+            an [EmailFlowResult][crudauth.email.service.EmailFlowResult].
 
         Raises:
             BadRequestException: If the token is invalid, expired, or already used,
                 or the recovery value changed since it was sent.
         """
-        user, _ = await self._redeem_token(db, token, VERIFY)
+        user, payload = await self._redeem_token(db, token, VERIFY)
         if not await self._consume(token, self.verify_ttl_hours * SECONDS_PER_HOUR):
             raise BadRequestException("Token already used")
         if not self.repo.recovery_verified(user):
@@ -331,12 +383,21 @@ class EmailFlowService:
             await self.hooks.run_after_recovery_verified(
                 self.repo.to_dict(user), db=db, context=HookContext()
             )
-        return user
+        return EmailFlowResult(user, self._redirect_from(payload))
 
     # --- password reset ------------------------------------------------------
-    async def request_password_reset(self, db: AsyncSession, value: str) -> None:
+    async def request_password_reset(
+        self, db: AsyncSession, value: str, *, redirect_to: str | None = None
+    ) -> None:
         """Send a reset token over the configured channel. Idempotent; never reveals
-        account existence. Looked up by, and delivered to, the recovery factor."""
+        account existence. Looked up by, and delivered to, the recovery factor.
+
+        Args:
+            db: Active async session.
+            value: The recovery value to look up and deliver to.
+            redirect_to: Where the app should send the person once the password is
+                reset; carried inside the signed token, same-origin paths only.
+        """
         factor = self.repo.recovery
         if factor is None:
             return
@@ -345,7 +406,9 @@ class EmailFlowService:
         user = await self.repo.get_by_field(db, factor, value)
         if user is None:
             return
-        token = self._mint_token(RESET, user, self.reset_ttl_hours)
+        token = self._mint_token(
+            RESET, user, self.reset_ttl_hours, **self._redirect_claim(redirect_to)
+        )
         await self._deliver(
             DeliveryIntent(
                 kind="reset_password",
@@ -357,7 +420,9 @@ class EmailFlowService:
             db,
         )
 
-    async def reset_password(self, db: AsyncSession, token: str, new_password: str) -> Any:
+    async def reset_password(
+        self, db: AsyncSession, token: str, new_password: str
+    ) -> EmailFlowResult:
         """Reset the password and evict every outstanding credential.
 
         Args:
@@ -366,7 +431,8 @@ class EmailFlowService:
             new_password: The new plaintext password (hashed before storage).
 
         Returns:
-            The updated user row.
+            The updated user row and the ``redirect_to`` the request carried, as
+            an [EmailFlowResult][crudauth.email.service.EmailFlowResult].
 
         Raises:
             BadRequestException: If the token is invalid, expired, or already used,
@@ -383,7 +449,7 @@ class EmailFlowService:
             column; without it (a custom model that omits it) only sessions are
             evicted.
         """
-        user, _ = await self._redeem_token(db, token, RESET)
+        user, payload = await self._redeem_token(db, token, RESET)
         await self.password_policy.enforce(
             new_password, PasswordContext.for_user(self.repo, "reset", user), field="new_password"
         )
@@ -400,13 +466,27 @@ class EmailFlowService:
         await self.hooks.run_after_password_reset(
             self.repo.to_dict(user), db=db, context=HookContext()
         )
-        return user
+        return EmailFlowResult(user, self._redirect_from(payload))
 
     # --- email change --------------------------------------------------------
     async def request_email_change(
-        self, db: AsyncSession, user: Any, new_email: str, password: str
+        self,
+        db: AsyncSession,
+        user: Any,
+        new_email: str,
+        password: str,
+        *,
+        redirect_to: str | None = None,
     ) -> None:
         """Send a confirmation link to the proposed new address.
+
+        Args:
+            db: Active async session.
+            user: The authenticated user changing their address.
+            new_email: The proposed address.
+            password: The current password, as re-auth.
+            redirect_to: Where the app should send the person once the new address
+                is confirmed; carried inside the signed token, same-origin paths only.
 
         Note:
             Requires the current password as re-auth. OAuth-only accounts hold
@@ -430,7 +510,13 @@ class EmailFlowService:
         if not await self._email_within_limit(CHANGE_ACTION, new_email_c):
             return
         if await self.repo.get_by_email(db, new_email_c) is None:
-            token = self._mint_token(CHANGE, user, self.change_ttl_hours, new_email=new_email_c)
+            token = self._mint_token(
+                CHANGE,
+                user,
+                self.change_ttl_hours,
+                new_email=new_email_c,
+                **self._redirect_claim(redirect_to),
+            )
             await self._deliver(
                 DeliveryIntent(
                     kind="change_email",
@@ -442,8 +528,12 @@ class EmailFlowService:
                 db,
             )
 
-    async def confirm_email_change(self, db: AsyncSession, token: str) -> Any:
+    async def confirm_email_change(self, db: AsyncSession, token: str) -> EmailFlowResult:
         """Apply a confirmed email change.
+
+        Returns:
+            The updated user row and the ``redirect_to`` the request carried, as
+            an [EmailFlowResult][crudauth.email.service.EmailFlowResult].
 
         Note:
             The confirmation link is delivered to, and clicked from, the new
@@ -487,4 +577,4 @@ class EmailFlowService:
         await self.hooks.run_after_email_changed(
             self.repo.to_dict(user), db=db, context=HookContext()
         )
-        return user
+        return EmailFlowResult(user, self._redirect_from(payload))

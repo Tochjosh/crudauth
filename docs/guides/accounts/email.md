@@ -66,6 +66,38 @@ That link points at **your** frontend, not at crudauth. Your page reads `token` 
 and POSTs it to the matching confirm endpoint. The paths default to `/verify-email`,
 `/reset-password`, and `/confirm-email-change`, and are configurable on `EmailConfig`.
 
+### Sending someone back where they started
+
+Someone who opens an invitation, signs up to accept it, and goes to their inbox to verify has
+lost the invitation by the time they come back. Pass `redirect_to` on the request, and the
+confirm response hands it back:
+
+```bash
+curl -X POST http://localhost:8000/email/verify-request \
+  -H "Content-Type: application/json" \
+  -d '{"email": "alice@example.com", "redirect_to": "/invites/abc123"}'
+
+# after they click the link, your page POSTs the token and gets:
+# {"detail": "Verified successfully.", "redirect_to": "/invites/abc123"}
+```
+
+The destination travels **inside the signed token**, not in the emailed URL, which has three
+consequences worth knowing:
+
+- The link is byte-for-byte what it was before, so there is nothing in it for a recipient or a
+  forwarder to edit.
+- It survives the link being opened somewhere else. The invite arrives in a chat app on a phone
+  and the email is confirmed on a laptop; the destination still comes back.
+- Only same-origin relative paths are carried, checked by
+  [`safe_redirect_path`](../../api/utils.md) when the token is minted and again when it's
+  redeemed. An absolute URL, `//host`, `/\host` or a control character is dropped - the person
+  still verifies their email, your page just falls back to its own default.
+
+`redirect_to` works the same on `/password/reset-request` and `/email/change-request`, and the
+matching confirm responses include it. The key is absent when no destination was asked for, and
+it's the same key the OAuth callback and `/mfa/verify` already return, so one handler covers all
+of them.
+
 ## Walk-through: password reset
 
 ```bash
@@ -85,12 +117,14 @@ Verify and change-email follow the same shape, with different bodies (below).
 
 | Method & path | Body | What it does |
 |---|---|---|
-| `POST /email/verify-request` | `{email}` | Send a verification link. |
+| `POST /email/verify-request` | `{email, redirect_to?}` | Send a verification link. |
 | `POST /email/verify-confirm` | `{token}` | Consume the token, mark `email_verified`. |
-| `POST /password/reset-request` | `{email}` | Send a reset link. |
+| `POST /password/reset-request` | `{email, redirect_to?}` | Send a reset link. |
 | `POST /password/reset-confirm` | `{token, new_password}` | Set the new password, revoke outstanding tokens. |
-| `POST /email/change-request` | `{new_email, password}` | Authenticated; send a link to the **new** address. |
+| `POST /email/change-request` | `{new_email, password, redirect_to?}` | Authenticated; send a link to the **new** address. |
 | `POST /email/change-confirm` | `{token}` | Swap the email and mark it verified. |
+
+Each confirm response carries `redirect_to` when the request that sent the link asked for one.
 
 The `-request` endpoints return `200` whether or not the address exists, so they don't leak
 which accounts are registered. `/email/change-request` still rejects a wrong password (`400`)

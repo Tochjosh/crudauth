@@ -86,12 +86,20 @@ Mounted by `email=` (and/or `channels=` when there's a recovery factor):
 
 | Endpoint | Body | Notes |
 |---|---|---|
-| `POST /email/verify-request` | `{"<factor>": ...}` | factor-shaped (email app: `email`; phone app: `phone`) |
+| `POST /email/verify-request` | `{"<factor>": ..., "redirect_to"?}` | factor-shaped (email app: `email`; phone app: `phone`) |
 | `POST /email/verify-confirm` | `{"token": ...}` | marks the factor verified |
-| `POST /password/reset-request` | `{"<factor>": ...}` | |
+| `POST /password/reset-request` | `{"<factor>": ..., "redirect_to"?}` | |
 | `POST /password/reset-confirm` | `{"token", "new_password"}` | evicts the user's other sessions |
-| `POST /email/change-request` | `{"new_email", "password"}` | authenticated; mounts only when the model has an `email` column and a `sends_email` channel |
+| `POST /email/change-request` | `{"new_email", "password", "redirect_to"?}` | authenticated; mounts only when the model has an `email` column and a `sends_email` channel |
 | `POST /email/change-confirm` | `{"token"}` | |
+
+`redirect_to` is where the app wants the person sent after confirming (an invite they signed up to
+accept). It rides inside the signed token, so the emailed URL is unchanged and the destination
+survives the link being opened on another device. Same-origin relative paths only, validated at mint
+and again at redemption; anything else is dropped without failing the flow. Each confirm response
+includes `redirect_to` only when the token carried one — the same key the OAuth callback and
+`/mfa/verify` return. Calling the service directly, the three confirm methods return
+`EmailFlowResult(user, redirect_to)`.
 
 ## Security rules
 
