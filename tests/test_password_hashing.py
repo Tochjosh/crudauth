@@ -239,6 +239,7 @@ async def test_no_request_path_hashes_or_verifies_on_the_event_loop(
             json={"token": sender.tokens["reset_password"], "new_password": "pw999999"},
         )
         assert r.status_code == 200
+        c.cookies.clear()
         c.cookies.set("session_id", oauth_sid)
         r = await c.post(
             "/set-password", json={"new_password": "pw123456"}, headers={"X-CSRF-Token": oauth_csrf}
