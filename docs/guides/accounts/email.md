@@ -26,9 +26,9 @@ auth = CRUDAuth(
 app.include_router(auth.router)   # adds the verify / reset / change routes
 ```
 
-Prefer enqueueing onto a task queue over blocking on SMTP here: registration sends are
-best-effort (a failure is logged), but the verify/reset/change flows surface a raised send as
-a 5xx.
+Prefer enqueueing onto a task queue over blocking on SMTP here: the request waits on `send`. A
+raised send is logged and swallowed on every flow, so it never fails the request, but that
+message is lost unless your queue retries it.
 
 ### Sending your own HTML
 
@@ -139,12 +139,17 @@ defaults (or pass `verify_ttl_hours` / `reset_ttl_hours` / `change_ttl_hours` to
 `deliver(intent, db)` receives the message descriptor plus the request session. Two things to
 know:
 
-- `intent.recipient` is the **email address** (the recovery lookup is still keyed on email;
-  per-field recovery like phone-as-identifier is a separate step). A non-email channel ignores
-  it and loads its own destination, as the SMS example does.
+- `intent.recipient` is where the message goes: the recovery value (an email address, or a
+  phone number in a [phone-recovery app](../../cookbook/phone-recovery.md)) for verify, reset and
+  the existing-account notice, the **new** address for `change_email`, and the previous address
+  for the `email_changed` notice.
+- `change_email` reaches only channels that email `intent.recipient`, marked with the class
+  attribute `sends_email = True`, because its token proves control of that address. The built-in
+  `EmailChannel` sets it; set it on a custom channel that sends email. The change-email routes
+  mount only when at least one such channel is configured.
 - `intent.user` holds only CRUDAuth's logical fields, so an app column like `phone` isn't in
-  it. Read it off `db` with `intent.user["id"]` (the session is present for verify/reset/change,
-  `None` for the existing-account notice). Use `db` **synchronously** and never commit or
+  it. Read it off `db` with `intent.user["id"]` (the session is present for verify, reset,
+  change and the `email_changed` notice, `None` for the existing-account notice). Use `db` **synchronously** and never commit or
   capture it: it closes when the request ends, so read what you need, then enqueue the send
   (as above) rather than blocking on it.
 
@@ -169,7 +174,13 @@ the matching confirm, so you can grant access, send a notice, or write an audit 
 
 - A password reset bumps the user's `token_version`, invalidating every bearer token issued
   before the reset, and evicts the user's other sessions.
-- The change-email link is sent to the **new** address, so confirming it proves control.
+- The change-email link is sent to the **new** address, so confirming it proves control. Once
+  it's confirmed, the previous address gets an `email_changed` notice.
+- Each token is bound to the account state it acts on and stops working when that state
+  changes: a reset link once the password or the recovery value changes, a change-email link
+  once the password, the email or `token_version` changes, and a verification link once the
+  address it was sent to is no longer the account's. Tokens issued by a CRUDAuth version without
+  this binding are rejected, so links sent before an upgrade have to be requested again.
 - `-request` endpoints are throttled per address and per IP.
 
 ---

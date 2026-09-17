@@ -38,6 +38,9 @@ class SizedUser(SizedBase, AuthUserMixin):
     email: Mapped[str] = mapped_column(String(20), unique=True, index=True)
     full_name: Mapped[str | None] = mapped_column(String(5), default=None)
     nickname: Mapped[str | None] = mapped_column(Nickname, default=None)
+    handle: Mapped[str | None] = mapped_column(
+        String(50).with_variant(String(10), "postgresql"), default=None
+    )
 
 
 class Register(BaseModel):
@@ -183,3 +186,11 @@ async def test_oauth_signup_rejects_an_email_longer_than_the_column(sized_sessio
             await service.get_or_create_user(info, db)
         assert await db.scalar(select(func.count()).select_from(SizedUser)) == 0
     assert exc.value.code == "email_too_long"
+
+
+def test_a_variant_column_reports_its_smallest_length() -> None:
+    repo = UserRepository(SizedUser)
+
+    assert repo.string_length("handle") == 10
+    assert repo.exceeds_length("handle", "x" * 11) == 10
+    assert repo.exceeds_length("handle", "x" * 10) is None

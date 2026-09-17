@@ -28,7 +28,8 @@ class EmailContext:
     Attributes:
         kind: Which message this is - one of :data:`EMAIL_KINDS`.
         link: The assembled, ready-to-click URL with the token embedded, or
-            ``None`` for ``existing_account`` (a notice with no action).
+            ``None`` for a notice with no action (``existing_account``,
+            ``email_changed``).
         recipient: The destination address crudauth resolved.
         expires_in: Token lifetime in seconds, or ``0`` when ``link`` is ``None``.
 
@@ -84,8 +85,8 @@ class EmailSender(ABC):
                 signed-token link. Deliver it as-is for a plain sender, or ignore
                 it and render your own from ``context``.
             kind: Which message this is - one of :data:`EMAIL_KINDS`. Use it to
-                select the template (``existing_account`` is a security notice,
-                not a welcome).
+                select the template (``existing_account`` and ``email_changed``
+                are security notices, not a welcome).
             context: crudauth-owned render data
                 ([EmailContext][crudauth.email.sender.EmailContext]): the assembled
                 ``link``, ``kind``, ``recipient``, and ``expires_in``. Read
@@ -94,9 +95,8 @@ class EmailSender(ABC):
 
         Note:
             Prefer to **enqueue** (hand off to a task queue) rather than block on
-            SMTP/provider I/O here. crudauth treats the registration sends as
-            best-effort (a failure is logged, not surfaced), but other flows may
-            propagate a raised send as a 5xx - a non-blocking adapter avoids both
-            slow requests and transient-failure errors.
+            SMTP/provider I/O here: the request waits on this call. A raised send
+            is logged and swallowed on every flow, so it never fails the request,
+            but that message is lost unless the sender retries it.
         """
         raise NotImplementedError

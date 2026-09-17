@@ -9,11 +9,12 @@ schema to adopt the library.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 from sqlalchemy import String, TypeDecorator, UniqueConstraint, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.types import TypeEngine
 
 from .constants import (
     LOGICAL_FIELDS,
@@ -33,6 +34,16 @@ __all__ = [
 
 # Sentinel: a value that could not be coerced to the PK type (so no row matches).
 _UNCOERCIBLE = object()
+
+
+def _string_lengths(column_type: TypeEngine[Any]) -> Iterator[int]:
+    """Every ``String`` length ``column_type`` declares, across its ``with_variant`` variants."""
+    if isinstance(column_type, TypeDecorator):
+        yield from _string_lengths(column_type.impl_instance)
+    elif isinstance(column_type, String) and column_type.length is not None:
+        yield column_type.length
+    for variant in column_type._variant_mapping.values():
+        yield from _string_lengths(variant)
 
 
 class UserRepository:
@@ -130,17 +141,16 @@ class UserRepository:
         return getattr(self.model, self.col(logical))
 
     def string_length(self, logical: str) -> int | None:
-        """Return the resolved SQLAlchemy ``String`` column length, if known."""
+        """Return the resolved SQLAlchemy ``String`` column length, if known.
+
+        A column declared with ``with_variant`` reports its smallest length across
+        dialects, which is never looser than the one the database enforces.
+        """
         try:
             column = self._attr(logical).property.columns[0]
         except (AttributeError, IndexError):
             return None
-        column_type = column.type
-        while isinstance(column_type, TypeDecorator):
-            column_type = column_type.impl_instance
-        if not isinstance(column_type, String):
-            return None
-        return column_type.length
+        return min(_string_lengths(column.type), default=None)
 
     def exceeds_length(self, logical: str, value: Any) -> int | None:
         """Return the column length when ``value`` is a string longer than it, else ``None``.
@@ -257,14 +267,15 @@ class UserRepository:
         register schema declaring ``is_admin`` would otherwise slip a gated
         field past a logical-only gate.
 
-        The recovery-factor verified column (e.g. ``phone_verified``) is gated
-        too - it must be as unsettable at signup as ``email_verified`` always was,
-        since "verified" may only be set by returning the delivered token.
+        The recovery-factor verified column (e.g. ``phone_verified``, by logical
+        and mapped name) is gated too - it must be as unsettable at signup as
+        ``email_verified`` always was, since "verified" may only be set by
+        returning the delivered token.
         """
         gated = set(REGISTRATION_GATED_FIELDS) | {self.col(g) for g in REGISTRATION_GATED_FIELDS}
         rv = self._recovery_verified_col()
         if rv is not None:
-            gated.add(rv)
+            gated |= {rv, self.col(rv)}
         return gated
 
     def _allowed_register_names(self) -> set[str]:
@@ -312,12 +323,13 @@ class UserRepository:
 
     def _contract_names(self) -> set[str]:
         """Every crudauth logical field, by logical AND mapped column name, plus the
-        recovery-factor verified column (so a ``new_user_fields`` callback can't set
-        ``{factor}_verified`` any more than it can set ``email_verified``)."""
+        recovery-factor verified column by both names (so a ``new_user_fields``
+        callback can't set ``{factor}_verified`` any more than it can set
+        ``email_verified``)."""
         names = set(LOGICAL_FIELDS) | {self.col(f) for f in LOGICAL_FIELDS}
         rv = self._recovery_verified_col()
         if rv is not None:
-            names.add(rv)
+            names |= {rv, self.col(rv)}
         return names
 
     def filter_provisioning_data(self, data: dict[str, Any]) -> dict[str, Any]:

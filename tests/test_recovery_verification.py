@@ -45,6 +45,15 @@ class PhoneUser(_PhoneBase, _PhoneMixin):
     phone: Mapped[str | None] = mapped_column(String(32), unique=True, default=None)
 
 
+_NoRecoveryMixin: Any = make_auth_identity(identifiers=["username"], recovery=None, oauth=False)
+
+
+class RenamedPhoneUser(_PhoneBase, _NoRecoveryMixin):
+    __tablename__ = "rv_renamed_phone_users"
+    phone: Mapped[str | None] = mapped_column(String(32), unique=True, default=None)
+    phone_ok: Mapped[bool] = mapped_column(default=False)
+
+
 class RecordingChannel(DeliveryChannel):
     def __init__(self) -> None:
         self.intents: list[DeliveryIntent] = []
@@ -133,6 +142,19 @@ def test_factor_verified_unsettable_via_register_and_provisioning() -> None:
     assert prov_repo.filter_provisioning_data({"phone": "1", "phone_verified": True}) == {
         "phone": "1"
     }
+
+
+def test_a_renamed_factor_verified_column_is_unsettable() -> None:
+    repo = UserRepository(
+        RenamedPhoneUser,
+        column_map={"phone_verified": "phone_ok"},
+        register_extra_fields={"phone", "phone_ok"},
+        recovery="phone",
+    )
+
+    assert repo.filter_registration_data({"username": "u", "phone_ok": True}) == {"username": "u"}
+    assert repo.filter_provisioning_data({"phone": "1", "phone_ok": True}) == {"phone": "1"}
+    assert repo.gated_register_fields({"phone_ok"}) == {"phone_ok"}
 
 
 def test_factor_verified_unsettable_via_new_user_defaults(get_session) -> None:

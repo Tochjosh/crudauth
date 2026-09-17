@@ -42,15 +42,13 @@ from crudauth import DeliveryChannel, DeliveryIntent
 class SmsChannel(DeliveryChannel):
     async def deliver(self, intent: DeliveryIntent, db) -> None:
         if intent.token is None:
-            return  # notices with no action (e.g. existing-account); nothing to send
+            return  # notices with no action (existing-account, email-changed); nothing to send
 
         link = f"https://app.example.com/recover?token={intent.token}"
         if intent.kind == "verify_recovery":
             body = f"Verify your number: {link}"
         elif intent.kind == "reset_password":
             body = f"Reset your password: {link}"
-        else:
-            return  # email-specific kinds (change-email) don't apply to a phone app
 
         await sms_client.send(to=intent.recipient, body=body)
 ```

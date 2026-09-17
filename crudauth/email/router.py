@@ -5,7 +5,8 @@ service additionally enforces a silent per-target cap. The verify and reset
 request bodies are shaped to the contract's recovery factor (``email`` validated
 as an address, any other factor as a plain string), so a phone-recovery app can
 drive them over HTTP with a phone number. Change-email is email-specific and only
-mounts when the model actually has an email column.
+mounts when the model actually has an email column and a channel emails the
+recipient.
 """
 
 from typing import Annotated, Any, cast
@@ -40,7 +41,8 @@ def build_email_router(*, auth: Any, service: EmailFlowService) -> APIRouter:
     The verify and reset request bodies are generated for the recovery factor: an
     email-recovery app keeps ``{"email": ...}`` (validated as an address), a
     phone-recovery app gets ``{"phone": ...}``. Change-email endpoints are added
-    only when the model has an ``email`` column, since they prove a real address.
+    only when the model has an ``email`` column and a channel emails the
+    recipient, since they prove a real address.
 
     Args:
         auth: The owning [CRUDAuth][crudauth.crud_auth.CRUDAuth] (for ``session``,
@@ -105,7 +107,7 @@ def build_email_router(*, auth: Any, service: EmailFlowService) -> APIRouter:
         await service.reset_password(db, reset_body.token, reset_body.new_password)
         return {"detail": "Password reset successfully."}
 
-    if service.repo.has("email"):
+    if service.supports_email_change:
 
         @router.post(
             "/email/change-request",

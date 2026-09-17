@@ -32,6 +32,10 @@ class RecordingChannel(DeliveryChannel):
         self.intents.append(intent)
 
 
+class RecordingEmailChannel(RecordingChannel):
+    sends_email = True
+
+
 class BoomChannel(DeliveryChannel):
     async def deliver(self, intent: DeliveryIntent, db) -> None:
         raise RuntimeError("channel down")
@@ -243,7 +247,7 @@ async def test_facade_fires_email_and_channels_together(
 async def test_intent_shapes_per_kind(sessionmaker, UserModel) -> None:
     repo = UserRepository(UserModel)
     await _make_user(repo, sessionmaker, email="u@x.com")
-    rec = RecordingChannel()
+    rec = RecordingEmailChannel()
     svc = _service(
         UserModel, channels=[rec], verify_ttl_hours=24, reset_ttl_hours=1, change_ttl_hours=12
     )
