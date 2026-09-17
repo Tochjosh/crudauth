@@ -374,6 +374,12 @@ class CRUDAuth:
         self._oauth_state_storage: AbstractSessionStorage[Any] | None = None
         if oauth:
             self._build_oauth(oauth, redirect_base_url, oauth_paths, oauth_response_mode)
+        if oauth and mfa is not None and mfa.required is not False and not mfa.oauth:
+            logger.warning(
+                "crudauth: MfaConfig.required is set but OAuth logins skip MFA "
+                "(MfaConfig.oauth=False), so a required account with a linked provider can "
+                "sign in without a code. Set MfaConfig(oauth=True) to challenge them."
+            )
 
         if warn_on_memory_backend:
             self._warn_on_memory_backend()

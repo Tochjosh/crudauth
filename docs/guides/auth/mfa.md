@@ -45,7 +45,9 @@ To rotate it, pass a list with the new key first: `encryption_key=[new_key, old_
 use the first key, and existing ones keep decrypting with the old one.
 
 `required` decides who must use MFA: `False` (the default, so it's up to each user), `True`, or a
-sync or async function of the user row. With MFA unset, nothing about login changes.
+sync or async function of the user row. It's checked when a user logs in with a password (and with
+OAuth when `oauth=True`, see [OAuth](#oauth)): sessions and refresh tokens that already exist when you
+turn it on keep working until they end. With MFA unset, nothing about login changes.
 
 ## Enrolling
 
@@ -93,8 +95,11 @@ works in place of `code`.
 
 A challenge lasts `challenge_ttl_seconds` (five minutes), is used once, and dies after
 `max_code_attempts` wrong codes (five). Wrong codes also count against the
-[login lockout](../infra/rate-limiting.md#login-lockout), and a correct password doesn't reset it;
-only a correct code does. So a stolen password can't be used to keep guessing codes. For a session
+[login lockout](../infra/rate-limiting.md#login-lockout). A correct password neither resets the
+lockout nor counts against it, and only a correct code clears it, so a stolen password can't be used
+to keep guessing codes. Earlier failed passwords and wrong codes share the lockout's budget (five
+attempts a minute by default), so a user who mistyped their password a few times gets fewer tries at
+the code before the lockout steps in. For a session
 login, `/mfa/verify` refuses a `Sec-Fetch-Site: cross-site` request, like `/login` does.
 
 Each code is six ASCII digits (spaces are ignored), valid for its 30-second step and one step either
@@ -124,9 +129,19 @@ required account can't disable MFA (`403`).
 
 ## Recovery codes, disabling
 
-Enabling MFA doesn't sign out the account's other sessions. If you want it to, revoke them in
-`on_after_mfa_enabled`. An account without a password (OAuth-only) enrolls without one, since there's
-nothing to check.
+Enabling MFA doesn't sign out the account's other sessions or invalidate its refresh tokens. To sign
+out the other sessions, revoke them from the hook, keeping the one that just enrolled:
+
+```python
+async def sign_out_elsewhere(user, *, db, context):
+    current = context.request.cookies.get("session_id") if context.request else None
+    await auth.sessions.revoke_all(user["id"], exclude=current)
+
+auth = CRUDAuth(..., hooks=AuthHooks(on_after_mfa_enabled=sign_out_elsewhere))
+```
+
+Refresh tokens end when the user's `token_version` is bumped, as a password change does. An account
+without a password (OAuth-only) enrolls without one, since there's nothing to check.
 
 `POST /mfa/recovery-codes/regenerate` replaces all recovery codes, and `POST /mfa/totp/disable` turns
 MFA off. Both take `{"code"}`: a current authenticator code, or a recovery code when the device is
@@ -142,14 +157,19 @@ until = await auth.sudo.elevate(user, code=body.code, db=db, request=request)
 
 ## OAuth
 
-OAuth logins skip MFA by default: the identity provider owns the second factor there. When an OAuth
+OAuth logins skip MFA by default: the identity provider owns the second factor there. That includes
+accounts `required` covers, so an account with a linked provider can sign in through it without a
+code; `CRUDAuth` logs a warning at startup when `required` is set with OAuth configured and
+`oauth=False`. When an OAuth
 login [claims an account](oauth.md#account-linking) whose email was never verified, it also removes
 any MFA enrollment on it, since whoever registered that account set it up. With
 `MfaConfig(oauth=True)`, the callback returns a challenge for an account with MFA instead of a
 session. In JSON mode it's the challenge body; in redirect mode it's a redirect to
-`redirect_base_url#mfa_challenge=<challenge>`. For a setup challenge that arrives this way, `POST
-/mfa/challenge` with `{"challenge"}` returns its `setup` details. The `/mfa/verify` response includes
-`redirect_to`, the landing path the OAuth login asked for.
+`redirect_base_url#mfa_challenge=<challenge>`. The fragment never reaches a server, but it stays in
+the browser history, so read it and remove it right away
+(`history.replaceState(null, "", location.pathname + location.search)`). For a setup challenge that
+arrives this way, `POST /mfa/challenge` with `{"challenge"}` returns its `setup` details. The
+`/mfa/verify` response includes `redirect_to`, the landing path the OAuth login asked for.
 
 ## Your own login route
 

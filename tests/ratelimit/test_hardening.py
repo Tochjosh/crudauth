@@ -20,6 +20,7 @@ from crudauth.ratelimit import (
     RateLimit,
     RedisBackend,
 )
+from crudauth.ratelimit.constants import LOCKOUT_NAMESPACE
 from crudauth.utils import client_ip_key, get_client_ip
 
 SECRET = "test-secret-key-0123456789-0123456789"
@@ -292,3 +293,24 @@ async def test_shutdown_closes_every_component_when_one_fails(
     with pytest.raises(RuntimeError, match="transport close failed"):
         await auth.shutdown()
     assert closed == ["redis"]
+
+
+@pytest.mark.parametrize("backend_name", ["memory", "redis"])
+async def test_forgetting_an_attempt_takes_back_one_failure_and_never_goes_negative(
+    backend_name: str,
+) -> None:
+    backend = (
+        MemoryRateLimiterBackend()
+        if backend_name == "memory"
+        else RedisBackend(client=fakeredis.aioredis.FakeRedis())
+    )
+    policy = LockoutPolicy(backend, max_attempts=5)
+    await policy.forget_attempt("10.0.0.1", "alice")
+    for _ in range(3):
+        await policy.check_and_record("10.0.0.1", "Alice")
+    await policy.forget_attempt("10.0.0.1", "alice")
+
+    assert await backend.get_count(f"{LOCKOUT_NAMESPACE}:user:alice") == 2
+    assert await backend.get_count(f"{LOCKOUT_NAMESPACE}:ip:10.0.0.1") == 2
+    assert await backend.get_count(f"{LOCKOUT_NAMESPACE}:pair:10.0.0.1:alice") == 2
+    await backend.close()

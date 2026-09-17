@@ -130,10 +130,10 @@ class AuthRuntime:
         A stored hash made before Unicode normalization is replaced with a
         normalized one on a successful login.
 
-        With ``record_success=False`` a correct password leaves the lockout counters
-        in place, for a login that still needs its second factor; call
-        [record_login_success][crudauth.core.AuthRuntime.record_login_success] once
-        the login completes.
+        With ``record_success=False`` a correct password neither clears the lockout
+        counters nor counts against them, for a login that still needs its second
+        factor; call [record_login_success][crudauth.core.AuthRuntime.record_login_success]
+        once the login completes.
 
         Raises:
             RateLimitException: The lockout is engaged for this IP/identifier.
@@ -171,6 +171,8 @@ class AuthRuntime:
             await self.repo.update(db, user, {"hashed_password": new_hash})
         if record_success:
             await self.record_login_success(ip, identifier)
+        elif self.lockout is not None:
+            await self.lockout.forget_attempt(ip, identifier)
         return user
 
     async def record_login_success(self, ip_address: str, identifier: str) -> None:

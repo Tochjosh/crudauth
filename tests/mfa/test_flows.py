@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -24,7 +25,9 @@ from crudauth import (
     SessionTransport,
     SudoConfig,
 )
+from crudauth.exceptions import BadRequestException
 from crudauth.mfa.constants import MFA_FIELDS
+from crudauth.mfa.recovery import hash_recovery_codes
 from crudauth.oauth import AbstractOAuthProvider, OAuthProviderFactory, OAuthUserInfo
 from crudauth.ratelimit import LockoutConfig
 from crudauth.storage.backends.memory import MemorySessionStorage
@@ -243,12 +246,12 @@ async def test_a_correct_password_does_not_reset_the_lockout(build) -> None:
         for _ in range(2):
             await _login(browser, password="wrong")
         challenged = await _login(browser)
-        locked = await _login(browser, password="wrong")
-        after_lock = await _login(browser)
+        failures = [(await _login(browser, password="wrong")).status_code for _ in range(2)]
+        locked = await _login(browser)
     await auth.shutdown()
 
     assert challenged.json()["mfa_required"] is True
-    assert (locked.status_code, after_lock.status_code) == (401, 429)
+    assert (failures, locked.status_code) == ([401, 401], 429)
 
 
 async def test_a_correct_code_resets_the_lockout(build) -> None:
@@ -631,11 +634,11 @@ async def test_wrong_codes_count_against_the_login_lockout(build) -> None:
                     "/mfa/verify", json={"challenge": token, "code": code_for(secret, 9)}
                 )
             ).status_code
-            for _ in range(3)
+            for _ in range(4)
         ]
     await auth.shutdown()
 
-    assert statuses == [401, 401, 429]
+    assert statuses == [401, 401, 401, 429]
 
 
 async def test_concurrent_wrong_codes_share_the_attempt_cap(build, monkeypatch) -> None:
@@ -782,3 +785,103 @@ async def test_a_password_reset_voids_an_outstanding_challenge(build, mfa_sessio
     await auth.shutdown()
 
     assert verified.status_code == 400
+
+
+async def test_every_code_attempt_is_usable_under_the_default_lockout(build) -> None:
+    auth, app, browser, secret, _ = await _enrolled_app(build)
+    async with browser:
+        token = (await _login(browser)).json()["challenge"]
+        wrong = [
+            (
+                await browser.post(
+                    "/mfa/verify", json={"challenge": token, "code": code_for(secret, 9)}
+                )
+            ).status_code
+            for _ in range(4)
+        ]
+        right = await browser.post(
+            "/mfa/verify", json={"challenge": token, "code": code_for(secret)}
+        )
+    await auth.shutdown()
+
+    assert (wrong, right.status_code) == ([401, 401, 401, 401], 200)
+
+
+async def test_only_one_of_two_racing_confirmations_hands_out_recovery_codes(
+    build, mfa_sessionmaker
+) -> None:
+    auth, app = build()
+    service = auth.mfa
+    assert service is not None
+    await auth.initialize()
+    async with client(app) as browser:
+        csrf = (await register_and_login(browser)).json()["csrf_token"]
+        setup = await browser.post(
+            "/mfa/totp/setup", json={"password": PASSWORD}, headers={"X-CSRF-Token": csrf}
+        )
+    secret = setup.json()["secret"]
+    async with mfa_sessionmaker() as first_db, mfa_sessionmaker() as second_db:
+        first = await auth.repo.get_by_username(first_db, "alice")
+        second = await auth.repo.get_by_username(second_db, "alice")
+        issued = await service.confirm_setup(first_db, first, code_for(secret, -1))
+        with pytest.raises(BadRequestException):
+            await service.confirm_setup(second_db, second, code_for(secret))
+    async with mfa_sessionmaker() as db:
+        stored = auth.repo.get(await auth.repo.get_by_username(db, "alice"), "mfa_recovery_codes")
+    await auth.shutdown()
+
+    assert stored == hash_recovery_codes(issued)
+
+
+@pytest.mark.parametrize("cross_site", [False, True])
+async def test_a_token_login_with_a_refresh_cookie_verifies_like_a_session_login(
+    build, cross_site: bool
+) -> None:
+    transports = [
+        SessionTransport(cookies=CookieConfig(secure=False)),
+        BearerTransport(refresh="cookie", cookies=CookieConfig(secure=False)),
+    ]
+    auth, app, browser, secret, _ = await _enrolled_app(build, transports=transports)
+    async with browser:
+        token = (
+            await browser.post("/token", data={"username": "alice", "password": PASSWORD})
+        ).json()["challenge"]
+        headers = {"Sec-Fetch-Site": "cross-site"} if cross_site else {}
+        verified = await browser.post(
+            "/mfa/verify", json={"challenge": token, "code": code_for(secret)}, headers=headers
+        )
+    await auth.shutdown()
+
+    if cross_site:
+        assert verified.status_code == 403
+    else:
+        assert verified.status_code == 200 and "refresh_token" in browser.cookies
+
+
+def test_required_mfa_with_oauth_skipped_warns_at_startup(mfa_session, caplog, monkeypatch) -> None:
+    monkeypatch.setitem(OAuthProviderFactory._providers, "stub", _Provider)
+    with caplog.at_level(logging.WARNING, logger="crudauth"):
+        CRUDAuth(
+            session=mfa_session,
+            user_model=MfaUser,
+            SECRET_KEY=SECRET,
+            transports=[SessionTransport()],
+            oauth={"stub": OAuthCredentials(client_id="id", client_secret="s")},
+            redirect_base_url="http://test",
+            mfa=MfaConfig(issuer="Acme", encryption_key=MFA_KEY, required=True),
+            warn_on_memory_backend=False,
+        )
+        quiet = len(caplog.records)
+        CRUDAuth(
+            session=mfa_session,
+            user_model=MfaUser,
+            SECRET_KEY=SECRET,
+            transports=[SessionTransport()],
+            oauth={"stub": OAuthCredentials(client_id="id", client_secret="s")},
+            redirect_base_url="http://test",
+            mfa=MfaConfig(issuer="Acme", encryption_key=MFA_KEY, required=True, oauth=True),
+            warn_on_memory_backend=False,
+        )
+
+    assert quiet == 1 and "sign in without a code" in caplog.records[0].getMessage()
+    assert len(caplog.records) == 1

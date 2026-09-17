@@ -176,8 +176,12 @@ class MfaService:
             if not any(hmac.compare_digest(value, target) for value in hashes):
                 return False
             remaining = json.dumps([value for value in hashes if value != target])
-            if await self.repo.replace_if_unchanged(
-                db, user, "mfa_recovery_codes", stored, remaining
+            if await self.repo.update_if_unchanged(
+                db,
+                user,
+                {"mfa_recovery_codes": remaining},
+                field="mfa_recovery_codes",
+                expected=stored,
             ):
                 await self.hooks.run_after_recovery_code_used(
                     self.repo.to_dict(user), db=db, context=context
@@ -256,13 +260,21 @@ class MfaService:
             raise BadRequestException("No authenticator setup is pending.")
         if not await self._accept_totp(db, user, secret, code):
             raise UnauthorizedException("Invalid code")
-        return await self._enable(db, user, secret, context or HookContext())
+        codes = await self._enable(db, user, secret, context or HookContext())
+        if codes is None:
+            raise BadRequestException("Two-factor authentication is already enabled.")
+        return codes
 
     async def _enable(
         self, db: AsyncSession, user: Any, secret: str, context: HookContext
-    ) -> list[str]:
+    ) -> list[str] | None:
+        """Confirm the pending authenticator and issue recovery codes.
+
+        Returns ``None`` when a concurrent request confirmed it first, so only one
+        set of recovery codes is ever handed out.
+        """
         codes = generate_recovery_codes(self.config.recovery_code_count)
-        await self.repo.update(
+        enabled = await self.repo.update_if_unchanged(
             db,
             user,
             {
@@ -270,7 +282,11 @@ class MfaService:
                 "totp_confirmed_at": _utcnow(),
                 "mfa_recovery_codes": hash_recovery_codes(codes),
             },
+            field="totp_confirmed_at",
+            expected=None,
         )
+        if not enabled:
+            return None
         await self.hooks.run_after_mfa_enabled(self.repo.to_dict(user), db=db, context=context)
         return codes
 

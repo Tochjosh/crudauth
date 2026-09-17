@@ -484,20 +484,26 @@ class UserRepository:
         await db.refresh(user)
         return bool(getattr(result, "rowcount", 0))
 
-    async def replace_if_unchanged(
-        self, db: AsyncSession, user: Any, logical: str, expected: Any, value: Any
+    async def update_if_unchanged(
+        self,
+        db: AsyncSession,
+        user: Any,
+        values: dict[str, Any],
+        *,
+        field: str,
+        expected: Any,
     ) -> bool:
-        """Set ``logical`` to ``value`` only if it still holds ``expected`` (compare-and-set).
+        """Apply ``values`` only if ``field`` still holds ``expected`` (compare-and-set).
 
         Returns:
-            ``True`` if the value was replaced.
+            ``True`` if the row was updated.
         """
-        column = self._attr(logical)
+        column = self._attr(field)
         matches = column.is_(None) if expected is None else column == expected
         result = await db.execute(
             update(self.model)
             .where(self._attr("id") == self.user_id(user), matches)
-            .values({column: value})
+            .values({self._attr(logical): value for logical, value in values.items()})
         )
         await db.commit()
         await db.refresh(user)
