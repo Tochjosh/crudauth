@@ -13,6 +13,7 @@ from fastapi import HTTPException, status
 __all__ = [
     "CustomException",
     "BadRequestException",
+    "OAuthAccountException",
     "NotFoundException",
     "ForbiddenException",
     "UnauthorizedException",
@@ -41,6 +42,19 @@ class CustomException(HTTPException):
 class BadRequestException(CustomException):
     def __init__(self, detail: str | None = None):
         super().__init__(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+
+class OAuthAccountException(BadRequestException):
+    """A ``400`` refusing an OAuth sign-in while resolving the account.
+
+    ``code`` is the machine-readable reason the OAuth callback reports as
+    ``error`` (``email_missing``, ``email_unverified``, ``email_too_long``,
+    ``provider_already_linked``); ``detail`` is the human-readable message.
+    """
+
+    def __init__(self, code: str, detail: str):
+        self.code = code
+        super().__init__(detail)
 
 
 class NotFoundException(CustomException):

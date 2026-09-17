@@ -635,7 +635,10 @@ class CRUDAuth:
         )
         self._oauth_state_storage = state_storage
         self._oauth_service = OAuthAccountService(
-            self.repo, self.new_user_fields, self._new_user_defaults
+            self.repo,
+            self.new_user_fields,
+            self._new_user_defaults,
+            session_manager=self.sessions,
         )
         self._oauth_router = build_oauth_router(
             runtime=self.runtime,
@@ -643,6 +646,7 @@ class CRUDAuth:
             state_storage=state_storage,
             account_service=self._oauth_service,
             session_manager=self.sessions,
+            authorize_rate_limit=self.rate_limit("oauth_authorize"),
             default_redirect=redirect_base_url,
             response_mode=oauth_response_mode,
             **paths,

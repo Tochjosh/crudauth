@@ -93,6 +93,7 @@ async def test_oauth_usernames_fit_column_and_suffixes(short_sessionmaker) -> No
         provider="google",
         provider_user_id="g-1",
         email="first@example.com",
+        email_verified=True,
         name="__Very Long Display Name__",
     )
     second = info.model_copy(update={"provider_user_id": "g-2", "email": "second@example.com"})
@@ -108,7 +109,11 @@ async def test_oauth_suffix_never_doubles_the_separator(short_sessionmaker) -> N
     service = OAuthAccountService(repo)
     taken = "aaaaaaaaa_bb"
     info = OAuthUserInfo(
-        provider="google", provider_user_id="g-1", email="new@example.com", username=taken
+        provider="google",
+        provider_user_id="g-1",
+        email="new@example.com",
+        email_verified=True,
+        username=taken,
     )
     async with short_sessionmaker() as db:
         await repo.create(
@@ -130,6 +135,7 @@ async def test_oauth_random_suffix_fits_short_column(short_sessionmaker, monkeyp
         provider="google",
         provider_user_id="g-1",
         email="first@example.com",
+        email_verified=True,
         name="Very Long Display Name",
     )
     async with short_sessionmaker() as db:

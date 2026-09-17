@@ -3,28 +3,40 @@
 from __future__ import annotations
 
 import pytest
-from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 
+from crudauth import OAuthAccountException
 from crudauth.oauth import OAuthAccountService, OAuthUserInfo
 from crudauth.oauth.providers.github import GitHubOAuthProvider, _select_github_email
 from crudauth.oauth.providers.google import GoogleOAuthProvider
 from crudauth.repository import UserRepository
 
 
-# --- a missing provider id must raise, not coerce to the string "None" ---
 async def test_google_missing_sub_raises() -> None:
     prov = GoogleOAuthProvider("id", "secret", "http://cb")
-    with pytest.raises(HTTPException) as exc:
-        await prov.process_user_info({"email": "a@x.com"})  # no "sub"
-    assert exc.value.status_code == 400
+    with pytest.raises(ValueError, match="sub"):
+        await prov.process_user_info({"email": "a@x.com"})
 
 
 async def test_github_missing_id_raises() -> None:
     prov = GitHubOAuthProvider("id", "secret", "http://cb")
-    with pytest.raises(HTTPException) as exc:
-        await prov.process_user_info({"login": "octocat"})  # no "id"
-    assert exc.value.status_code == 400
+    with pytest.raises(ValueError, match="user id"):
+        await prov.process_user_info({"login": "octocat"})
+
+
+@pytest.mark.parametrize("flag", ["true", "false", 1, None])
+async def test_google_only_a_json_true_verifies_the_email(flag) -> None:
+    prov = GoogleOAuthProvider("id", "secret", "http://cb")
+    info = await prov.process_user_info({"sub": "g-1", "email": "a@x.com", "email_verified": flag})
+    assert info.email_verified is False
+
+
+@pytest.mark.parametrize("flag", ["true", "false", 1])
+def test_github_only_a_json_true_verifies_the_email(flag) -> None:
+    assert _select_github_email([{"email": "a@x.com", "primary": True, "verified": flag}]) == (
+        "a@x.com",
+        False,
+    )
 
 
 async def test_google_uses_real_sub() -> None:
@@ -69,21 +81,19 @@ def test_github_email_empty() -> None:
     assert _select_github_email([]) == (None, False)
 
 
-# --- creating a NEW account on an unverified email is allowed (not refused),
-#         but the row is created unverified -----------------------------------
-async def test_oauth_creates_unverified_new_email(sessionmaker, UserModel) -> None:
+async def test_oauth_refuses_to_create_an_account_from_an_unverified_email(
+    sessionmaker, UserModel
+) -> None:
     repo = UserRepository(UserModel)
     service = OAuthAccountService(repo)
     info = OAuthUserInfo(
-        provider="google",
-        provider_user_id="g-new",
-        email="fresh@x.com",
-        email_verified=False,  # unverified, but no existing account to hijack
+        provider="google", provider_user_id="g-new", email="fresh@x.com", email_verified=False
     )
     async with sessionmaker() as db:
-        user, created = await service.get_or_create_user(info, db)
-        assert created is True
-        assert repo.email_verified(user) is False  # not treated as proven
+        with pytest.raises(OAuthAccountException) as exc:
+            await service.get_or_create_user(info, db)
+        assert await repo.get_by_email(db, "fresh@x.com") is None
+    assert (exc.value.status_code, exc.value.code) == (400, "email_unverified")
 
 
 # --- username generation is bounded and survives an insert race ----------

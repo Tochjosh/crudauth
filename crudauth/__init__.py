@@ -33,6 +33,7 @@ from .exceptions import (
     DuplicateValueException,
     ForbiddenException,
     NotFoundException,
+    OAuthAccountException,
     PasswordPolicyException,
     RateLimitException,
     SudoLockoutError,
@@ -107,6 +108,7 @@ __all__ = [
     # exceptions
     "BadRequestException",
     "NotFoundException",
+    "OAuthAccountException",
     "ForbiddenException",
     "UnauthorizedException",
     "UnprocessableEntityException",

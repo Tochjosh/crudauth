@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...exceptions import BadRequestException
 from ..constants import (
     GITHUB,
     GITHUB_AUTHORIZE_ENDPOINT,
@@ -28,16 +27,16 @@ def _select_github_email(emails: list[dict[str, Any]]) -> tuple[str | None, bool
     account email - ``email_verified`` only rides a genuinely verified entry.
     """
     for entry in emails:
-        if entry.get("primary") and entry.get("verified"):
+        if entry.get("primary") and entry.get("verified") is True:
             return entry.get("email"), True
     for entry in emails:
-        if entry.get("verified"):
+        if entry.get("verified") is True:
             return entry.get("email"), True
     for entry in emails:
         if entry.get("primary"):
             return entry.get("email"), False
     if emails:
-        return emails[0].get("email"), bool(emails[0].get("verified", False))
+        return emails[0].get("email"), emails[0].get("verified") is True
     return None, False
 
 
@@ -92,7 +91,7 @@ class GitHubOAuthProvider(AbstractOAuthProvider):
         """
         gh_id = user_info.get("id")
         if gh_id is None:
-            raise BadRequestException("GitHub did not return a user id.")
+            raise ValueError("GitHub did not return a user id.")
         email, email_verified = _select_github_email(user_info.get("emails", []) or [])
         return OAuthUserInfo(
             provider=GITHUB,

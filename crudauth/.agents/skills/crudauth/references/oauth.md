@@ -43,14 +43,22 @@ only** (open-redirect hardened).
    callback must match, so a captured/forged callback can't complete someone else's login.
 2. Then crudauth finds or creates the user, in order:
    - **provider id hit** → that user (returning login).
+   - **no email / unverified email** → refused (`email_missing` / `email_unverified`). Linking and
+     creating both require `info.email_verified`, the account-takeover defense.
    - **verified-email match** → links the provider to the existing account (`{provider}_id` set), so
-     the user can then sign in by password or provider. **Linking requires `info.email_verified`** — an
-     unverified provider email matching an existing account is refused ("sign in with your existing
-     method to link"), the account-takeover defense.
-   - **otherwise** → a new user, created with `email_verified` taken from the provider (a Google user
-     usually arrives verified), an unusable password, and a unique username derived from the profile,
-     cut to the `username` column's length (32 when unbounded), with `_1`, `_2`, ... then a random
-     suffix on collision.
+     the user can then sign in by password or provider. If that account's own email was never
+     verified, the link **claims** it: unusable password, `token_version` bumped, sessions signed out,
+     email marked verified. An account already linked to another id of that provider is refused
+     (`provider_already_linked`).
+   - **otherwise** → a new user, created verified, with an unusable password and a unique username
+     derived from the profile, cut to the `username` column's length (32 when unbounded), with `_1`,
+     `_2`, ... then a random suffix on collision.
+
+A disabled user gets no session (`account_inactive`). Failures redirect to `redirect_base_url` with
+`?error=<code>` (`oauth_failed`, `email_missing`, `email_unverified`, `email_too_long`,
+`provider_already_linked`, `account_inactive`), or return `400 {"detail": "<code>"}` in JSON mode.
+The service raises `OAuthAccountException` (`.code`). `authorize` is rate limited per IP
+(`oauth_authorize`, 30/hour).
 
 ## Provisioning OAuth users
 

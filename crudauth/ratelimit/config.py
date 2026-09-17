@@ -63,4 +63,5 @@ DEFAULT_RATE_LIMITS: dict[str, RateLimit] = {
     "change_password": RateLimit(times=5, seconds=SECONDS_PER_HOUR),
     "logout_all": RateLimit(times=10, seconds=SECONDS_PER_HOUR),
     "csrf_refresh": RateLimit(times=30, seconds=SECONDS_PER_HOUR),
+    "oauth_authorize": RateLimit(times=30, seconds=SECONDS_PER_HOUR),
 }
