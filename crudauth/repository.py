@@ -12,7 +12,7 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
-from sqlalchemy import UniqueConstraint, select
+from sqlalchemy import String, TypeDecorator, UniqueConstraint, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .constants import (
@@ -128,6 +128,34 @@ class UserRepository:
 
     def _attr(self, logical: str) -> Any:
         return getattr(self.model, self.col(logical))
+
+    def string_length(self, logical: str) -> int | None:
+        """Return the resolved SQLAlchemy ``String`` column length, if known."""
+        try:
+            column = self._attr(logical).property.columns[0]
+        except (AttributeError, IndexError):
+            return None
+        column_type = column.type
+        while isinstance(column_type, TypeDecorator):
+            column_type = column_type.impl_instance
+        if not isinstance(column_type, String):
+            return None
+        return column_type.length
+
+    def exceeds_length(self, logical: str, value: Any) -> int | None:
+        """Return the column length when ``value`` is a string longer than it, else ``None``.
+
+        An email is measured canonicalized, the form [create][crudauth.repository.UserRepository.create]
+        stores.
+        """
+        if not isinstance(value, str):
+            return None
+        if self.col(logical) == self.col("email"):
+            value = canonical_email(value)
+        limit = self.string_length(logical)
+        if limit is not None and len(value) > limit:
+            return limit
+        return None
 
     # --- reads ---------------------------------------------------------------
     def _coerce_id(self, user_id: Any) -> Any:

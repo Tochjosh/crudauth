@@ -12,23 +12,22 @@ This builds on any of the earlier recipes; the auth config itself doesn't change
 CRUDAuth keeps server-side state (sessions, CSRF tokens, lockout counters, single-use email and
 OAuth tokens) in a pluggable store. In memory, that state lives in the process, so under multiple
 workers or pods it isn't shared, which silently weakens lockout counters, sessions, and the
-atomicity of one-time tokens. Point both the session store and the rate limiter at Redis:
+atomicity of one-time tokens. Point CRUDAuth at Redis:
 
 ```python title="main.py"
-from crudauth import CRUDAuth, SessionTransport
-from crudauth.ratelimit import redis_rate_limiter
+from crudauth import CRUDAuth
 
 REDIS_URL = os.environ["REDIS_URL"]
 
 auth = CRUDAuth(
     session=get_session, user_model=User, SECRET_KEY=os.environ["SECRET_KEY"],
-    transports=[SessionTransport(backend="redis", redis_url=REDIS_URL)],
-    rate_limiter=redis_rate_limiter(REDIS_URL),
+    redis_url=REDIS_URL,
 )
 ```
 
-`SessionTransport(backend="redis")` moves sessions, CSRF, and the one-time-token and OAuth-state
-stores to Redis; `redis_rate_limiter(...)` moves the lockout and throttle counters. CRUDAuth logs a
+`redis_url` moves sessions, CSRF, the one-time-token and OAuth-state stores, and the lockout and
+throttle counters to Redis. To reuse a Redis client your app already builds, or to send one part
+somewhere else, see [Storage](../guides/infra/storage.md#sharing-a-client). CRUDAuth logs a
 startup warning whenever an in-memory backend is active, so a multi-worker deploy left on the
 default won't fail silently; if you've *deliberately* chosen in-memory on a single worker, pass
 `warn_on_memory_backend=False`.

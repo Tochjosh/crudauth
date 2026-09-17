@@ -12,19 +12,19 @@
 
 <p align="center">
 <a href="https://pypi.org/project/crudauth/">
-  <img src="https://img.shields.io/pypi/v/crudauth?color=%2334D058&label=pypi%20package" alt="PyPi Version"/>
+  <img src="https://img.shields.io/pypi/v/crudauth?color=%2334D058&label=pypi%20package&style=for-the-badge" alt="PyPi Version"/>
 </a>
 <a href="https://pypi.org/project/crudauth/">
-  <img src="https://img.shields.io/pypi/pyversions/crudauth.svg?color=%2334D058" alt="Supported Python Versions"/>
+  <img src="https://img.shields.io/pypi/pyversions/crudauth.svg?color=%2334D058&style=for-the-badge" alt="Supported Python Versions"/>
 </a>
 <a href="https://github.com/benavlabs/crudauth/blob/main/LICENSE">
-  <img src="https://img.shields.io/badge/license-MIT-34D058" alt="License"/>
+  <img src="https://img.shields.io/badge/license-MIT-34D058?style=for-the-badge" alt="License"/>
 </a>
 <a href="https://benavlabs.github.io/crudauth">
-  <img src="https://img.shields.io/badge/docs-benavlabs.github.io%2Fcrudauth-34D058?logo=materialformkdocs&logoColor=white" alt="Documentation"/>
+  <img src="https://img.shields.io/badge/docs-benavlabs.github.io%2Fcrudauth-34D058?logo=materialformkdocs&logoColor=white&style=for-the-badge" alt="Documentation"/>
 </a>
 <a href="https://deepwiki.com/benavlabs/crudauth">
-  <img src="https://img.shields.io/badge/DeepWiki-1F2937.svg?logo=book&logoColor=white&labelColor=1F2937&color=34D058" alt="DeepWiki"/>
+  <img src="https://img.shields.io/badge/DeepWiki-1F2937.svg?logo=book&logoColor=white&labelColor=1F2937&color=34D058&style=for-the-badge" alt="DeepWiki"/>
 </a>
 </p>
 
@@ -56,6 +56,7 @@
 
 - **Python** 3.10+
 - **FastAPI**, **SQLAlchemy 2.0+**, **Pydantic v2** (installed as dependencies)
+- **Redis 7.0+** (or a compatible server such as Valkey) if you use the Redis backends
 
 ## Install
 
@@ -150,9 +151,10 @@ from crudauth import CRUDAuth, SessionTransport, BearerTransport
 
 auth = CRUDAuth(
     session=get_session, user_model=User, SECRET_KEY=...,
+    redis_url=...,
     transports=[
-        SessionTransport(backend="redis", redis_url=..., csrf=True),  # browsers
-        BearerTransport(access_ttl=900, refresh="cookie"),            # apps/scripts
+        SessionTransport(csrf=True),                        # browsers
+        BearerTransport(access_ttl=900, refresh="cookie"),  # apps/scripts
     ],
 )
 ```

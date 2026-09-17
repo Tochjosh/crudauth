@@ -17,10 +17,11 @@ from ..constants import (
     DEFAULT_VERIFY_TTL_HOURS,
     SECONDS_PER_HOUR,
 )
-from ..exceptions import BadRequestException, DuplicateValueException
+from ..exceptions import BadRequestException, DuplicateValueException, ValueTooLongException
 from ..hooks import AuthHooks, HookContext
 from ..ratelimit import RateLimit
 from ..repository import UserRepository
+from ..password import PasswordContext, PasswordPolicy
 from ..storage.base import AbstractSessionStorage
 from ..transports.bearer.tokens import (
     create_signed_token,
@@ -91,8 +92,10 @@ class EmailFlowService:
         verify_ttl_hours: int | None = None,
         reset_ttl_hours: int | None = None,
         change_ttl_hours: int | None = None,
+        password_policy: PasswordPolicy | None = None,
     ):
         self.repo = repo
+        self.password_policy = password_policy or PasswordPolicy()
         self.secret_key = secret_key
         self.hooks = hooks
         self.algorithm = algorithm
@@ -317,6 +320,8 @@ class EmailFlowService:
 
         Raises:
             BadRequestException: If the token is invalid, expired, or already used.
+            PasswordPolicyException: If ``new_password`` fails the password policy. The
+                token isn't used up, so the user can retry with a stronger password.
 
         Note:
             A reset is attacker-eviction: it often follows a compromise, so any
@@ -330,11 +335,14 @@ class EmailFlowService:
         sub = verify_signed_token(token, self.secret_key, RESET, algorithm=self.algorithm)
         if sub is None:
             raise BadRequestException("Invalid or expired token")
-        if not await self._consume(token, self.reset_ttl_hours * SECONDS_PER_HOUR):
-            raise BadRequestException("Token already used")
         user = await self.repo.get_by_id(db, sub)
         if user is None:
             raise BadRequestException("Invalid or expired token")
+        await self.password_policy.enforce(
+            new_password, PasswordContext.for_user(self.repo, "reset", user), field="new_password"
+        )
+        if not await self._consume(token, self.reset_ttl_hours * SECONDS_PER_HOUR):
+            raise BadRequestException("Token already used")
         await self.repo.update(db, user, {"hashed_password": get_password_hash(new_password)})
         await self.repo.increment_token_version(db, user)
         if self.session_manager is not None:
@@ -366,6 +374,9 @@ class EmailFlowService:
         if not verify_password(password, self.repo.get(user, "hashed_password", "")):
             raise BadRequestException("Incorrect password")
         new_email_c = canonical_email(new_email)
+        limit = self.repo.exceeds_length("email", new_email_c)
+        if limit is not None:
+            raise ValueTooLongException({"new_email": limit})
         if new_email_c == canonical_email(self.repo.get(user, "email")):
             raise BadRequestException("New email matches current email")
         if not await self._email_within_limit(CHANGE_ACTION, new_email_c):

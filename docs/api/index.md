@@ -29,6 +29,7 @@ otherwise, each is importable straight from the top-level `crudauth` package.
 | [OAuth](oauth.md) | Credentials, the provider port and factory, and account linking. |
 | [Email](email.md) | `EmailConfig`, the `EmailSender` port, and `EmailFlowService`. |
 | [Hooks](hooks.md) | `AuthHooks` lifecycle callbacks and `HookContext`. |
+| [Passwords](passwords.md) | `PasswordPolicy` and the `PasswordContext` its validators can read. |
 | [Sudo](sudo.md) | `SudoConfig` and `SudoManager` for re-authentication. |
 
 ## Data layer

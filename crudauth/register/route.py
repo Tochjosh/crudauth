@@ -10,12 +10,12 @@ from collections.abc import Awaitable
 from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, Request, Response, status
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, create_model
 from sqlalchemy.exc import IntegrityError
 
-from ..constants import MIN_PASSWORD_LENGTH
-from ..exceptions import DuplicateValueException
+from ..exceptions import DuplicateValueException, ValueTooLongException
 from ..hooks import HookContext
+from ..password import PasswordContext
 from ..provisioning import NewUserContext, resolve_new_user_fields
 from ..ratelimit import KeyBy
 from ..utils import get_client_ip, get_password_hash
@@ -33,14 +33,14 @@ class RegisterIn(BaseModel):
     ``register_extra_fields=``; otherwise registration drops it.
 
     Note:
-        ``password`` enforces ``MIN_PASSWORD_LENGTH`` (matching the reset flow). A
-        custom ``register_schema`` governs its own policy - apply your own
-        ``Field`` constraints / validators there.
+        ``password`` must meet the configured
+        [PasswordPolicy][crudauth.password.PasswordPolicy], which runs on a custom
+        ``register_schema`` too.
     """
 
     email: EmailStr
     username: str
-    password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
+    password: str
 
 
 def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter:
@@ -54,7 +54,9 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
         An `APIRouter` with the ``POST /register`` route.
     """
     router = APIRouter(tags=["auth"])
-    RegisterModel = schema or RegisterIn
+    RegisterModel = schema or create_model(
+        "RegisterIn", __base__=RegisterIn, password=(auth.password_policy.body_field(), ...)
+    )
 
     @router.post("/register", dependencies=[Depends(auth.rate_limit("register", key=KeyBy.IP))])
     async def register(
@@ -90,9 +92,22 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
         login_fields = auth.identity.login
         data = cast(BaseModel, body).model_dump()
         password = data.pop("password")
+        await auth.password_policy.enforce(
+            password,
+            PasswordContext(
+                source="register", username=data.get("username"), email=data.get("email")
+            ),
+        )
         submitted = dict(data)
         data = auth.repo.filter_registration_data(data)
         login_values = {f: data.pop(f) for f in login_fields}
+        too_long = {
+            field: limit
+            for field, value in {**login_values, **data}.items()
+            if (limit := auth.repo.exceeds_length(field, value)) is not None
+        }
+        if too_long:
+            raise ValueTooLongException(too_long)
 
         async def _send_best_effort(coro: Awaitable[Any]) -> None:
             """Dispatch a registration email without letting a send failure fail

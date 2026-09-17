@@ -17,6 +17,10 @@ The HTTP exceptions CRUDAuth raises. All subclass `CustomException`, which is a 
 
 ::: crudauth.exceptions.DuplicateValueException
 
+::: crudauth.exceptions.ValueTooLongException
+
+::: crudauth.exceptions.PasswordPolicyException
+
 ::: crudauth.exceptions.RateLimitException
 
 ::: crudauth.exceptions.SudoLockoutError

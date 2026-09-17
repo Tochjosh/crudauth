@@ -147,6 +147,7 @@ edit_uri = "edit/main/docs/"
     { "Delivery channels" = "api/delivery.md" },
     { "Hooks" = "api/hooks.md" },
     { "Provisioning" = "api/provisioning.md" },
+    { "Passwords" = "api/passwords.md" },
     { "Sudo" = "api/sudo.md" },
     { "UserRepository" = "api/repository.md" },
     { "Models" = "api/models.md" },

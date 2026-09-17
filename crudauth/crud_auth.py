@@ -13,10 +13,10 @@ async def me(user: Principal = Depends(auth.current_user())):
 import inspect
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING, Annotated, Any, Callable, Sequence
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal, Sequence, cast
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model
 
 from .register import build_register_route
 from .constants import (
@@ -25,11 +25,10 @@ from .constants import (
     DEFAULT_LOGIN_LOCKOUT_BASE_SECONDS,
     DEFAULT_LOGIN_LOCKOUT_MAX_SECONDS,
     DEFAULT_LOGIN_MAX_ATTEMPTS,
-    MIN_PASSWORD_LENGTH,
     OAUTH_STATE_TTL_SECONDS,
     USED_TOKEN_TTL_SECONDS,
 )
-from .core import AuthContext, AuthRuntime, CookieConfig, Transport
+from .core import AuthRuntime, CookieConfig, Transport
 from .email.channel import DeliveryChannel
 from .email.router import build_email_router
 from .email.service import EmailFlowService
@@ -45,6 +44,7 @@ from .identity import IdentityConfig
 from .oauth import OAuthAccountService, OAuthProviderFactory
 from .oauth.router import build_oauth_router
 from .principal import Principal
+from .password import PasswordContext, PasswordPolicy, PasswordSource
 from .provisioning import NewUserFields
 from .ratelimit import (
     DEFAULT_RATE_LIMITS,
@@ -52,16 +52,26 @@ from .ratelimit import (
     LockoutPolicy,
     MemoryRateLimiterBackend,
     RateLimit,
+    RateLimitResolver,
+    redis_rate_limiter,
 )
 from .ratelimit.constants import RATE_LIMIT_NAMESPACE
 from .repository import REGISTRATION_ALLOWED_FIELDS, UserRepository
-from .storage import get_session_storage
+from .resolution import PrincipalResolver
+from .storage import MemorySessionStorage, get_session_storage
+from .storage.backends.redis import redis_client_from_url
 from .sudo import SudoConfig, SudoManager
-from .storage.constants import BACKEND_MEMORY
+from .storage.constants import BACKEND_MEMORY, BACKEND_REDIS
 from .transports.bearer.transport import BearerTransport
 from .transports.session.constants import REMEMBER_ME_META_KEY
 from .transports.session.transport import SessionTransport
-from .utils import get_client_ip, get_password_hash, is_unusable_password, verify_password
+from .utils import (
+    get_client_ip,
+    get_password_hash,
+    is_unusable_password,
+    takes_two_arguments,
+    verify_password,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .ratelimit import RateLimiterBackend
@@ -73,12 +83,12 @@ __all__ = ["CRUDAuth"]
 
 
 class _SetPasswordIn(BaseModel):
-    new_password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
+    new_password: str
 
 
 class _ChangePasswordIn(BaseModel):
     current_password: str
-    new_password: Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH)]
+    new_password: str
 
 
 class SessionInfo(BaseModel):
@@ -136,6 +146,8 @@ class CRUDAuth:
         column_map: dict[str, str] | None = None,
         identity: IdentityConfig | None = None,
         oauth: dict[str, Any] | None = None,
+        oauth_paths: dict[str, str] | None = None,
+        oauth_response_mode: Literal["redirect", "json"] = "redirect",
         email: Any = None,
         channels: list[DeliveryChannel] | None = None,
         hooks: AuthHooks | None = None,
@@ -147,10 +159,13 @@ class CRUDAuth:
         new_user_fields: NewUserFields | None = None,
         new_user_defaults: dict[str, Any] | None = None,
         rate_limiter: "RateLimiterBackend | None" = None,
+        redis_url: str | None = None,
+        redis_client: Any = None,
         rate_limits: dict[str, RateLimit] | None = None,
         trusted_proxy_hops: int = 0,
         sudo: SudoConfig | None = None,
         warn_on_memory_backend: bool = True,
+        password_policy: PasswordPolicy | None = None,
     ):
         """Configure the auth surface.
 
@@ -167,6 +182,17 @@ class CRUDAuth:
                 column names when they differ (e.g. ``{"hashed_password": "pw_hash"}``).
             oauth: ``{provider_name: OAuthCredentials}`` to enable OAuth login;
                 requires ``redirect_base_url`` and a session transport.
+            oauth_paths: Optional OAuth router paths: ``prefix``,
+                ``authorize_path``, and ``callback_path``. Defaults to
+                ``{"prefix": "/oauth", "authorize_path": "/{provider}/authorize",
+                "callback_path": "/{provider}/callback"}``. Both paths must contain
+                ``{provider}``. The provider redirect URI is ``redirect_base_url``
+                plus ``prefix`` plus the callback path, so ``redirect_base_url``
+                must include any prefix the app adds when mounting the router.
+            oauth_response_mode: ``"redirect"`` (default) or ``"json"``. In JSON
+                mode ``authorize`` returns ``{"url": ...}`` and ``callback``
+                returns ``{"user": ..., "csrf_token": ..., "redirect_to": ...}``
+                with the session cookies set, or a ``400`` on failure.
             email: An [EmailConfig][crudauth.email.config.EmailConfig] to enable
                 verify/reset/change flows over email (the built-in delivery
                 channel); ``None`` disables email delivery. Either ``email`` or
@@ -210,6 +236,16 @@ class CRUDAuth:
             rate_limiter: Backend for lockout/throttles; defaults to an in-process
                 [MemoryRateLimiterBackend][crudauth.ratelimit.backends.memory.MemoryRateLimiterBackend]. Use
                 ``redis_rate_limiter(...)`` in production.
+            redis_url: Redis URL for every server-side store: sessions and CSRF
+                tokens, the one-time-token and OAuth-state stores, and the default
+                rate limiter. A part configured directly (a ``SessionTransport``
+                with its own ``backend``/``redis_url``/``redis_client``, or
+                ``rate_limiter=``) keeps its own setting. Mutually exclusive with
+                ``redis_client``.
+            redis_client: An existing async Redis client to use the same way as
+                ``redis_url``, with either ``decode_responses`` setting. The caller
+                owns it, so ``shutdown()`` doesn't close it. Mutually exclusive with
+                ``redis_url``.
             rate_limits: Per-action overrides merged over
                 :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS`.
             trusted_proxy_hops: Number of trusted reverse proxies in front of the
@@ -227,6 +263,9 @@ class CRUDAuth:
                 per-process, so under multiple workers it silently breaks; set
                 ``False`` to silence once you've accepted that (e.g. single-worker
                 dev).
+            password_policy: The [PasswordPolicy][crudauth.password.PasswordPolicy] every
+                new password must meet on registration, set, change and reset. The
+                default requires at least 8 characters.
 
         Raises:
             ValueError: If ``SECRET_KEY`` is empty; if ``oauth`` or ``sudo`` is
@@ -236,7 +275,10 @@ class CRUDAuth:
         """
         if not SECRET_KEY:
             raise ValueError("SECRET_KEY is required")
+        if redis_client is not None and redis_url is not None:
+            raise ValueError("redis_url and redis_client are mutually exclusive")
         self.session = session
+        self.password_policy = password_policy or PasswordPolicy()
         self.identity = identity or IdentityConfig()
         self.repo = UserRepository(
             user_model,
@@ -254,6 +296,8 @@ class CRUDAuth:
         self._warn_on_register_extra_fields(register_extra_fields)
         self._warn_on_privileged_register_fields(register_schema)
         self._rate_limits: dict[str, RateLimit] = {**DEFAULT_RATE_LIMITS, **(rate_limits or {})}
+        self._owned_redis = redis_client_from_url(redis_url) if redis_url is not None else None
+        shared_redis = redis_client if redis_client is not None else self._owned_redis
 
         self.runtime = AuthRuntime(
             secret_key=SECRET_KEY,
@@ -263,9 +307,16 @@ class CRUDAuth:
             db_dependency=session,
             algorithm=algorithm,
             cookie_config=cookies or CookieConfig(),
-            rate_limiter=rate_limiter or MemoryRateLimiterBackend(),
+            rate_limiter=rate_limiter
+            or (
+                redis_rate_limiter(client=shared_redis)
+                if shared_redis is not None
+                else MemoryRateLimiterBackend()
+            ),
             trusted_proxy_hops=trusted_proxy_hops,
+            redis_client=shared_redis,
         )
+        self._principals = PrincipalResolver(self.runtime)
         self._session_transport = next(
             (t for t in self.transports if isinstance(t, SessionTransport)), None
         )
@@ -289,7 +340,7 @@ class CRUDAuth:
         self._oauth_service: OAuthAccountService | None = None
         self._oauth_state_storage: AbstractSessionStorage[Any] | None = None
         if oauth:
-            self._build_oauth(oauth, redirect_base_url)
+            self._build_oauth(oauth, redirect_base_url, oauth_paths, oauth_response_mode)
 
         if warn_on_memory_backend:
             self._warn_on_memory_backend()
@@ -403,9 +454,11 @@ class CRUDAuth:
             )
 
     # --- backend detection ---------------------------------------------------
-    def _backend_config(self) -> tuple[str, str | None]:
-        if self._session_transport is not None:
-            return self._session_transport.backend, self._session_transport.redis_url
+    def _backend_config(self) -> tuple[str, Any]:
+        if self.runtime.redis_client is not None:
+            return BACKEND_REDIS, self.runtime.redis_client
+        if self._session_transport is not None and self._session_transport.backend is not None:
+            return self._session_transport.backend, self._session_transport.redis_client
         return BACKEND_MEMORY, None
 
     def _warn_on_memory_backend(self) -> None:
@@ -418,20 +471,45 @@ class CRUDAuth:
         memory: list[str] = []
         if isinstance(self.runtime.rate_limiter, MemoryRateLimiterBackend):
             memory.append("rate limiter (lockout/throttle counters)")
-        if self._backend_config()[0] == BACKEND_MEMORY:
-            memory.append("sessions/CSRF and one-time-token/OAuth-state stores")
+        if any(
+            isinstance(t, SessionTransport) and t.backend == BACKEND_MEMORY for t in self.transports
+        ):
+            memory.append("sessions/CSRF")
+        stores = (self._email_token_store, self._oauth_state_storage)
+        if any(isinstance(store, MemorySessionStorage) for store in stores):
+            memory.append("one-time-token/OAuth-state stores")
         if not memory:
             return
         logger.warning(
             "crudauth: using in-memory backend(s) - %s. In-memory state is per-process, so "
-            "under multiple workers it is NOT shared: lockout counters, sessions/CSRF, and "
-            "single-use token/OAuth-state atomicity weaken silently. Use redis in production "
-            "(redis_rate_limiter(...) and SessionTransport(backend='redis')), or pass "
+            "under multiple workers it is NOT shared and those guarantees weaken silently. "
+            "Pass redis_url= or redis_client= to CRUDAuth in production, or "
             "warn_on_memory_backend=False to silence.",
-            " and ".join(memory),
+            ", ".join(memory),
         )
 
     # --- public: session manager --------------------------------------------
+    async def validate_password(
+        self,
+        password: str,
+        *,
+        user: Any = None,
+        source: PasswordSource = "set",
+        field: str = "password",
+    ) -> None:
+        """Check ``password`` against ``password_policy`` before your own code hashes it.
+
+        Raises [PasswordPolicyException][crudauth.exceptions.PasswordPolicyException]
+        (422) at ``field`` when it fails. Pass the ``user`` it's for so validators
+        taking a [PasswordContext][crudauth.password.PasswordContext] see its username
+        and email.
+        """
+        if user is None:
+            context = PasswordContext(source=source)
+        else:
+            context = PasswordContext.for_user(self.repo, source, user)
+        await self.password_policy.enforce(password, context, field=field)
+
     @property
     def sessions(self):
         """The [SessionManager][crudauth.transports.session.manager.SessionManager] of the configured session transport."""
@@ -472,13 +550,20 @@ class CRUDAuth:
         """
         return self._oauth_service
 
+    @property
+    def oauth_router(self) -> APIRouter:
+        """The configured OAuth routes, for apps keeping their own auth routes."""
+        if self._oauth_router is None:
+            raise RuntimeError("OAuth is not configured")
+        return self._oauth_router
+
     # --- email wiring --------------------------------------------------------
     def _build_email(
         self, email: Any, channels: list[DeliveryChannel] | None, algorithm: str
     ) -> None:
-        backend, redis_url = self._backend_config()
+        backend, redis_client = self._backend_config()
         token_store = get_session_storage(
-            backend, prefix="used_token:", expiration=USED_TOKEN_TTL_SECONDS, redis_url=redis_url
+            backend, prefix="used_token:", expiration=USED_TOKEN_TTL_SECONDS, client=redis_client
         )
         self._email_token_store = token_store
         self._email_service = EmailFlowService(
@@ -492,11 +577,18 @@ class CRUDAuth:
             session_manager=self.sessions if self._session_transport else None,
             rate_limiter=self.runtime.rate_limiter,
             rate_limits=self._rate_limits,
+            password_policy=self.password_policy,
         )
         self.runtime.email_service = self._email_service
 
     # --- oauth wiring --------------------------------------------------------
-    def _build_oauth(self, oauth: dict[str, Any], redirect_base_url: str | None) -> None:
+    def _build_oauth(
+        self,
+        oauth: dict[str, Any],
+        redirect_base_url: str | None,
+        oauth_paths: dict[str, str] | None = None,
+        oauth_response_mode: Literal["redirect", "json"] = "redirect",
+    ) -> None:
         if self._session_transport is None:
             raise ValueError(
                 "OAuth establishes a session on callback; add a SessionTransport to transports=[...]."
@@ -504,6 +596,17 @@ class CRUDAuth:
         if not redirect_base_url:
             raise ValueError("redirect_base_url is required when oauth=... is configured")
 
+        default_paths = {
+            "prefix": "/oauth",
+            "authorize_path": "/{provider}/authorize",
+            "callback_path": "/{provider}/callback",
+        }
+        unknown_paths = sorted(set(oauth_paths or {}) - set(default_paths))
+        if unknown_paths:
+            raise ValueError(
+                f"Unknown oauth_paths key(s) {unknown_paths}; expected {sorted(default_paths)}."
+            )
+        paths = {**default_paths, **(oauth_paths or {})}
         providers = {}
         for name, creds in oauth.items():
             if not self.repo.has(f"{name}_id"):
@@ -513,7 +616,11 @@ class CRUDAuth:
                     f"'{name}_id: Mapped[str | None] = mapped_column(unique=True, index=True, "
                     f"default=None)') or map it via column_map=."
                 )
-            redirect_uri = f"{redirect_base_url.rstrip('/')}/oauth/{name}/callback"
+            callback_route = paths["callback_path"].replace("{provider}", name)
+            route = "/".join(
+                part.strip("/") for part in (paths["prefix"], callback_route) if part.strip("/")
+            )
+            redirect_uri = f"{redirect_base_url.rstrip('/')}/{route}"
             providers[name] = OAuthProviderFactory.create_provider(
                 name,
                 client_id=creds.client_id,
@@ -522,9 +629,9 @@ class CRUDAuth:
                 scopes=creds.scopes,
             )
 
-        backend, redis_url = self._backend_config()
+        backend, redis_client = self._backend_config()
         state_storage = get_session_storage(
-            backend, prefix="oauth_state:", expiration=OAUTH_STATE_TTL_SECONDS, redis_url=redis_url
+            backend, prefix="oauth_state:", expiration=OAUTH_STATE_TTL_SECONDS, client=redis_client
         )
         self._oauth_state_storage = state_storage
         self._oauth_service = OAuthAccountService(
@@ -537,6 +644,8 @@ class CRUDAuth:
             account_service=self._oauth_service,
             session_manager=self.sessions,
             default_redirect=redirect_base_url,
+            response_mode=oauth_response_mode,
+            **paths,
         )
 
     # --- sudo wiring ---------------------------------------------------------
@@ -555,33 +664,23 @@ class CRUDAuth:
         )
 
     # --- the current_user() factory -----------------------------------------
-    async def _resolve_principal(
-        self, request: Request, db: Any, selected: list[Transport]
+    async def resolve_principal(
+        self, request: Request, update_activity: bool = False
     ) -> Principal | None:
-        """Run the transport loop once per request, per transport selection.
+        """Resolve the request principal outside FastAPI dependency injection.
 
-        Cached on ``request.state`` so multiple gates over the same selection in
-        one request (e.g. ``current_user()`` plus a ``KeyBy.USER`` rate limit,
-        which calls ``current_user()`` internally) share a single authentication
-        - one transport loop, one user load, one CSRF check - instead of running
-        it once per dependency. Gates (superuser/scopes/check) are still applied
-        per call by the caller, on the shared principal.
+        This is intended for middleware and other request-level code. It tries
+        transports in configured order, returns ``None`` for anonymous or
+        invalid credentials, does not enforce CSRF, and does not slide sessions
+        unless ``update_activity=True``. A later ``current_user()`` in the same
+        request reuses the result, reloading the user through its own session.
+
+        It opens its own DB session by calling the ``session`` dependency
+        directly, so FastAPI's ``dependency_overrides`` don't apply to it.
         """
-        cache = getattr(request.state, "_crudauth_principals", None)
-        if cache is None:
-            cache = {}
-            request.state._crudauth_principals = cache
-        key = tuple(t.name for t in selected)
-        if key in cache:
-            return cache[key]
-        ctx = AuthContext(request=request, db=db, runtime=self.runtime)
-        principal: Principal | None = None
-        for t in selected:
-            principal = await t.authenticate(request, ctx)
-            if principal is not None:
-                break
-        cache[key] = principal
-        return principal
+        return await self._principals.resolve_outside_dependencies(
+            request, self.transports, update_activity=update_activity
+        )
 
     async def authenticate_password(
         self, db: Any, identifier: str, password: str, *, request: Request
@@ -685,7 +784,7 @@ class CRUDAuth:
         async def dependency(
             request: Request, db: Annotated[Any, Depends(self.session)]
         ) -> Principal | None:
-            principal = await self._resolve_principal(request, db, selected)
+            principal = await self._principals.resolve(request, db, selected)
 
             if principal is None:
                 if optional:
@@ -757,15 +856,20 @@ class CRUDAuth:
     def rate_limit(
         self,
         action: str,
-        limit: RateLimit | None = None,
+        limit: RateLimit | RateLimitResolver | None = None,
         *,
-        key: "KeyBy | Callable[[Request], str]" = KeyBy.IP,
+        key: "KeyBy | Callable[..., str]" = KeyBy.IP,
+        transport: str | list[str] | None = None,
     ) -> Callable[..., Any]:
         """Build a FastAPI dependency that throttles an endpoint.
 
-        Resolves the limit (explicit ``limit`` → ``rate_limits=`` override →
-        :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS`), keys by IP, user, or a
-        custom function, writes ``X-RateLimit-*`` headers, and raises
+        ``limit`` is a ``RateLimit`` or a sync/async function of ``(request, principal)``
+        returning one (``None`` for no limit). Without it, the ``rate_limits=`` override
+        or :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS` entry for ``action`` applies.
+        ``key`` picks who shares a budget: a ``KeyBy`` member, ``key(request)``, or
+        ``key(request, principal)``. ``transport`` narrows which credentials identify the
+        caller, as on [current_user][crudauth.crud_auth.CRUDAuth.current_user]. Writes
+        ``X-RateLimit-*`` headers and raises
         [RateLimitException][crudauth.exceptions.RateLimitException] (429) when the caller exceeds the window.
 
         Example:
@@ -779,34 +883,75 @@ class CRUDAuth:
             raise ValueError(
                 f"No rate limit configured for action {action!r}; pass limit=RateLimit(...)."
             )
+        selected = self._select_transports(transport)
 
         if key is KeyBy.USER:
-            user_dep = self.current_user()
+            user_dep = self.current_user(transport=transport)
 
             async def by_user(
-                response: Response, principal: Annotated[Principal, Depends(user_dep)]
+                request: Request,
+                response: Response,
+                principal: Annotated[Principal, Depends(user_dep)],
             ) -> None:
-                await self._apply_rate_limit(response, action, str(principal.user_id), resolved)
+                ident = str(principal.user_id)
+                await self._apply_rate_limit(request, response, action, ident, resolved, principal)
 
             return by_user
 
+        trusted_hops = self.runtime.trusted_proxy_hops
+        needs_principal = callable(resolved)
+
         if key is KeyBy.IP:
 
-            async def by_ip(request: Request, response: Response) -> None:
-                ip = get_client_ip(request, self.runtime.trusted_proxy_hops)
-                await self._apply_rate_limit(response, action, ip, resolved)
+            def ident_for(request: Request, principal: Principal | None) -> str:
+                return get_client_ip(request, trusted_hops)
 
-            return by_ip
+        elif key is KeyBy.USER_OR_IP:
+            needs_principal = True
 
-        keyfn = key
+            def ident_for(request: Request, principal: Principal | None) -> str:
+                if principal is not None:
+                    return f"user:{principal.user_id}"
+                return f"ip:{get_client_ip(request, trusted_hops)}"
 
-        async def by_custom(request: Request, response: Response) -> None:
-            await self._apply_rate_limit(response, action, keyfn(request), resolved)
+        elif callable(key):
+            key_callback = key
+            takes_principal = takes_two_arguments(key_callback)
+            needs_principal = needs_principal or takes_principal
 
-        return by_custom
+            def ident_for(request: Request, principal: Principal | None) -> str:
+                if takes_principal:
+                    return key_callback(request, principal)
+                return key_callback(request)
+
+        else:
+            raise ValueError(f"Unsupported rate limit key: {key!r}")
+
+        if not needs_principal:
+
+            async def without_principal(request: Request, response: Response) -> None:
+                ident = ident_for(request, None)
+                await self._apply_rate_limit(request, response, action, ident, resolved, None)
+
+            return without_principal
+
+        async def with_principal(
+            request: Request, response: Response, db: Annotated[Any, Depends(self.session)]
+        ) -> None:
+            principal = await self._principals.resolve(request, db, selected, enforce_csrf=False)
+            ident = ident_for(request, principal)
+            await self._apply_rate_limit(request, response, action, ident, resolved, principal)
+
+        return with_principal
 
     async def _apply_rate_limit(
-        self, response: Response, action: str, ident: str, limit: RateLimit
+        self,
+        request: Request,
+        response: Response,
+        action: str,
+        ident: str,
+        limit: RateLimit | RateLimitResolver,
+        principal: Principal | None,
     ) -> None:
         """Run the window check, set ``X-RateLimit-*`` headers, raise 429 if over.
 
@@ -815,28 +960,53 @@ class CRUDAuth:
             dependency raises, so the limit headers are also attached to the
             ``RateLimitException`` on the over-limit path.
         """
+        effective: RateLimit | None
+        if callable(limit):
+            result = limit(request, principal)
+            if inspect.isawaitable(result):
+                result = await result
+            effective = result
+        else:
+            effective = limit
+        if effective is None:
+            return
         backend = self.runtime.rate_limiter
-        if backend is None or limit.disabled:
+        if backend is None or effective.disabled:
             return
         count, limited, retry_after = await backend.increment_and_check(
-            f"{RATE_LIMIT_NAMESPACE}:{action}:{ident}", limit.times, limit.seconds, fail_open=True
+            f"{RATE_LIMIT_NAMESPACE}:{action}:{ident}",
+            effective.times,
+            effective.seconds,
+            fail_open=True,
         )
-        response.headers["X-RateLimit-Limit"] = str(limit.times)
-        response.headers["X-RateLimit-Remaining"] = str(max(0, limit.times - count))
+        response.headers["X-RateLimit-Limit"] = str(effective.times)
+        response.headers["X-RateLimit-Remaining"] = str(max(0, effective.times - count))
         if limited:
             raise RateLimitException(
                 "Too many requests. Try again later.",
                 retry_after=retry_after,
                 headers={
-                    "X-RateLimit-Limit": str(limit.times),
+                    "X-RateLimit-Limit": str(effective.times),
                     "X-RateLimit-Remaining": "0",
                 },
             )
+
+    @property
+    def rate_limiter(self) -> "RateLimiterBackend | None":
+        """The configured rate-limit backend."""
+        return self.runtime.rate_limiter
 
     # --- shared routes -------------------------------------------------------
     def _shared_router(self) -> APIRouter:
         router = APIRouter(tags=["auth"])
         router.include_router(build_register_route(self, self._register_schema))
+        password_field = (self.password_policy.body_field(), ...)
+        SetPasswordModel = create_model(
+            "_SetPasswordIn", __base__=_SetPasswordIn, new_password=password_field
+        )
+        ChangePasswordModel = create_model(
+            "_ChangePasswordIn", __base__=_ChangePasswordIn, new_password=password_field
+        )
 
         @router.get("/me")
         async def me(user: Annotated[Principal, Depends(self.current_user())]):
@@ -852,7 +1022,7 @@ class CRUDAuth:
 
         @router.post("/set-password")
         async def set_password(
-            body: _SetPasswordIn,
+            body: SetPasswordModel,  # type: ignore[valid-type]
             principal: Annotated[Principal, Depends(self.current_user())],
             db: Annotated[Any, Depends(self.session)],
         ):
@@ -875,13 +1045,15 @@ class CRUDAuth:
                 requires first-password establishment to be browser-only.
             """
             user = principal.user
+            new_password = cast(_SetPasswordIn, body).new_password
             if not is_unusable_password(self.repo.get(user, "hashed_password", "")):
                 raise BadRequestException(
                     "Account already has a password; use the password reset flow to change it."
                 )
-            await self.repo.update(
-                db, user, {"hashed_password": get_password_hash(body.new_password)}
+            await self.validate_password(
+                new_password, user=user, source="set", field="new_password"
             )
+            await self.repo.update(db, user, {"hashed_password": get_password_hash(new_password)})
             return {"detail": "Password set."}
 
         @router.post(
@@ -889,7 +1061,7 @@ class CRUDAuth:
             dependencies=[Depends(self.rate_limit("change_password", key=KeyBy.USER))],
         )
         async def change_password(
-            body: _ChangePasswordIn,
+            body: ChangePasswordModel,  # type: ignore[valid-type]
             request: Request,
             principal: Annotated[Principal, Depends(self.current_user())],
             db: Annotated[Any, Depends(self.session)],
@@ -915,10 +1087,14 @@ class CRUDAuth:
                 raise BadRequestException(
                     "Account has no password; use /set-password to create one."
                 )
-            if not verify_password(body.current_password, current_hash):
+            change = cast(_ChangePasswordIn, body)
+            if not verify_password(change.current_password, current_hash):
                 raise UnauthorizedException("Current password is incorrect.")
+            await self.validate_password(
+                change.new_password, user=user, source="change", field="new_password"
+            )
             await self.repo.update(
-                db, user, {"hashed_password": get_password_hash(body.new_password)}
+                db, user, {"hashed_password": get_password_hash(change.new_password)}
             )
             await self.repo.increment_token_version(db, user)
             if self.sessions is not None:
@@ -1102,3 +1278,5 @@ class CRUDAuth:
             await self._email_token_store.close()
         if self.runtime.rate_limiter is not None:
             await self.runtime.rate_limiter.close()
+        if self._owned_redis is not None:
+            await self._owned_redis.aclose()

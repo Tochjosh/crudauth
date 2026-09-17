@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Awaitable, Callable
+
+from fastapi import Request
 
 from ..constants import SECONDS_PER_HOUR
+from ..principal import Principal
 
-__all__ = ["RateLimit", "KeyBy", "DEFAULT_RATE_LIMITS"]
+__all__ = ["RateLimit", "RateLimitResolver", "KeyBy", "DEFAULT_RATE_LIMITS"]
 
 
 @dataclass(frozen=True)
@@ -32,11 +36,19 @@ class RateLimit:
         return self.times == 0
 
 
+RateLimitResolver = Callable[
+    [Request, Principal | None], RateLimit | None | Awaitable[RateLimit | None]
+]
+"""A per-request limit: a sync or async function of the request and the principal (``None``
+when anonymous) returning a ``RateLimit``, or ``None`` for no limit on that request."""
+
+
 class KeyBy(str, Enum):
     """Which dimension a [CRUDAuth.rate_limit][crudauth.crud_auth.CRUDAuth.rate_limit] dependency keys on."""
 
     IP = "ip"
     USER = "user"
+    USER_OR_IP = "user_or_ip"
 
 
 # Auth-adjacent endpoints protected out of the box. Apps tune via
