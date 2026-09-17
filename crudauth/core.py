@@ -19,7 +19,6 @@ from .constants import DEFAULT_ALGORITHM
 from .exceptions import RateLimitException, UnauthorizedException
 from .principal import Principal
 from .utils import (
-    canonical_identifier,
     get_client_ip,
     verify_and_update_password_async,
 )
@@ -137,10 +136,9 @@ class AuthRuntime:
             ```
         """
         ip = get_client_ip(request, self.trusted_proxy_hops)
-        login_id = canonical_identifier(identifier)
         if self.lockout is not None:
             allowed, _, retry_after = await self.lockout.check_and_record(
-                ip, login_id, success=False
+                ip, identifier, success=False
             )
             if not allowed:
                 raise RateLimitException(
@@ -157,7 +155,7 @@ class AuthRuntime:
         if new_hash is not None:
             await self.repo.update(db, user, {"hashed_password": new_hash})
         if self.lockout is not None:
-            await self.lockout.check_and_record(ip, login_id, success=True)
+            await self.lockout.check_and_record(ip, identifier, success=True)
         return user
 
 

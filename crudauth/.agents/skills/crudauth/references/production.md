@@ -1,7 +1,7 @@
 # Production: storage, lifespan, rate limiting, sudo
 
-The dev defaults run in one process: state lives in memory, the limiter is in-process, cookies work
-over plain HTTP. Going to production is four changes; the auth config and the API don't change, only
+The dev defaults run in one process: state lives in memory and the limiter is in-process (cookies are
+already `secure=True` unless you turned that off for local HTTP). Going to production is four changes; the auth config and the API don't change, only
 *where state lives* and the operational wiring.
 
 ## 1. Move state to Redis
@@ -64,7 +64,14 @@ auth = CRUDAuth(..., trusted_proxy_hops=1)   # default 0 ignores the header (cor
 ## Rate limiting & lockout
 
 - The same escalating login-lockout policy is shared by `/login` and `/token`, keyed identically, so
-  neither endpoint sidesteps the other's failure counter. It re-arms its round TTL atomically.
+  neither endpoint sidesteps the other's failure counter. It re-arms its round TTL atomically. Tune it
+  with `CRUDAuth(lockout=LockoutConfig(...))` (from `crudauth.ratelimit`), which works for bearer-only
+  apps too; `SessionTransport(login_*=...)` sets the same values, and setting both raises.
+- Lockout keys case-fold the username and key IPv6 clients by `/64` (`client_ip_key`); `KeyBy.IP`
+  does the same. A successful login under `on_login_success="clear_all"` only takes back the IP
+  failures that username added, so it can't launder a spray.
+- `rate_limits={...}` accepts only built-in actions (unknown keys raise); `RateLimit` rejects negative
+  `times` and non-positive `seconds`.
 - The limiter is a dumb counter port (`rate_limiter=`). Don't construct a backend inside a transport;
   pass it on `CRUDAuth`. Auth-adjacent endpoints carry a `rate_limit()` dependency or a service-level
   guard; per-target-email throttles fail silently (a 429 there would re-open the enumeration oracle).

@@ -1,7 +1,8 @@
 # Going to production
 
 The dev defaults are tuned for one process: state lives in memory, the rate limiter is in-process,
-and cookies are configured to work over plain HTTP. None of that survives more than one worker.
+and none of that survives more than one worker. The cookies are already production-ready: they're
+`secure` unless you turned that off for local HTTP.
 Going to production is four changes, and the security model and the API stay identical, what moves
 is *where state lives* and the operational wiring around it.
 

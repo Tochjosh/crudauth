@@ -17,6 +17,12 @@ auth = CRUDAuth(..., hooks=AuthHooks(on_after_register=welcome))
 A hook may be sync or async. `user` is passed as a plain `dict`, not your ORM instance, so
 your hooks don't couple to the model.
 
+Hooks run after the operation is done (the account created, the session stored, the password
+changed), so they can't block or undo it. An exception a hook raises is logged with its
+traceback on the `crudauth.hooks` logger and the request still succeeds. A hook that writes
+through `db` owns that work: commit it, or roll back on its own failure. For work that must not
+be lost, enqueue it from the hook rather than doing it inline.
+
 ## The hooks
 
 | Hook | Fires after | Receives |

@@ -31,4 +31,6 @@ validation, client-IP resolution, and display masking.
 
 ::: crudauth.utils.get_client_ip
 
+::: crudauth.utils.client_ip_key
+
 ::: crudauth.utils.safe_redirect_path

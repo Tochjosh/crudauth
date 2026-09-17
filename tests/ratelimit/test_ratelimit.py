@@ -695,10 +695,12 @@ async def test_clear_user_only_keeps_ip_pressure() -> None:
     assert await b.get_count(f"{LOCKOUT_NAMESPACE}:user:neighbor") is None  # username cleared
 
 
-async def test_clear_all_clears_ip_pressure() -> None:
+async def test_clear_all_takes_back_only_the_successful_users_own_ip_pressure() -> None:
     b = MemoryRateLimiterBackend()
-    pol = LockoutPolicy(b, max_attempts=3, on_login_success="clear_all")  # default
+    pol = LockoutPolicy(b, max_attempts=10, on_login_success="clear_all")
     for _ in range(3):
         await pol.check_and_record("10.0.0.1", "attacker", success=False)
+    for _ in range(2):
+        await pol.check_and_record("10.0.0.1", "neighbor", success=False)
     await pol.check_and_record("10.0.0.1", "neighbor", success=True)
-    assert await b.get_count(f"{LOCKOUT_NAMESPACE}:ip:10.0.0.1") is None  # per-IP cleared too
+    assert await b.get_count(f"{LOCKOUT_NAMESPACE}:ip:10.0.0.1") == 3

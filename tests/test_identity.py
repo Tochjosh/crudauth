@@ -19,6 +19,8 @@ from crudauth import (
     AuthUserMixin,
     CookieConfig,
     CRUDAuth,
+    DeliveryChannel,
+    DeliveryIntent,
     EmailConfig,
     EmailSender,
     IdentityConfig,
@@ -47,6 +49,11 @@ _PlainMixin: Any = make_auth_identity(identifiers=["username"], recovery=None, o
 _RecoveryEmailMixin: Any = make_auth_identity(
     identifiers=["username"], recovery="email", oauth=False
 )
+
+
+class _Channel(DeliveryChannel):
+    async def deliver(self, intent: DeliveryIntent, db) -> None:
+        return None
 
 
 class _ConstraintBase(DeclarativeBase):
@@ -231,10 +238,21 @@ def test_oauth_requires_email_in_login() -> None:
 def test_email_config_requires_email_column() -> None:
     with pytest.raises(ValueError, match="requires an 'email' column"):
         _build(
-            AnonUser,
-            identity=IdentityConfig(login=["username"], recovery=None),
+            PhoneUser,
+            identity=IdentityConfig(login=["username"], recovery="phone"),
             email=EmailConfig(sender=_Sender(), frontend_url="https://app"),
         )
+
+
+@pytest.mark.parametrize("delivery", ["email", "channels"])
+def test_recovery_delivery_requires_a_recovery_factor(delivery) -> None:
+    options: dict[str, Any] = (
+        {"email": EmailConfig(sender=_Sender(), frontend_url="https://app")}
+        if delivery == "email"
+        else {"channels": [_Channel()]}
+    )
+    with pytest.raises(ValueError, match="require a recovery factor"):
+        _build(AnonUser, identity=IdentityConfig(login=["username"], recovery=None), **options)
 
 
 def test_verified_gate_requires_email_column() -> None:
@@ -358,7 +376,6 @@ async def test_recovery_none_omits_recovery_endpoints(get_session, UserModel) ->
         SECRET_KEY=SECRET,
         transports=[SessionTransport(cookies=CookieConfig(secure=False))],
         identity=IdentityConfig(login=["email", "username"], recovery=None),
-        email=EmailConfig(sender=_Sender(), frontend_url="https://app"),
     )
     app = FastAPI()
     app.include_router(auth.router)

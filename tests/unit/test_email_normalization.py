@@ -24,5 +24,6 @@ def test_canonical_identifier_normalizes_email_case() -> None:
     assert canonical_identifier("  Foo@x.com ") == "foo@x.com"
 
 
-def test_canonical_identifier_leaves_usernames_untouched() -> None:
-    assert canonical_identifier("Alice") == "Alice"
+def test_canonical_identifier_folds_username_case() -> None:
+    assert canonical_identifier(" Alice ") == "alice"
+    assert canonical_identifier("STRASSE") == canonical_identifier("straße")
