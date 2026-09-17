@@ -22,8 +22,9 @@ wrong layer.
 shared runtime types), `resolution.py` (the per-request principal resolver), `principal.py`,
 `repository.py`, `identity.py` (the account-shape contract), and `hooks.py`. `CRUDAuth` is the only module allowed to import from every layer.
 
-**Cross-cutting leaves** depend on nothing internal: `constants.py`, `exceptions.py`,
-`utils.py`. The registration gating contract (`REGISTRATION_ALLOWED_FIELDS`) lives in
+**Cross-cutting leaves** depend on nothing internal: `constants.py`, `exceptions.py`, and
+`utils/` (password hashing, identifier canonicalization, request helpers, callback
+introspection), re-exported as one `crudauth.utils` namespace. The registration gating contract (`REGISTRATION_ALLOWED_FIELDS`) lives in
 `constants.py` because the spine consumes it.
 
 **Features** are vertical slices, each owning its router, service, schemas, and constants:

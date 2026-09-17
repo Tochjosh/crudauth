@@ -14,6 +14,7 @@ from typing import Annotated, Any, cast
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, EmailStr, create_model
 
+from ..protocols import AuthSurface
 from ..principal import Principal
 from ..ratelimit import KeyBy
 from .service import EmailFlowService
@@ -35,7 +36,7 @@ class _ChangeIn(BaseModel):
     password: str
 
 
-def build_email_router(*, auth: Any, service: EmailFlowService) -> APIRouter:
+def build_email_router(*, auth: AuthSurface, service: EmailFlowService) -> APIRouter:
     """Build the recovery-flow router (verify / reset, plus change-email when applicable).
 
     The verify and reset request bodies are generated for the recovery factor: an

@@ -5,6 +5,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel
 
+from ..protocols import AuthSurface
 from ..exceptions import ForbiddenException, UnauthorizedException
 from ..hooks import HookContext
 from ..principal import Principal
@@ -32,7 +33,7 @@ class _CodeIn(BaseModel):
     code: str
 
 
-def build_mfa_router(*, auth: Any, service: MfaService) -> APIRouter:
+def build_mfa_router(*, auth: AuthSurface, service: MfaService) -> APIRouter:
     """Build the MFA router.
 
     ``/mfa/verify`` and ``/mfa/challenge`` answer a login challenge and need no

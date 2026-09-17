@@ -6,6 +6,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, Field
 
+from ...protocols import AuthSurface
 from ...exceptions import BadRequestException, NotFoundException, UnauthorizedException
 from ...principal import Principal
 from ...ratelimit import KeyBy
@@ -43,7 +44,7 @@ class SessionInfo(BaseModel):
     current: bool = False
 
 
-def build_session_management_router(auth: Any, sessions: SessionManager) -> APIRouter:
+def build_session_management_router(auth: AuthSurface, sessions: SessionManager) -> APIRouter:
     """Build ``/logout-all``, ``/sessions``, ``DELETE /sessions/{id}`` and ``/csrf/refresh``.
 
     Args:

@@ -1,10 +1,9 @@
 """The bearer transport: ``Authorization: Bearer <jwt>`` for apps and scripts."""
 
 from datetime import timedelta
-from typing import Annotated, Any
+from typing import Any
 
-from fastapi import APIRouter, Depends, Request, Response
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import APIRouter, Request, Response
 
 from ...constants import (
     DEFAULT_ACCESS_TTL_SECONDS,
@@ -12,10 +11,10 @@ from ...constants import (
     SECONDS_PER_DAY,
 )
 from ...core import AuthContext, AuthRuntime, CookieConfig, Transport
-from ...exceptions import ForbiddenException, UnauthorizedException
+from ...exceptions import UnauthorizedException
 from ...hooks import HookContext
 from ...principal import Principal
-from ...utils import get_client_ip, is_cross_site
+from ...utils import get_client_ip
 from .constants import (
     REFRESH_LOCATION_BODY,
     REFRESH_LOCATION_COOKIE,
@@ -24,6 +23,7 @@ from .constants import (
     TOKEN_TYPE_BEARER,
     TOKEN_VERSION_CLAIM,
 )
+from .routes import build_bearer_routes
 from .tokens import (
     TokenType,
     create_access_token,
@@ -161,87 +161,7 @@ class BearerTransport(Transport):
 
     # --- routes --------------------------------------------------------------
     def contributes_routes(self) -> APIRouter:
-        router = APIRouter(tags=["auth"])
-        runtime = self.runtime
-        db_dep = runtime.db_dependency
-
-        @router.post("/token")
-        async def issue_token(
-            request: Request,
-            response: Response,
-            form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
-            db: Annotated[Any, Depends(db_dep)],
-        ):
-            """Exchange username/email + password for an access token.
-
-            Returns ``{"access_token", "token_type"}``; the refresh token is set
-            as an httpOnly cookie or returned in the body per ``refresh=``.
-            Subject to the shared login lockout.
-
-            With ``refresh="cookie"``, a request the browser marks
-            ``Sec-Fetch-Site: cross-site`` gets a 403, so another site can't plant
-            its refresh cookie in the visitor's browser.
-
-            Note:
-                A disabled account returns the same "Incorrect username or
-                password" as bad credentials (no exists-but-disabled oracle for a
-                credential holder); the real reason is logged server-side
-                (``reason=disabled``).
-            """
-            if self.refresh == REFRESH_LOCATION_COOKIE and is_cross_site(request):
-                raise ForbiddenException("Cross-site login requests are not allowed.")
-            user = await runtime.authenticate_password(
-                db,
-                form_data.username,
-                form_data.password,
-                request=request,
-                record_success=runtime.mfa is None,
-            )
-            options = {"scopes": form_data.scopes}
-            if runtime.mfa is not None:
-                challenge = await runtime.mfa.challenge_login(
-                    db,
-                    user,
-                    request=request,
-                    transport=self.name,
-                    lockout_identifier=form_data.username,
-                    options=options,
-                )
-                if challenge is not None:
-                    return challenge
-            return await self.complete_login(request, response, user, options)
-
-        @router.post("/refresh")
-        async def refresh_token(request: Request, db: Annotated[Any, Depends(db_dep)]):
-            """Mint a fresh access token from a valid refresh token (cookie or body)."""
-            token = await self._read_refresh(request)
-            if not token:
-                raise UnauthorizedException("Refresh token missing")
-            payload = verify_token(
-                token, runtime.secret_key, TokenType.REFRESH, algorithm=runtime.algorithm
-            )
-            if payload is None:
-                raise UnauthorizedException("Invalid or expired refresh token")
-            user = await runtime.repo.get_by_id(db, payload["sub"])
-            if user is None or not runtime.repo.is_active(user):
-                raise UnauthorizedException("Invalid or expired refresh token")
-            if payload.get(TOKEN_VERSION_CLAIM, 0) != runtime.repo.token_version(user):
-                raise UnauthorizedException("Invalid or expired refresh token")
-            scopes = self._clamp_scopes(payload.get("scopes") or ())
-            access = self._access_token(user, scopes)
-            return {"access_token": access, "token_type": TOKEN_TYPE_BEARER}
-
-        if self.refresh == REFRESH_LOCATION_COOKIE and not any(
-            transport.name == "session" for transport in runtime.transports
-        ):
-
-            @router.post("/logout")
-            async def logout(response: Response):
-                """Clear the refresh-token cookie. With a session transport, its ``/logout`` does this."""
-                self.clear_cookies(response)
-                return {"detail": "Logged out"}
-
-        return router
+        return build_bearer_routes(self)
 
     async def complete_login(
         self, request: Request, response: Response, user: Any, options: dict[str, Any]
@@ -306,7 +226,7 @@ class BearerTransport(Transport):
         return self._mint(self.runtime, user, granted, response)
 
     # --- helpers -------------------------------------------------------------
-    def _clamp_scopes(self, scopes: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    def clamp_scopes(self, scopes: list[str] | tuple[str, ...]) -> tuple[str, ...]:
         """Drop any scope not in ``grantable_scopes`` (the issued ⊆ grantable invariant)."""
         return tuple(s for s in scopes if s in self.grantable_scopes)
 
@@ -314,9 +234,9 @@ class BearerTransport(Transport):
         """Resolve scopes to issue at ``/token``: the request (or ``default_scopes``
         if none) clamped to ``grantable_scopes``, so a client can only narrow."""
         asked = tuple(requested) if requested else self.default_scopes
-        return self._clamp_scopes(asked)
+        return self.clamp_scopes(asked)
 
-    def _access_token(self, user: Any, scopes: tuple[str, ...]) -> str:
+    def access_token(self, user: Any, scopes: tuple[str, ...]) -> str:
         """Mint an access token for ``user`` with ``scopes``, stamped with the epoch."""
         return create_access_token(
             {
@@ -334,7 +254,7 @@ class BearerTransport(Transport):
     ) -> dict[str, Any]:
         uid = str(runtime.repo.user_id(user))
         ver = runtime.repo.token_version(user)
-        access = self._access_token(user, scopes)
+        access = self.access_token(user, scopes)
         refresh = create_refresh_token(
             {"sub": uid, TOKEN_VERSION_CLAIM: ver, "scopes": list(scopes)},
             runtime.secret_key,
@@ -357,7 +277,7 @@ class BearerTransport(Transport):
             body[REFRESH_TOKEN_NAME] = refresh
         return body
 
-    async def _read_refresh(self, request: Request) -> str | None:
+    async def read_refresh(self, request: Request) -> str | None:
         cookie = request.cookies.get(self.refresh_cookie_name)
         if cookie:
             return cookie

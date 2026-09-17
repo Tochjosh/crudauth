@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, Request, Response, status
 from pydantic import BaseModel, EmailStr, create_model
 from sqlalchemy.exc import IntegrityError
 
+from ..protocols import AuthSurface
 from ..exceptions import DuplicateValueException, ValueTooLongException
 from ..hooks import HookContext
 from ..password import PasswordContext
@@ -43,7 +44,7 @@ class RegisterIn(BaseModel):
     password: str
 
 
-def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter:
+def build_register_route(auth: AuthSurface, schema: type[BaseModel] | None) -> APIRouter:
     """Build the ``/register`` router using ``schema`` (or the default body).
 
     Args:
@@ -95,7 +96,8 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
             retrying a rejected password isn't locked out of signing up.
         """
         ip = get_client_ip(request, auth.runtime.trusted_proxy_hops)
-        email_on = auth.emails is not None
+        emails = auth.emails
+        email_on = emails is not None
         login_fields = auth.identity.login
         data = cast(BaseModel, body).model_dump()
         password = data.pop("password")
@@ -172,8 +174,8 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
                 if await auth.repo.get_by_field(db, field, value) is None:
                     continue
                 if field in private_fields:
-                    if email_on:
-                        await _send_best_effort(auth.emails.notify_existing_account(value))
+                    if emails is not None:
+                        await _send_best_effort(emails.notify_existing_account(value))
                         return _enrolled()
                     raise DuplicateValueException(f"{field.capitalize()} already registered")
                 if email_on and field not in login_fields:
@@ -218,9 +220,9 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
             ),
         )
 
-        if email_on and auth.identity.recovery is not None:
+        if emails is not None and auth.identity.recovery is not None:
             await _send_best_effort(
-                auth.emails.request_recovery_verification(
+                emails.request_recovery_verification(
                     db, auth.repo.get(user, auth.identity.recovery)
                 )
             )

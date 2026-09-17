@@ -10,7 +10,6 @@ import bcrypt
 import pytest
 
 from crudauth.utils import (
-    _bcrypt_input,
     dummy_verify_password,
     get_password_hash,
     get_password_hash_async,
@@ -20,6 +19,7 @@ from crudauth.utils import (
     verify_password,
     verify_password_async,
 )
+from crudauth.utils.hashing import _bcrypt_input
 
 
 def test_password_roundtrip() -> None:

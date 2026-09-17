@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Annotated, Any, cast
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, create_model
 
+from ..protocols import AuthSurface
 from ..exceptions import BadRequestException, UnauthorizedException
 from ..hooks import HookContext
 from ..principal import Principal
@@ -31,7 +32,7 @@ class _ChangePasswordIn(BaseModel):
     new_password: str
 
 
-def build_account_router(auth: Any, session_manager: "SessionManager | None") -> APIRouter:
+def build_account_router(auth: AuthSurface, session_manager: "SessionManager | None") -> APIRouter:
     """Build the account routes.
 
     Args:

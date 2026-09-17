@@ -4,10 +4,9 @@ This is the default transport - configuring nothing gives you cookie sessions,
 CSRF synchronizer-token, login lockout, secure cookies, and ``/login`` ``/logout``.
 """
 
-from typing import Annotated, Any
+from typing import Any
 
-from fastapi import APIRouter, Depends, Form, Request, Response
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi import APIRouter, Request, Response
 
 from ...constants import (
     DEFAULT_CLEANUP_INTERVAL_MINUTES,
@@ -17,14 +16,14 @@ from ...constants import (
     SECONDS_PER_MINUTE,
 )
 from ...core import AuthContext, AuthRuntime, CookieConfig, Transport
-from ...exceptions import CSRFException, ForbiddenException
+from ...exceptions import CSRFException
 from ...hooks import HookContext
 from ...principal import Principal
 from ...ratelimit.config import LockoutConfig, LoginSuccessClears
 from ...storage import get_session_storage
 from ...storage.backends.redis import redis_client_from_url
 from ...storage.constants import BACKEND_MEMORY, BACKEND_REDIS
-from ...utils import get_client_ip, is_cross_site
+from ...utils import get_client_ip
 from .constants import (
     CSRF_HEADER_NAME,
     CSRF_STORAGE_PREFIX,
@@ -33,6 +32,7 @@ from .constants import (
     SESSION_STORAGE_PREFIX,
 )
 from .manager import SessionManager
+from .routes import build_session_routes
 
 __all__ = ["SessionTransport"]
 
@@ -228,7 +228,7 @@ class SessionTransport(Transport):
             return None
 
         if ctx.enforce_csrf:
-            await self._enforce_csrf(request, session_id)
+            await self.enforce_csrf(request, session_id)
 
         user = await ctx.resolve_user(session.user_id)
         if user is None or not ctx.repo.is_active(user):
@@ -252,10 +252,10 @@ class SessionTransport(Transport):
         if ctx.update_activity and await self.manager.validate_session(session_id) is None:
             return False
         if ctx.enforce_csrf:
-            await self._enforce_csrf(request, session_id)
+            await self.enforce_csrf(request, session_id)
         return True
 
-    async def _enforce_csrf(self, request: Request, session_id: str) -> None:
+    async def enforce_csrf(self, request: Request, session_id: str) -> None:
         """Require a valid synchronizer-token header on unsafe methods.
 
         Note:
@@ -326,84 +326,4 @@ class SessionTransport(Transport):
 
     # --- routes --------------------------------------------------------------
     def contributes_routes(self) -> APIRouter:
-        router = APIRouter(tags=["auth"])
-        runtime = self.runtime
-        db_dep = runtime.db_dependency
-
-        @router.post("/login")
-        async def login(
-            request: Request,
-            response: Response,
-            form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
-            db: Annotated[Any, Depends(db_dep)],
-            remember_me: Annotated[bool, Form()] = False,
-        ):
-            """Log in with username/email + password; sets the session + CSRF cookies.
-
-            Subject to login lockout (shared with bearer ``/token``). ``remember_me``
-            switches the cookie from session-scoped to a long persistent lifetime.
-            A request the browser marks ``Sec-Fetch-Site: cross-site`` gets a 403,
-            so another site can't sign the visitor into an account it controls.
-
-            Note:
-                A disabled account returns the same "Incorrect username or
-                password" as bad credentials, so a credential holder can't tell a
-                disabled account from a wrong password; the real reason is logged
-                server-side (``reason=disabled``) for operators.
-            """
-            assert self.manager is not None
-            if is_cross_site(request):
-                raise ForbiddenException("Cross-site login requests are not allowed.")
-            user = await runtime.authenticate_password(
-                db,
-                form_data.username,
-                form_data.password,
-                request=request,
-                record_success=runtime.mfa is None,
-            )
-            options = {"remember_me": remember_me}
-            if runtime.mfa is not None:
-                challenge = await runtime.mfa.challenge_login(
-                    db,
-                    user,
-                    request=request,
-                    transport=self.name,
-                    lockout_identifier=form_data.username,
-                    options=options,
-                )
-                if challenge is not None:
-                    return challenge
-            return await self.complete_login(request, response, user, options)
-
-        @router.post("/logout")
-        async def logout(request: Request, response: Response, db: Annotated[Any, Depends(db_dep)]):
-            """Revoke the current session and clear the auth cookies (CSRF-protected).
-
-            Clears every configured transport's cookies, including a bearer refresh
-            cookie. A session that already expired has nothing left to protect, so
-            its cookies are cleared without a CSRF check.
-            """
-            assert self.manager is not None
-            session_id = request.cookies.get(self.manager.session_cookie_name)
-            session = (
-                await self.manager.validate_session(session_id, update_activity=False)
-                if session_id
-                else None
-            )
-            user_dict = None
-            if session_id and session is not None:
-                await self._enforce_csrf(request, session_id)
-                user = await runtime.repo.get_by_id(db, session.user_id)
-                if user is not None:
-                    user_dict = runtime.repo.to_dict(user)
-                await self.manager.terminate_session(session_id, reason="logout")
-            runtime.clear_cookies(response)
-            if user_dict is not None:
-                await runtime.hooks.run_after_logout(
-                    user_dict,
-                    request=request,
-                    context=HookContext(transport=self.name, request=request),
-                )
-            return {"detail": "Logged out"}
-
-        return router
+        return build_session_routes(self)
