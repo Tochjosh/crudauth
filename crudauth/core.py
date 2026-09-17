@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 
 from .constants import DEFAULT_ALGORITHM
 from .exceptions import RateLimitException, UnauthorizedException
@@ -81,6 +81,7 @@ class AuthRuntime:
         redis_client: The app-wide async Redis client every Redis-capable component
             uses unless it's configured directly: the one ``CRUDAuth`` built from
             ``redis_url``, or the caller's ``redis_client``.
+        transports: Every configured transport, in precedence order.
 
     Note:
         ``lockout`` is a single shared policy used by BOTH the session ``/login``
@@ -100,6 +101,12 @@ class AuthRuntime:
     lockout: "LockoutPolicy | None" = None
     trusted_proxy_hops: int = 0
     redis_client: Any = None
+    transports: list[Transport] = field(default_factory=list)
+
+    def clear_cookies(self, response: Response) -> None:
+        """Expire the cookie credentials of every configured transport, for a logout."""
+        for transport in self.transports:
+            transport.clear_cookies(response)
 
     async def authenticate_password(
         self, db: "AsyncSession", identifier: str, password: str, *, request: Request
@@ -263,6 +270,12 @@ class Transport(ABC):
     def contributes_routes(self) -> APIRouter | None:
         """Return an `APIRouter` of endpoints this transport adds, or ``None``."""
         return None
+
+    def clear_cookies(self, response: Response) -> None:
+        """Expire the cookies this transport sets on the client, called on logout.
+
+        The default sets no cookies, so it clears none.
+        """
 
     async def initialize(self) -> None:
         """Open connections / start background work. Called from ``auth.initialize()``."""

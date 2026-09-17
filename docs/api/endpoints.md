@@ -31,7 +31,7 @@ Mounted by `SessionTransport` (the default). ([Sessions](../guides/auth/sessions
 | Method | Path | Auth | Notes |
 |---|---|---|---|
 | POST | `/login` | none | Form `username`+`password`; sets cookies, returns `{"csrf_token"}`. |
-| POST | `/logout` | session | Ends the current session, clears cookies. |
+| POST | `/logout` | session | Ends the current session, clears the session and bearer refresh cookies. |
 
 ### With `management_routes=True`
 
@@ -40,7 +40,7 @@ Opt-in device/CSRF management. ([Devices & sessions](../guides/accounts/session-
 | Method | Path | Auth | Notes |
 |---|---|---|---|
 | GET | `/sessions` | session | List active sessions ([`SessionInfo[]`](transports.md#sessioninfo)); `current` flags the caller. |
-| DELETE | `/sessions/{session_id}` | session | Revoke one (ownership-checked; `404` if not found or not yours). |
+| DELETE | `/sessions/{id}` | session | Revoke one by the `id` from `GET /sessions` (ownership-checked; `404` if not found or not yours). |
 | POST | `/logout-all` | session | Revoke all; `?keep_current=true` keeps the caller's. |
 | POST | `/csrf/refresh` | session cookie | Re-mint the CSRF cookie (no CSRF header required; self-heals; `400` if CSRF disabled, `401` if no session). |
 
@@ -52,6 +52,7 @@ Mounted by `BearerTransport`. ([Bearer tokens](../guides/auth/bearer.md))
 |---|---|---|---|
 | POST | `/token` | none | Form login → `{"access_token", "token_type"}` (+ `refresh_token` when `refresh="body"`). |
 | POST | `/refresh` | refresh token | Mint a new access token (cookie rides automatically, or `{"refresh_token"}` body). |
+| POST | `/logout` | none | Only on a bearer-only app with `refresh="cookie"`: clears the refresh cookie. |
 
 ## Email & recovery
 

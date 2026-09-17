@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Generic, TypeVar
+from typing import Any, Callable, Generic, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -30,6 +30,9 @@ class AbstractSessionStorage(ABC, Generic[T]):
     - ``async scan_keys(match: str | None = None) -> list[str]`` - enumerate keys
       by glob; unlocks the periodic idle-session cleanup sweep. A backend without
       it simply gets no proactive sweep (per-key TTLs still expire entries).
+    - ``async remove_from_user_index(user_id, session_id) -> None`` - drop an
+      index entry whose record is gone. A backend with a separate per-user index
+      implements it so expired sessions don't pile up there.
 
     Example:
         ```python
@@ -117,7 +120,47 @@ class AbstractSessionStorage(ABC, Generic[T]):
     @abstractmethod
     async def exists(self, session_id: str) -> bool: ...
 
-    # --- atomic single-use primitives ---------------------------------------
+    # --- atomic primitives --------------------------------------------------
+    async def modify(
+        self,
+        session_id: str,
+        model_class: type[T],
+        change: Callable[[T], None],
+        reset_expiration: bool = True,
+        expiration: int | None = None,
+    ) -> T | None:
+        """Apply ``change`` to a stored value and write it back without losing a concurrent write.
+
+        Two writers that each change a different field of the same value both
+        land: a write made after this call read the value makes it read again
+        and reapply ``change``, so ``change`` may run more than once and must only
+        set what it owns.
+
+        Args:
+            session_id: Key to modify.
+            model_class: Model to deserialize into.
+            change: Mutates the loaded value in place.
+            reset_expiration: If ``True``, refresh the TTL to ``expiration``.
+            expiration: TTL in seconds when resetting; storage default if ``None``.
+
+        Returns:
+            The value as written, or ``None`` if the key doesn't exist.
+
+        Note:
+            This default implementation is only atomic on a backend whose
+            ``get``/``update`` never yield to the event loop (the in-memory
+            backend). Networked backends MUST override it with a native
+            compare-and-set; see
+            [RedisSessionStorage][crudauth.storage.backends.redis.RedisSessionStorage].
+        """
+        data = await self.get(session_id, model_class)
+        if data is None:
+            return None
+        change(data)
+        if not await self.update(session_id, data, reset_expiration, expiration):
+            return None
+        return data
+
     async def set_if_absent(self, session_id: str, data: T, expiration: int | None = None) -> bool:
         """Atomically store ``data`` under ``session_id`` only if it is absent.
 
@@ -160,6 +203,14 @@ class AbstractSessionStorage(ABC, Generic[T]):
         models. Raises `NotImplementedError` when unsupported.
         """
         raise NotImplementedError
+
+    async def remove_from_user_index(self, user_id: Any, session_id: str) -> None:
+        """Optional: drop ``session_id`` from ``user_id``'s index once its record is gone.
+
+        Callers use it when an indexed id points at a missing record (an expired
+        session). The default does nothing, which suits a backend that derives the
+        index from the records themselves.
+        """
 
     async def scan_keys(self, match: str | None = None) -> list[str]:
         """Optional: enumerate stored keys by glob.

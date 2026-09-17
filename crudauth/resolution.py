@@ -20,6 +20,7 @@ _CACHE_ATTR = "_crudauth_principals"
 @dataclass
 class _CachedPrincipal:
     principal: Principal
+    transport: Transport
     db: Any
     csrf_enforced: bool
     activity_updated: bool
@@ -62,7 +63,9 @@ class PrincipalResolver:
             for transport in transports:
                 principal = await transport.authenticate(request, ctx)
                 if principal is not None:
-                    cache[key] = _CachedPrincipal(principal, db, enforce_csrf, update_activity)
+                    cache[key] = _CachedPrincipal(
+                        principal, transport, db, enforce_csrf, update_activity
+                    )
                     return principal
             return None
 
@@ -77,9 +80,8 @@ class PrincipalResolver:
         missing_csrf = enforce_csrf and not cached.csrf_enforced
         missing_activity = update_activity and not cached.activity_updated
         if missing_csrf or missing_activity:
-            transport = next(t for t in transports if t.name == cached.principal.transport)
             ctx = self._context(request, db, missing_csrf, missing_activity)
-            if not await transport.revalidate(request, cached.principal, ctx):
+            if not await cached.transport.revalidate(request, cached.principal, ctx):
                 del cache[key]
                 return None
             cached.csrf_enforced = cached.csrf_enforced or enforce_csrf

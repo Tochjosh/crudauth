@@ -89,5 +89,7 @@ Sudo is short-lived, stamped on the session, has its own lockout, and fires an `
 ## Custom storage backend
 
 Implement the storage port (serialize Pydantic models under `{prefix}{id}` with per-key TTL, plus the
-atomic `set_if_absent` / `get_and_delete` primitives the one-time-token flows need). The built-ins are
-in-memory and Redis.
+atomic `set_if_absent` / `get_and_delete` primitives the one-time-token flows need). A networked backend
+must also override `modify` with a compare-and-set, since session activity, sudo and CSRF rotation write
+the same record concurrently, and should implement `remove_from_user_index` if it keeps a per-user
+index. The built-ins are in-memory and Redis.

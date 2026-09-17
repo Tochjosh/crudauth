@@ -92,7 +92,7 @@ async def test_sessions_list_shape_and_current_flag(get_session, UserModel) -> N
         rows = (await c.get("/sessions")).json()
         assert len(rows) == 1
         s = rows[0]
-        assert set(s) >= {"session_id", "device", "ip", "created_at", "last_activity", "current"}
+        assert set(s) >= {"id", "device", "ip", "created_at", "last_activity", "current"}
         assert s["current"] is True
     await auth.shutdown()
 
@@ -106,8 +106,8 @@ async def test_delete_own_other_unknown_and_cross_user(get_session, UserModel) -
         csrf_other = await _register_login(other, "bob")  # different user
 
         sessions = (await a.get("/sessions")).json()
-        b_id = next(s["session_id"] for s in sessions if not s["current"])
-        a_id = next(s["session_id"] for s in sessions if s["current"])
+        b_id = next(s["id"] for s in sessions if not s["current"])
+        a_id = next(s["id"] for s in sessions if s["current"])
 
         # revoke alice's other session (B)
         r = await a.delete(f"/sessions/{b_id}", headers={"X-CSRF-Token": csrf_a})

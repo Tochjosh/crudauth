@@ -209,6 +209,7 @@ def build_oauth_router(
             request,
             user_id=runtime.repo.user_id(user),
             metadata={"login_type": "oauth", "oauth_provider": provider},
+            token_version=runtime.repo.token_version(user),
         )
         redirect_url = safe_redirect_path(state_data.redirect_to, default=default_redirect)
 

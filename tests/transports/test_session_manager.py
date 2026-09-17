@@ -48,7 +48,7 @@ async def test_regenerate_csrf_rotates() -> None:
     sid, old = await mgr.create_session(make_request(), user_id=1)
     assert await mgr.validate_csrf_token(sid, old) is True
 
-    new = await mgr.regenerate_csrf_token(user_id=1, session_id=sid)
+    new = await mgr.regenerate_csrf_token(session_id=sid)
     assert new and new != old
     # old token is invalidated, new token is accepted
     assert await mgr.validate_csrf_token(sid, old) is False
@@ -61,7 +61,7 @@ async def test_regenerate_csrf_rotates() -> None:
 
 async def test_regenerate_csrf_missing_session_returns_empty() -> None:
     mgr = build_manager()
-    assert await mgr.regenerate_csrf_token(user_id=1, session_id="nope") == ""
+    assert await mgr.regenerate_csrf_token(session_id="nope") == ""
 
 
 async def test_validate_session_evicts_idle_on_read() -> None:

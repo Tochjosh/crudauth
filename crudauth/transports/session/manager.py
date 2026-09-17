@@ -5,6 +5,7 @@ Decoupled from any global settings: every policy knob is a constructor argument.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -93,8 +94,20 @@ class SessionManager:
         user_id: Any,
         metadata: dict[str, Any] | None = None,
         expiration_seconds: int | None = None,
+        token_version: int | None = None,
     ) -> tuple[str, str]:
         """Create a session + CSRF token. Returns ``(session_id, csrf_token)``.
+
+        Args:
+            request: The login request (user agent and client IP are recorded).
+            user_id: The session's owner.
+            metadata: Extra values stored on the session.
+            expiration_seconds: TTL override; the idle window for ``metadata`` otherwise.
+            token_version: The user's ``token_version`` when their credentials were
+                checked. The session transport rejects the session once the user's
+                version moves past it, so a password reset also revokes a session
+                created after the reset from an earlier password check. ``None``
+                leaves the session unbound.
 
         Note:
             The CSRF token id is stored on the session so its TTL can slide
@@ -112,6 +125,7 @@ class SessionManager:
             user_agent=user_agent,
             device_info=device_info,
             metadata=metadata or {},
+            token_version=token_version,
         )
         ttl = (
             expiration_seconds
@@ -119,7 +133,7 @@ class SessionManager:
             else self.timeout_seconds_for(session.metadata)
         )
         session_id = session.session_id
-        csrf_token = await self._generate_csrf_token(user_id, session_id, ttl)
+        csrf_token = await self._generate_csrf_token(session_id, ttl)
         if csrf_token:
             session.metadata[CSRF_TOKEN_ID_META_KEY] = csrf_token
         await self.storage.create(session, session_id=session_id, expiration=ttl)
@@ -134,6 +148,11 @@ class SessionManager:
             On activity, the CSRF token's TTL is slid forward together with the
             session's - otherwise it would expire out from under a session kept
             alive by activity and 403 later mutations.
+
+        Note:
+            The activity update goes through [modify][crudauth.storage.base.AbstractSessionStorage.modify]
+            and sets only ``last_activity``, so a sudo stamp or a CSRF rotation
+            written while this request was in flight is kept.
         """
         if not session_id:
             return None
@@ -142,29 +161,59 @@ class SessionManager:
             return None
         now = _utcnow()
         if self._is_idle_expired(session, now):
-            await self.terminate_session(
-                session_id, reason="session_timeout", user_id=session.user_id
-            )
+            await self._terminate(session_id, session, reason="session_timeout")
             return None
-        if update_activity:
-            session.last_activity = now
-            ttl = self.timeout_seconds_for(session.metadata)
-            await self.storage.update(session_id, session, expiration=ttl)
-            csrf_id = session.metadata.get(CSRF_TOKEN_ID_META_KEY)
-            if csrf_id and self.csrf_storage is not None:
-                await self.csrf_storage.extend(csrf_id, ttl)
-        return session
+        if not update_activity:
+            return session
 
-    async def terminate_session(
-        self, session_id: str, reason: str = "manual_termination", user_id: Any = None
-    ) -> bool:
-        """Hard-revoke a session: remove it from storage (and its user index).
+        def touch(current: SessionData) -> None:
+            current.last_activity = now
 
-        Passing ``user_id`` (known on the indexed terminate paths) lets the
-        backend skip re-reading the record just to update its user index.
+        ttl = self.timeout_seconds_for(session.metadata)
+        touched = await self.storage.modify(session_id, SessionData, touch, expiration=ttl)
+        if touched is None:
+            return None
+        csrf_id = touched.metadata.get(CSRF_TOKEN_ID_META_KEY)
+        if csrf_id and self.csrf_storage is not None:
+            await self.csrf_storage.extend(csrf_id, ttl)
+        return touched
+
+    async def set_token_version(self, session_id: str, token_version: int) -> bool:
+        """Rebind a live session to the user's current ``token_version``.
+
+        For a credential change that keeps the caller signed in: bump the user's
+        version, then rebind the caller's session so only the others are revoked.
+
+        Returns:
+            ``True`` if the session exists and was rebound.
         """
+
+        def rebind(current: SessionData) -> None:
+            current.token_version = token_version
+
+        return (
+            await self.storage.modify(session_id, SessionData, rebind, reset_expiration=False)
+            is not None
+        )
+
+    async def terminate_session(self, session_id: str, reason: str = "manual_termination") -> bool:
+        """Hard-revoke a session: remove it, its user-index entry, and its CSRF token.
+
+        Returns:
+            ``True`` if a session was removed.
+        """
+        session = await self.storage.get(session_id, SessionData)
+        if session is None:
+            return False
+        return await self._terminate(session_id, session, reason)
+
+    async def _terminate(self, session_id: str, session: SessionData, reason: str) -> bool:
         logger.debug("terminating session %s (reason=%s)", session_id, reason)
-        return await self.storage.delete(session_id, user_id=user_id)
+        deleted = await self.storage.delete(session_id, user_id=session.user_id)
+        csrf_id = session.metadata.get(CSRF_TOKEN_ID_META_KEY)
+        if csrf_id and self.csrf_storage is not None:
+            await self.csrf_storage.delete(csrf_id)
+        return deleted
 
     async def terminate_all_user_sessions(
         self, user_id: Any, reason: str = "logout_all", exclude: str | None = None
@@ -176,14 +225,23 @@ class SessionManager:
             [revoke_all][crudauth.transports.session.manager.SessionManager.revoke_all].
         """
         terminated = 0
-        for sid in await self._user_session_ids(user_id):
-            if exclude is not None and sid == exclude:
-                continue
-            if await self.terminate_session(sid, reason=reason, user_id=user_id):
+        for sid, session in await self._user_sessions(user_id):
+            if sid != exclude and await self._terminate(sid, session, reason):
                 terminated += 1
         return terminated
 
     # --- public device-management API (used by app endpoints) ----------------
+    @staticmethod
+    def session_handle(session_id: str) -> str:
+        """The public handle for a session: the SHA-256 hex digest of its id.
+
+        The session id is the cookie value, so it must never reach a page or an
+        API response. A handle identifies the session in a device list and can be
+        passed to [revoke_by_handle][crudauth.transports.session.manager.SessionManager.revoke_by_handle],
+        but it can't be turned back into a cookie.
+        """
+        return hashlib.sha256(session_id.encode()).hexdigest()
+
     async def list_for_user(
         self, user_id: Any, current_session_id: str | None = None
     ) -> list[dict[str, Any]]:
@@ -195,9 +253,11 @@ class SessionManager:
                 ``"current": True``.
 
         Returns:
-            One dict per active session with ``session_id``, ``device``, ``ip``,
-            ``created_at``, ``last_activity``, and ``current``. Empty if the
-            storage backend can't index by user.
+            One dict per active session with ``id`` (the
+            [session_handle][crudauth.transports.session.manager.SessionManager.session_handle],
+            never the session id), ``device``, ``ip``, ``created_at``,
+            ``last_activity``, and ``current``. Empty if the storage backend can't
+            index by user.
 
         Example:
             ```python
@@ -207,13 +267,10 @@ class SessionManager:
             ```
         """
         out: list[dict[str, Any]] = []
-        for sid in await self._user_session_ids(user_id):
-            session = await self.storage.get(sid, SessionData)
-            if session is None:
-                continue
+        for sid, session in await self._user_sessions(user_id):
             out.append(
                 {
-                    "session_id": sid,
+                    "id": self.session_handle(sid),
                     "device": session.device_info,
                     "ip": session.ip_address,
                     "created_at": session.created_at,
@@ -229,17 +286,34 @@ class SessionManager:
         Args:
             session_id: Session to revoke.
             owner_id: If given, the session is only revoked when it belongs to
-                this user (so a user can't revoke someone else's session).
+                this user (so a user can't revoke someone else's session). Compared
+                as a string, the way the stored ``user_id`` round-trips.
 
         Returns:
             ``True`` if a session was revoked, ``False`` if it didn't exist or
             failed the ownership check.
         """
-        if owner_id is not None:
-            session = await self.storage.get(session_id, SessionData)
-            if session is None or session.user_id != owner_id:
-                return False
-        return await self.terminate_session(session_id, reason="user_revoked", user_id=owner_id)
+        session = await self.storage.get(session_id, SessionData)
+        if session is None or (owner_id is not None and str(session.user_id) != str(owner_id)):
+            return False
+        return await self._terminate(session_id, session, reason="user_revoked")
+
+    async def revoke_by_handle(self, handle: str, owner_id: Any) -> bool:
+        """Revoke one of ``owner_id``'s sessions by its public handle.
+
+        Args:
+            handle: A [session_handle][crudauth.transports.session.manager.SessionManager.session_handle],
+                as listed by [list_for_user][crudauth.transports.session.manager.SessionManager.list_for_user].
+            owner_id: Whose sessions the handle is looked up among.
+
+        Returns:
+            ``True`` if a session was revoked, ``False`` if none of the owner's
+            sessions has that handle (or the backend can't index by user).
+        """
+        for sid, session in await self._user_sessions(owner_id):
+            if self.session_handle(sid) == handle:
+                return await self._terminate(sid, session, reason="user_revoked")
+        return False
 
     async def revoke_all(self, user_id: Any, exclude: str | None = None) -> int:
         """Revoke all of a user's sessions ("sign out everywhere").
@@ -258,7 +332,7 @@ class SessionManager:
 
     # --- CSRF ----------------------------------------------------------------
     async def _generate_csrf_token(
-        self, user_id: Any, session_id: str, expiration_seconds: int | None = None
+        self, session_id: str, expiration_seconds: int | None = None
     ) -> str:
         if self.csrf_storage is None:
             return ""
@@ -270,7 +344,6 @@ class SessionManager:
         token = secrets.token_hex(self.csrf_token_bytes)
         csrf = CSRFToken(
             token=token,
-            user_id=user_id,
             session_id=session_id,
             expiry=_utcnow() + timedelta(seconds=ttl),
         )
@@ -278,7 +351,7 @@ class SessionManager:
         return token
 
     async def regenerate_csrf_token(
-        self, user_id: Any, session_id: str, expiration_seconds: int | None = None
+        self, session_id: str, expiration_seconds: int | None = None
     ) -> str:
         """Rotate the session's CSRF token and return the new one.
 
@@ -301,12 +374,19 @@ class SessionManager:
             if expiration_seconds is not None
             else self.timeout_seconds_for(session.metadata)
         )
-        old_token = session.metadata.get(CSRF_TOKEN_ID_META_KEY)
-        new_token = await self._generate_csrf_token(user_id, session_id, ttl)
-        session.metadata[CSRF_TOKEN_ID_META_KEY] = new_token
-        await self.storage.update(session_id, session, expiration=ttl)
-        if old_token:
-            await self.csrf_storage.delete(old_token)
+        new_token = await self._generate_csrf_token(session_id, ttl)
+        replaced = ""
+
+        def rotate(current: SessionData) -> None:
+            nonlocal replaced
+            replaced = current.metadata.get(CSRF_TOKEN_ID_META_KEY) or ""
+            current.metadata[CSRF_TOKEN_ID_META_KEY] = new_token
+
+        if await self.storage.modify(session_id, SessionData, rotate, expiration=ttl) is None:
+            await self.csrf_storage.delete(new_token)
+            return ""
+        if replaced:
+            await self.csrf_storage.delete(replaced)
         return new_token
 
     async def validate_csrf_token(self, session_id: str, csrf_token: str) -> bool:
@@ -399,6 +479,17 @@ class SessionManager:
             )
 
     # --- session-limit enforcement & cleanup ---------------------------------
+    async def _user_sessions(self, user_id: Any) -> list[tuple[str, SessionData]]:
+        """The user's live ``(session_id, session)`` pairs, pruning index entries whose record is gone."""
+        sessions: list[tuple[str, SessionData]] = []
+        for sid in await self._user_session_ids(user_id):
+            session = await self.storage.get(sid, SessionData)
+            if session is None:
+                await self.storage.remove_from_user_index(user_id, sid)
+            else:
+                sessions.append((sid, session))
+        return sessions
+
     async def _user_session_ids(self, user_id: Any) -> list[str]:
         """User's session ids, or ``[]`` when the backend can't index by user.
 
@@ -416,19 +507,12 @@ class SessionManager:
             return []
 
     async def _enforce_session_limit(self, user_id: Any) -> None:
-        ids = await self._user_session_ids(user_id)
-        active: list[SessionData] = []
-        for sid in ids:
-            session = await self.storage.get(sid, SessionData)
-            if session is not None:
-                active.append(session)
+        active = await self._user_sessions(user_id)
         if len(active) >= self.max_sessions:
-            active.sort(key=lambda s: s.last_activity)
+            active.sort(key=lambda pair: pair[1].last_activity)
             excess = len(active) - self.max_sessions + 1
-            for session in active[:excess]:
-                await self.terminate_session(
-                    session.session_id, reason="session_limit", user_id=session.user_id
-                )
+            for sid, session in active[:excess]:
+                await self._terminate(sid, session, reason="session_limit")
 
     async def cleanup_expired_sessions(self, force: bool = False) -> None:
         """Proactively sweep idle-expired sessions (throttled by ``cleanup_interval``).
@@ -462,7 +546,7 @@ class SessionManager:
             sid = key[len(self.storage.prefix) :] if key.startswith(self.storage.prefix) else key
             session = await self.storage.get(sid, SessionData)
             if session is not None and self._is_idle_expired(session, now):
-                await self.terminate_session(sid, reason="session_timeout", user_id=session.user_id)
+                await self._terminate(sid, session, reason="session_timeout")
 
     # --- login lockout -------------------------------------------------------
     async def track_login_attempt(

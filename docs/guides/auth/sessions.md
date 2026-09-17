@@ -117,8 +117,20 @@ CookieConfig(secure=True, samesite="lax", path="/")
 ```
 
 `secure=True` (the default) means the cookies are only sent over HTTPS. For local development
-over plain HTTP, set `secure=False` so the browser will store them. Use `samesite="none"`
-(with `secure=True`) only if your frontend is on a different site than your API.
+over plain HTTP, set `secure=False` so the browser will store them. `SessionTransport` rejects
+`samesite="none"`: session cookies stay `lax` or `strict`, so the frontend and the API must be on
+the same site (for example `app.example.com` and `api.example.com`). For a frontend on another
+site, use a [bearer token](bearer.md).
+
+`POST /login` refuses a request the browser marks `Sec-Fetch-Site: cross-site` with `403`, so
+another site can't sign a visitor into an account it controls. `POST /logout` clears the session
+cookies, and the bearer refresh cookie when a `BearerTransport` with `refresh="cookie"` is
+configured. It also works after the session expired: there is nothing left to protect, so it
+just clears the cookies.
+
+A session remembers the user's `token_version` from login. A password reset or change bumps it,
+which ends every other session, including one whose login checked the old password just before
+the reset and was stored just after.
 
 ## Multi-device sessions
 
@@ -130,9 +142,9 @@ out everywhere" on top of `auth.sessions`:
 async def list_sessions(user: Principal = Depends(auth.current_user())):
     return await auth.sessions.list_for_user(user.user_id)
 
-@app.post("/account/sessions/{session_id}/revoke")
-async def revoke_session(session_id: str, user: Principal = Depends(auth.current_user())):
-    await auth.sessions.revoke(session_id, owner_id=user.user_id)  # owner check prevents cross-user revoke
+@app.post("/account/sessions/{session}/revoke")
+async def revoke_session(session: str, user: Principal = Depends(auth.current_user())):
+    await auth.sessions.revoke_by_handle(session, owner_id=user.user_id)
 
 @app.post("/account/sign-out-everywhere")
 async def sign_out_all(user: Principal = Depends(auth.current_user())):

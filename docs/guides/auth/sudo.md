@@ -58,7 +58,9 @@ async def close_account(
 
 Repeated wrong passwords trip a dedicated sudo lockout, keyed separately from the login
 lockout so one can't mask the other. Once tripped, `elevate()` raises `SudoLockoutError`
-(`429` with a `Retry-After` header) and any standing elevation is cleared.
+(`429` with a `Retry-After` header), and the elevation on the session that tripped it is cleared.
+Other sessions keep an elevation they already hold until it expires. Attempts are counted before
+the password is checked, so concurrent guesses can't exceed the limit.
 
 ## Auditing
 

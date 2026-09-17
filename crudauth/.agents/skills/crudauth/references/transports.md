@@ -57,7 +57,14 @@ auth = CRUDAuth(..., transports=[SessionTransport(), BearerTransport()])
 - Both yield the same `Principal`, so `current_user()` accepts either. Narrow a route with
   `current_user(transport="bearer")` / `"session"` / `["session", "bearer"]`.
 - **CSRF is a session-transport property only** — enforced on cookie mutations, irrelevant to bearer.
-  Your API paths never deal with CSRF; your browser paths are protected automatically.
+  A request carrying both a session cookie and a bearer token authenticates by whichever transport is
+  listed first; with the session first, its mutations need `X-CSRF-Token`.
+- `/login` (and `/token` with `refresh="cookie"`) refuse `Sec-Fetch-Site: cross-site` with `403`.
+- `/logout` clears every transport's cookies, including the bearer refresh cookie; a bearer-only app
+  with `refresh="cookie"` gets its own `POST /logout` for that. After idle expiry, `/logout` just
+  clears the cookies.
+- A session stores the user's `token_version` at login; a password reset or change (which bumps it)
+  ends every other session even one created from a password check that raced the reset.
 
 ## Custom transport
 
