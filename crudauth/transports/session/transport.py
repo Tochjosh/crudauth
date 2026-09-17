@@ -21,13 +21,13 @@ from ...constants import (
     SECONDS_PER_MINUTE,
 )
 from ...core import AuthContext, AuthRuntime, CookieConfig, Transport
-from ...exceptions import CSRFException
+from ...exceptions import CSRFException, ForbiddenException
 from ...hooks import HookContext
 from ...principal import Principal
 from ...storage import get_session_storage
 from ...storage.backends.redis import redis_client_from_url
 from ...storage.constants import BACKEND_MEMORY, BACKEND_REDIS
-from ...utils import get_client_ip
+from ...utils import get_client_ip, is_cross_site
 from .constants import (
     CSRF_HEADER_NAME,
     CSRF_STORAGE_PREFIX,
@@ -36,7 +36,6 @@ from .constants import (
     SESSION_STORAGE_PREFIX,
 )
 from .manager import SessionManager
-from .schemas import SessionData
 
 __all__ = ["SessionTransport"]
 
@@ -209,7 +208,9 @@ class SessionTransport(Transport):
         Returns ``None`` when no session cookie is present or the session is
         invalid/idle-expired (try the next transport). On a present, valid
         session it enforces CSRF for unsafe methods (raising on failure) and
-        returns the [Principal][crudauth.principal.Principal].
+        returns the [Principal][crudauth.principal.Principal]. A session bound to
+        a ``token_version`` the user has since moved past (a password reset or
+        change) also returns ``None``.
         """
         assert self.manager is not None
         session_id = request.cookies.get(self.manager.session_cookie_name)
@@ -227,6 +228,8 @@ class SessionTransport(Transport):
 
         user = await ctx.resolve_user(session.user_id)
         if user is None or not ctx.repo.is_active(user):
+            return None
+        if session.token_version not in (None, ctx.repo.token_version(user)):
             return None
         return ctx.build_principal(
             user_id=ctx.repo.user_id(user),
@@ -266,6 +269,11 @@ class SessionTransport(Transport):
         if not await self.manager.validate_csrf_token(session_id, header):
             raise CSRFException("Invalid CSRF token")
 
+    def clear_cookies(self, response: Response) -> None:
+        """Expire the session and CSRF cookies."""
+        assert self.manager is not None
+        self.manager.clear_session_cookies(response)
+
     # --- routes --------------------------------------------------------------
     def contributes_routes(self) -> APIRouter:
         router = APIRouter(tags=["auth"])
@@ -284,6 +292,8 @@ class SessionTransport(Transport):
 
             Subject to login lockout (shared with bearer ``/token``). ``remember_me``
             switches the cookie from session-scoped to a long persistent lifetime.
+            A request the browser marks ``Sec-Fetch-Site: cross-site`` gets a 403,
+            so another site can't sign the visitor into an account it controls.
 
             Note:
                 A disabled account returns the same "Incorrect username or
@@ -292,6 +302,8 @@ class SessionTransport(Transport):
                 server-side (``reason=disabled``) for operators.
             """
             assert self.manager is not None
+            if is_cross_site(request):
+                raise ForbiddenException("Cross-site login requests are not allowed.")
             ip = get_client_ip(request, runtime.trusted_proxy_hops)
             user = await runtime.authenticate_password(
                 db, form_data.username, form_data.password, request=request
@@ -299,7 +311,10 @@ class SessionTransport(Transport):
 
             metadata = {REMEMBER_ME_META_KEY: True} if remember_me else {}
             session_id, csrf = await self.manager.create_session(
-                request, user_id=runtime.repo.user_id(user), metadata=metadata
+                request,
+                user_id=runtime.repo.user_id(user),
+                metadata=metadata,
+                token_version=runtime.repo.token_version(user),
             )
             cookie_max_age = self.manager.timeout_seconds_for(metadata) if remember_me else None
             self.manager.set_session_cookies(response, session_id, csrf, max_age=cookie_max_age)
@@ -322,19 +337,27 @@ class SessionTransport(Transport):
 
         @router.post("/logout")
         async def logout(request: Request, response: Response, db: Annotated[Any, Depends(db_dep)]):
-            """Revoke the current session and clear its cookies (CSRF-protected)."""
+            """Revoke the current session and clear the auth cookies (CSRF-protected).
+
+            Clears every configured transport's cookies, including a bearer refresh
+            cookie. A session that already expired has nothing left to protect, so
+            its cookies are cleared without a CSRF check.
+            """
             assert self.manager is not None
             session_id = request.cookies.get(self.manager.session_cookie_name)
+            session = (
+                await self.manager.validate_session(session_id, update_activity=False)
+                if session_id
+                else None
+            )
             user_dict = None
-            if session_id:
+            if session_id and session is not None:
                 await self._enforce_csrf(request, session_id)
-                session = await self.manager.storage.get(session_id, SessionData)
-                if session is not None:
-                    user = await runtime.repo.get_by_id(db, session.user_id)
-                    if user is not None:
-                        user_dict = runtime.repo.to_dict(user)
+                user = await runtime.repo.get_by_id(db, session.user_id)
+                if user is not None:
+                    user_dict = runtime.repo.to_dict(user)
                 await self.manager.terminate_session(session_id, reason="logout")
-            self.manager.clear_session_cookies(response)
+            runtime.clear_cookies(response)
             if user_dict is not None:
                 await runtime.hooks.run_after_logout(
                     user_dict,

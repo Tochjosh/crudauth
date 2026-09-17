@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
 
 from ...constants import DEFAULT_SESSION_TTL_SECONDS, USER_INDEX_TTL_BUFFER_SECONDS
 from ..base import AbstractSessionStorage, T
@@ -38,8 +38,8 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
         index is written before a record, an index entry is only removed with the
         record it points at, and every activity update puts the session back in the
         index and extends the index's TTL. A leftover entry points at a record that
-        no longer exists and is skipped when sessions are listed. Needs Redis 7.0+
-        for ``EXPIRE NX``/``GT``.
+        no longer exists; the session manager removes it the next time it reads the
+        user's sessions. Needs Redis 7.0+ for ``EXPIRE NX``/``GT``.
 
     Note:
         Pass an existing ``client=`` to share one connection pool with other
@@ -152,6 +152,49 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
             await self._index(user_id, session_id, ttl)
         return True
 
+    async def modify(
+        self,
+        session_id: str,
+        model_class: type[T],
+        change: Callable[[T], None],
+        reset_expiration: bool = True,
+        expiration: int | None = None,
+    ) -> T | None:
+        """Compare-and-set update: ``WATCH`` the key, apply ``change``, write in ``MULTI``.
+
+        Note:
+            A write to the key between the read and ``EXEC`` aborts the
+            transaction, and the value is read and changed again. The transaction
+            touches one key, so it stays within one hash slot on Redis Cluster. A
+            key deleted meanwhile stays deleted and ``None`` is returned.
+        """
+        from redis.exceptions import WatchError
+
+        key = self.get_key(session_id)
+        ttl = expiration if expiration is not None else self.expiration
+        async with self.client.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if raw is None:
+                        return None
+                    data = model_class.model_validate_json(raw)
+                    change(data)
+                    pipe.multi()
+                    if reset_expiration:
+                        pipe.set(key, data.model_dump_json().encode(), ex=ttl)
+                    else:
+                        pipe.set(key, data.model_dump_json().encode(), keepttl=True)
+                    await pipe.execute()
+                    break
+                except WatchError:
+                    continue
+        user_id = getattr(data, "user_id", None)
+        if user_id is not None:
+            await self._index(user_id, session_id, ttl)
+        return data
+
     async def delete(self, session_id: str, user_id: Any = None) -> bool:
         """Delete a session and drop it from its owner's index.
 
@@ -214,6 +257,16 @@ class RedisSessionStorage(AbstractSessionStorage[T]):
     async def get_user_sessions(self, user_id: Any) -> list[str]:
         members = await self.client.smembers(self._user_key(user_id))
         return [m.decode() if isinstance(m, bytes) else m for m in members]
+
+    async def remove_from_user_index(self, user_id: Any, session_id: str) -> None:
+        """Drop an index entry whose record expired.
+
+        Note:
+            A login writes its index entry before its record, so a prune can land
+            in between and unindex a session that is about to exist. Its first
+            activity update puts it back.
+        """
+        await self.client.srem(self._user_key(user_id), session_id)
 
     async def scan_keys(self, match: str | None = None) -> list[str]:
         pattern = match or f"{self.prefix}*"

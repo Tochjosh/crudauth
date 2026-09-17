@@ -50,6 +50,7 @@ async def test_logout_all_during_a_login_leaves_the_new_session_revocable(
     monkeypatch.setattr(client, "set", write)
 
     assert revoked_mid_login == [0]
+    assert await manager.validate_session(session_id, update_activity=True) is not None
     assert session_id in await manager.storage.get_user_sessions(7)
     assert await manager.revoke_all(7) == 1
     assert await manager.validate_session(session_id, update_activity=False) is None
@@ -61,19 +62,27 @@ async def test_a_revoke_during_an_activity_update_does_not_bring_the_session_bac
     client = fakeredis.aioredis.FakeRedis()
     manager = _manager(get_session, UserModel, client)
     session_id, _ = await manager.create_session(_request(), user_id=8)
-    write = client.set
+    open_pipeline = client.pipeline
     revoked_mid_update: list[int] = []
 
-    async def write_after_a_revoke(name: Any, *args: Any, **kwargs: Any) -> Any:
-        if not revoked_mid_update and str(name) == f"session:{session_id}":
-            revoked_mid_update.append(await manager.revoke_all(8))
-        return await write(name, *args, **kwargs)
+    def pipeline_revoking_before_exec(*args: Any, **kwargs: Any) -> Any:
+        pipe = open_pipeline(*args, **kwargs)
+        execute = pipe.execute
 
-    monkeypatch.setattr(client, "set", write_after_a_revoke)
-    await manager.validate_session(session_id, update_activity=True)
-    monkeypatch.setattr(client, "set", write)
+        async def revoke_then_execute(*execute_args: Any, **execute_kwargs: Any) -> Any:
+            if not revoked_mid_update and pipe.watching:
+                revoked_mid_update.append(await manager.revoke_all(8))
+            return await execute(*execute_args, **execute_kwargs)
+
+        monkeypatch.setattr(pipe, "execute", revoke_then_execute)
+        return pipe
+
+    monkeypatch.setattr(client, "pipeline", pipeline_revoking_before_exec)
+    touched = await manager.validate_session(session_id, update_activity=True)
+    monkeypatch.setattr(client, "pipeline", open_pipeline)
 
     assert revoked_mid_update == [1]
+    assert touched is None
     assert await manager.storage.get(session_id, SessionData) is None
     assert session_id not in await manager.storage.get_user_sessions(8)
 

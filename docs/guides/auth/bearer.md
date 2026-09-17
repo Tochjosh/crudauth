@@ -19,8 +19,8 @@ to mint a new access token.
 ## Access and refresh tokens
 
 <p align="center">
-  <img src="../../assets/diagrams/token-lifecycle-light.png#only-light" alt="One long-lived refresh token, stored in an httpOnly cookie and sent only to /refresh, mints many short-lived 15-minute access tokens that carry the scopes" width="100%">
-  <img src="../../assets/diagrams/token-lifecycle-dark.png#only-dark" alt="One long-lived refresh token, stored in an httpOnly cookie and sent only to /refresh, mints many short-lived 15-minute access tokens that carry the scopes" width="100%">
+  <img src="../../assets/diagrams/token-lifecycle-light.png#only-light" alt="One long-lived refresh token, stored in an httpOnly cookie that /refresh reads, mints many short-lived 15-minute access tokens that carry the scopes" width="100%">
+  <img src="../../assets/diagrams/token-lifecycle-dark.png#only-dark" alt="One long-lived refresh token, stored in an httpOnly cookie that /refresh reads, mints many short-lived 15-minute access tokens that carry the scopes" width="100%">
 </p>
 
 The access token is short-lived (15 minutes by default) and carries the scopes. The refresh

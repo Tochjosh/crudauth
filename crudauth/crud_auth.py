@@ -64,6 +64,7 @@ from .sudo import SudoConfig, SudoManager
 from .storage.constants import BACKEND_MEMORY, BACKEND_REDIS
 from .transports.bearer.transport import BearerTransport
 from .transports.session.constants import REMEMBER_ME_META_KEY
+from .transports.session.manager import SessionManager
 from .transports.session.transport import SessionTransport
 from .utils import (
     get_client_ip,
@@ -94,14 +95,16 @@ class _ChangePasswordIn(BaseModel):
 class SessionInfo(BaseModel):
     """One active session, as returned by ``GET /sessions`` (the opt-in management route).
 
-    ``device`` is the parsed user-agent info (browser/os/device flags), empty when
-    UA parsing isn't available; timestamps serialize to ISO-8601.
+    ``id`` is the session's public handle (the SHA-256 of its id), what
+    ``DELETE /sessions/{id}`` takes; the session id itself is the cookie value and
+    is never returned. ``device`` is the parsed user-agent info (browser/os/device
+    flags), empty when UA parsing isn't available; timestamps serialize to ISO-8601.
 
     Example:
         ```python
         # each entry in the GET /sessions response:
         SessionInfo(
-            session_id="9f3c...",
+            id="5d41...",
             device={"browser": "Chrome", "os": "macOS", "is_mobile": False},
             ip="203.0.113.7",
             created_at=created, last_activity=seen, current=True,
@@ -109,7 +112,7 @@ class SessionInfo(BaseModel):
         ```
     """
 
-    session_id: str
+    id: str
     device: dict[str, Any] = Field(default_factory=dict)
     ip: str = ""
     created_at: datetime
@@ -315,6 +318,7 @@ class CRUDAuth:
             ),
             trusted_proxy_hops=trusted_proxy_hops,
             redis_client=shared_redis,
+            transports=self.transports,
         )
         self._principals = PrincipalResolver(self.runtime)
         self._session_transport = next(
@@ -513,10 +517,16 @@ class CRUDAuth:
     @property
     def sessions(self):
         """The [SessionManager][crudauth.transports.session.manager.SessionManager] of the configured session transport."""
-        if self._session_transport is None or self._session_transport.manager is None:
+        if self._session_manager is None:
             raise RuntimeError(
                 "Session management requires a SessionTransport in transports=[...]."
             )
+        return self._session_manager
+
+    @property
+    def _session_manager(self) -> SessionManager | None:
+        if self._session_transport is None:
+            return None
         return self._session_transport.manager
 
     @property
@@ -574,7 +584,7 @@ class CRUDAuth:
             hooks=self.hooks,
             algorithm=algorithm,
             token_store=token_store,
-            session_manager=self.sessions if self._session_transport else None,
+            session_manager=self._session_manager,
             rate_limiter=self.runtime.rate_limiter,
             rate_limits=self._rate_limits,
             password_policy=self.password_policy,
@@ -1101,10 +1111,12 @@ class CRUDAuth:
                 db, user, {"hashed_password": get_password_hash(change.new_password)}
             )
             await self.repo.increment_token_version(db, user)
-            if self.sessions is not None:
-                await self.sessions.revoke_all(
-                    principal.user_id, exclude=principal.metadata.get("session_id")
-                )
+            sessions = self._session_manager
+            if sessions is not None:
+                current_sid = principal.metadata.get("session_id")
+                if current_sid:
+                    await sessions.set_token_version(current_sid, self.repo.token_version(user))
+                await sessions.revoke_all(principal.user_id, exclude=current_sid)
             await self.hooks.run_after_password_changed(
                 self.repo.to_dict(user),
                 db=db,
@@ -1148,17 +1160,17 @@ class CRUDAuth:
                 principal.user_id, current_session_id=principal.metadata.get("session_id")
             )
 
-        @router.delete("/sessions/{session_id}")
+        @router.delete("/sessions/{session_handle}")
         async def revoke_session(
-            session_id: str,
+            session_handle: str,
             response: Response,
             principal: Annotated[Principal, Depends(session_user)],
         ):
-            """Revoke one session by id (ownership-checked; 404 also covers 'not yours')."""
-            ok = await sessions.revoke(session_id, owner_id=principal.user_id)
-            if not ok:
+            """Revoke one session by the ``id`` listed in ``GET /sessions`` (404 also covers 'not yours')."""
+            if not await sessions.revoke_by_handle(session_handle, owner_id=principal.user_id):
                 raise NotFoundException("Session not found.")
-            if session_id == principal.metadata.get("session_id"):
+            current_sid = principal.metadata.get("session_id")
+            if current_sid and sessions.session_handle(current_sid) == session_handle:
                 sessions.clear_session_cookies(response)
             return {"detail": "Session revoked."}
 
@@ -1189,7 +1201,7 @@ class CRUDAuth:
             if cookie and await sessions.validate_csrf_token(session_id, cookie):
                 token = cookie
             else:
-                token = await sessions.regenerate_csrf_token(session.user_id, session_id)
+                token = await sessions.regenerate_csrf_token(session_id)
                 max_age = (
                     sessions.timeout_seconds_for(session.metadata)
                     if session.metadata.get(REMEMBER_ME_META_KEY)

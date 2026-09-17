@@ -12,7 +12,7 @@ import logging
 from collections.abc import Iterable
 from typing import Any
 
-from sqlalchemy import String, TypeDecorator, UniqueConstraint, select
+from sqlalchemy import String, TypeDecorator, UniqueConstraint, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .constants import (
@@ -441,7 +441,14 @@ class UserRepository:
         """
         if not self.has("token_version"):
             return
-        await self.update(db, user, {"token_version": self.token_version(user) + 1})
+        version = self._attr("token_version")
+        await db.execute(
+            update(self.model)
+            .where(self._attr("id") == self.user_id(user))
+            .values({self.col("token_version"): version + 1})
+        )
+        await db.commit()
+        await db.refresh(user)
 
     def to_dict(self, user: Any) -> dict[str, Any]:
         """Project a user row onto the logical contract (for hooks).

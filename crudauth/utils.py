@@ -23,6 +23,7 @@ __all__ = [
     "canonical_identifier",
     "mask_email",
     "get_client_ip",
+    "is_cross_site",
     "safe_redirect_path",
 ]
 
@@ -201,6 +202,14 @@ def canonical_identifier(identifier: str) -> str:
     ``@``) are left as-is, matching ``get_by_username`` which is case-sensitive.
     """
     return canonical_email(identifier) if "@" in identifier else identifier
+
+
+def is_cross_site(request: Request) -> bool:
+    """Whether the browser marked ``request`` as sent from another site (``Sec-Fetch-Site``).
+
+    A request without the header (an API client, an older browser) isn't cross-site.
+    """
+    return request.headers.get("sec-fetch-site") == "cross-site"
 
 
 def get_client_ip(request: Request, trusted_hops: int = 0) -> str:

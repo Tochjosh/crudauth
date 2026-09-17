@@ -34,10 +34,10 @@ class SessionData(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
     last_activity: datetime = Field(default_factory=_utcnow)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    token_version: int | None = None
 
 
 class CSRFToken(BaseModel):
     token: str
-    user_id: Any
     session_id: str
     expiry: datetime

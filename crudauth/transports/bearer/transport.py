@@ -12,10 +12,10 @@ from ...constants import (
     SECONDS_PER_DAY,
 )
 from ...core import AuthContext, AuthRuntime, CookieConfig, Transport
-from ...exceptions import UnauthorizedException
+from ...exceptions import ForbiddenException, UnauthorizedException
 from ...hooks import HookContext
 from ...principal import Principal
-from ...utils import get_client_ip
+from ...utils import get_client_ip, is_cross_site
 from .constants import (
     REFRESH_LOCATION_BODY,
     REFRESH_LOCATION_COOKIE,
@@ -178,12 +178,18 @@ class BearerTransport(Transport):
             as an httpOnly cookie or returned in the body per ``refresh=``.
             Subject to the shared login lockout.
 
+            With ``refresh="cookie"``, a request the browser marks
+            ``Sec-Fetch-Site: cross-site`` gets a 403, so another site can't plant
+            its refresh cookie in the visitor's browser.
+
             Note:
                 A disabled account returns the same "Incorrect username or
                 password" as bad credentials (no exists-but-disabled oracle for a
                 credential holder); the real reason is logged server-side
                 (``reason=disabled``).
             """
+            if self.refresh == REFRESH_LOCATION_COOKIE and is_cross_site(request):
+                raise ForbiddenException("Cross-site login requests are not allowed.")
             ip = get_client_ip(request, runtime.trusted_proxy_hops)
             user = await runtime.authenticate_password(
                 db, form_data.username, form_data.password, request=request
@@ -222,7 +228,30 @@ class BearerTransport(Transport):
             access = self._access_token(user, scopes)
             return {"access_token": access, "token_type": TOKEN_TYPE_BEARER}
 
+        if self.refresh == REFRESH_LOCATION_COOKIE and not any(
+            transport.name == "session" for transport in runtime.transports
+        ):
+
+            @router.post("/logout")
+            async def logout(response: Response):
+                """Clear the refresh-token cookie. With a session transport, its ``/logout`` does this."""
+                self.clear_cookies(response)
+                return {"detail": "Logged out"}
+
         return router
+
+    def clear_cookies(self, response: Response) -> None:
+        """Expire the refresh-token cookie (``refresh="cookie"`` only)."""
+        if self.refresh != REFRESH_LOCATION_COOKIE:
+            return
+        cookies = self.cookie_config()
+        response.delete_cookie(
+            self.refresh_cookie_name,
+            path=self.refresh_cookie_path or cookies.path,
+            secure=cookies.secure,
+            httponly=True,
+            samesite=cookies.samesite,
+        )
 
     # --- token issuance ------------------------------------------------------
     def issue_tokens(

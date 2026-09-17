@@ -35,9 +35,13 @@ for the calling session, so a "your devices" table is a single fetch:
 
 ```bash
 curl http://localhost:8000/sessions -b jar.txt
-# [{"session_id":"...","device":{"browser":"Chrome","os":"macOS",...},
+# [{"id":"...","device":{"browser":"Chrome","os":"macOS",...},
 #   "ip":"...","created_at":"...","last_activity":"...","current":true}, ...]
 ```
+
+`id` is a handle for the session, not the session id itself: the session id is the cookie value,
+so returning it would hand a stolen response every device's login. `DELETE /sessions/{id}` takes
+the handle.
 
 ## 3. Revoke a device, or sign out everywhere
 

@@ -51,9 +51,13 @@ You can also pass a list, `transport=["session", "bearer"]`, to accept a subset.
 ## CSRF stays where sessions are
 
 CSRF is a property of the session transport. It's enforced on cookie-authenticated mutations
-and is irrelevant to bearer requests, which don't ride a cookie. So your bearer API paths
-never deal with CSRF, while your browser paths are protected automatically. Nothing in your
-route code has to know the difference.
+and is irrelevant to bearer requests, which don't ride a cookie. The first transport whose
+credential is present authenticates the request, so a request that carries both a session cookie
+and a bearer token is a session request when `SessionTransport` comes first, and its mutations
+need the `X-CSRF-Token` header. A client that only sends the bearer token (a mobile app, a
+server, a frontend that doesn't send cookies to the API) never deals with CSRF. To have a
+request with both credentials authenticate by its token, list `BearerTransport` first or narrow
+the route with `current_user(transport="bearer")`.
 
 ---
 

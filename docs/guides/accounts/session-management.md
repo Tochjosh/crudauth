@@ -45,21 +45,26 @@ agent and a flag marking the current one:
 async def sessions(request: Request, user: Principal = Depends(auth.current_user())):
     current = request.cookies.get("session_id")
     return await auth.sessions.list_for_user(user.user_id, current_session_id=current)
-# [{ "session_id", "device", "ip", "created_at", "last_activity", "current" }, ...]
+# [{ "id", "device", "ip", "created_at", "last_activity", "current" }, ...]
 ```
+
+`id` is `auth.sessions.session_handle(session_id)`, a SHA-256 of the session id. The session id
+is the cookie value, so it never goes in a response.
 
 ## Revoke one session
 
-`revoke` takes an owner id so a user can only revoke their own sessions:
+`revoke_by_handle` takes the `id` from the list and an owner id, so a user can only revoke their
+own sessions:
 
 ```python
-@app.post("/account/sessions/{session_id}/revoke")
-async def revoke(session_id: str, user: Principal = Depends(auth.current_user())):
-    ok = await auth.sessions.revoke(session_id, owner_id=user.user_id)
+@app.post("/account/sessions/{session}/revoke")
+async def revoke(session: str, user: Principal = Depends(auth.current_user())):
+    ok = await auth.sessions.revoke_by_handle(session, owner_id=user.user_id)
     return {"revoked": ok}
 ```
 
-If `session_id` doesn't belong to `owner_id`, nothing is revoked and it returns `False`.
+If none of the owner's sessions has that handle, nothing is revoked and it returns `False`.
+`revoke(session_id, owner_id=...)` does the same with a real session id, for server-side code.
 
 ## Sign out everywhere
 

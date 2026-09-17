@@ -117,20 +117,27 @@ class SudoManager:
         user_id = self.repo.user_id(user)
 
         await self._guard_locked(user_id)
+        attempt = await self._count_attempt(user_id)
+        if attempt > self.config.max_attempts:
+            await self._lock(session_id, user_id)
 
         hashed = self.repo.get(user, "hashed_password", "") or ""
         if not verify_password(password, hashed):
-            await self._record_failure(session_id, user_id)
+            if attempt >= self.config.max_attempts:
+                await self._lock(session_id, user_id)
             raise UnauthorizedException("Incorrect password")
 
         await self._clear_failures(user_id)
         elevated_until = _utcnow() + timedelta(seconds=self.config.window_seconds)
-        session = await self.session_manager.storage.get(session_id, SessionData)
-        if session is None:
+
+        def stamp(session: SessionData) -> None:
+            session.metadata[SUDO_ELEVATED_UNTIL_META_KEY] = elevated_until.isoformat()
+
+        stamped = await self.session_manager.storage.modify(
+            session_id, SessionData, stamp, reset_expiration=False
+        )
+        if stamped is None:
             raise ForbiddenException("Session no longer exists.")
-        session.metadata[SUDO_ELEVATED_UNTIL_META_KEY] = elevated_until.isoformat()
-        ttl = self.session_manager.timeout_seconds_for(session.metadata)
-        await self.session_manager.storage.update(session_id, session, expiration=ttl)
 
         await self.hooks.run_after_sudo(
             self.repo.to_dict(user),
@@ -170,27 +177,30 @@ class SudoManager:
         if ttl > 0:
             raise SudoLockoutError("Too many attempts. Try again later.", retry_after=ttl)
 
-    async def _record_failure(self, session_id: str, user_id: Any) -> None:
-        """Count a wrong attempt; on the cap, lock sudo and drop the elevation."""
+    async def _count_attempt(self, user_id: Any) -> int:
+        """Count an attempt before checking the password, so concurrent guesses share the cap."""
         if self.backend is None:
-            return
-        count = await self.backend.increment(self._fail_key(user_id), 1, self.config.window_seconds)
-        if count >= self.config.max_attempts:
-            await self.backend.increment(self._lock_key(user_id), 1, self.config.lockout_seconds)
-            await self.backend.delete(self._fail_key(user_id))
-            await self._clear_elevation(session_id)
-            raise SudoLockoutError(
-                "Too many attempts. Try again later.", retry_after=self.config.lockout_seconds
-            )
+            return 0
+        return await self.backend.increment(self._fail_key(user_id), 1, self.config.window_seconds)
+
+    async def _lock(self, session_id: str, user_id: Any) -> None:
+        """Lock sudo, drop the elevation, and raise."""
+        assert self.backend is not None
+        await self.backend.increment(self._lock_key(user_id), 1, self.config.lockout_seconds)
+        await self.backend.delete(self._fail_key(user_id))
+        await self._clear_elevation(session_id)
+        raise SudoLockoutError(
+            "Too many attempts. Try again later.", retry_after=self.config.lockout_seconds
+        )
 
     async def _clear_failures(self, user_id: Any) -> None:
         if self.backend is not None:
             await self.backend.delete(self._fail_key(user_id))
 
     async def _clear_elevation(self, session_id: str) -> None:
-        session = await self.session_manager.storage.get(session_id, SessionData)
-        if session is None or SUDO_ELEVATED_UNTIL_META_KEY not in session.metadata:
-            return
-        del session.metadata[SUDO_ELEVATED_UNTIL_META_KEY]
-        ttl = self.session_manager.timeout_seconds_for(session.metadata)
-        await self.session_manager.storage.update(session_id, session, expiration=ttl)
+        def unstamp(session: SessionData) -> None:
+            session.metadata.pop(SUDO_ELEVATED_UNTIL_META_KEY, None)
+
+        await self.session_manager.storage.modify(
+            session_id, SessionData, unstamp, reset_expiration=False
+        )
