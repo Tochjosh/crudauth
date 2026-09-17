@@ -7,15 +7,22 @@ import functools
 import hashlib
 import inspect
 import secrets
+import unicodedata
 from typing import Any, Callable, overload
 from urllib.parse import urlsplit
 
 import bcrypt
 from fastapi import Request
+from fastapi.concurrency import run_in_threadpool
 
 __all__ = [
+    "normalize_password",
     "get_password_hash",
+    "get_password_hash_async",
     "verify_password",
+    "verify_password_async",
+    "verify_and_update_password",
+    "verify_and_update_password_async",
     "dummy_verify_password",
     "make_unusable_password",
     "is_unusable_password",
@@ -66,39 +73,130 @@ def _bcrypt_input(password: str) -> bytes:
     return base64.b64encode(digest)
 
 
+def normalize_password(password: str) -> str:
+    """Unicode-normalize a password (NFKC) so every way of typing it hashes the same.
+
+    ``é`` typed as one precomposed code point and as ``e`` plus a combining accent
+    normalize to the same string, as NIST SP 800-63B recommends.
+    """
+    return unicodedata.normalize("NFKC", password)
+
+
 def get_password_hash(password: str) -> str:
     """Hash a plaintext password with bcrypt (random salt per call).
 
-    The password is SHA-256 pre-hashed before bcrypt (see [_bcrypt_input]
-    [crudauth.utils._bcrypt_input]), so there is no effective length ceiling and
-    no silent truncation.
+    The password is NFKC-normalized (see [normalize_password]
+    [crudauth.utils.normalize_password]) and SHA-256 pre-hashed before bcrypt
+    (see [_bcrypt_input][crudauth.utils._bcrypt_input]), so there is no effective
+    length ceiling and no silent truncation. This call blocks for the bcrypt
+    work; use [get_password_hash_async][crudauth.utils.get_password_hash_async]
+    inside an async route.
 
     Example:
         ```python
         await auth.repo.create(db, {"email": e, "hashed_password": get_password_hash(pw)})
         ```
     """
-    hashed: bytes = bcrypt.hashpw(_bcrypt_input(password), bcrypt.gensalt())
+    hashed: bytes = bcrypt.hashpw(_bcrypt_input(normalize_password(password)), bcrypt.gensalt())
     return hashed.decode()
 
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a plaintext password against a bcrypt hash.
-
-    Returns ``False`` (rather than raising) when the stored hash is malformed,
-    so a corrupted row produces a clean "invalid password" path instead of a
-    500 - which would both leak information and be a DoS lever.
+async def get_password_hash_async(password: str) -> str:
+    """[get_password_hash][crudauth.utils.get_password_hash] in a worker thread, off the event loop.
 
     Example:
         ```python
-        if not verify_password(form.password, auth.repo.get(user, "hashed_password", "")):
+        hashed = await get_password_hash_async(pw)
+        await auth.repo.update(db, user, {"hashed_password": hashed})
+        ```
+    """
+    return await run_in_threadpool(get_password_hash, password)
+
+
+def _checkpw(password: str, hashed_password: str | None) -> bool:
+    try:
+        return bcrypt.checkpw(_bcrypt_input(password), (hashed_password or "").encode())
+    except (ValueError, TypeError):
+        bcrypt.checkpw(_bcrypt_input(""), _dummy_hash().encode())
+        return False
+
+
+def _matching_form(plain_password: str, hashed_password: str | None) -> str | None:
+    normalized = normalize_password(plain_password)
+    if _checkpw(normalized, hashed_password):
+        return normalized
+    if plain_password != normalized and _checkpw(plain_password, hashed_password):
+        return plain_password
+    return None
+
+
+def verify_password(plain_password: str, hashed_password: str | None) -> bool:
+    """Verify a plaintext password against a bcrypt hash.
+
+    The NFKC-normalized password is checked first, then the password as typed,
+    so hashes created before normalization keep verifying.
+
+    Returns ``False`` (rather than raising) when the stored hash is missing,
+    empty, the unusable sentinel, or malformed, so a corrupted row produces a
+    clean "invalid password" path instead of a 500. Those cases still pay a full
+    bcrypt verification, so an account without a verifiable hash answers in the
+    same time as one with a real hash. This call blocks for the bcrypt work; use
+    [verify_password_async][crudauth.utils.verify_password_async] inside an async
+    route.
+
+    Example:
+        ```python
+        if not verify_password(form.password, auth.repo.get(user, "hashed_password")):
             raise UnauthorizedException("Incorrect username or password")
         ```
     """
-    try:
-        return bcrypt.checkpw(_bcrypt_input(plain_password), hashed_password.encode())
-    except (ValueError, TypeError):
-        return False
+    return _matching_form(plain_password, hashed_password) is not None
+
+
+async def verify_password_async(plain_password: str, hashed_password: str | None) -> bool:
+    """[verify_password][crudauth.utils.verify_password] in a worker thread, off the event loop.
+
+    Example:
+        ```python
+        if not await verify_password_async(form.password, auth.repo.get(user, "hashed_password")):
+            raise UnauthorizedException("Incorrect username or password")
+        ```
+    """
+    return await run_in_threadpool(verify_password, plain_password, hashed_password)
+
+
+def verify_and_update_password(
+    plain_password: str, hashed_password: str | None
+) -> tuple[bool, str | None]:
+    """Verify a password and return a replacement hash when the stored one predates normalization.
+
+    Verification is the same as [verify_password][crudauth.utils.verify_password].
+
+    Returns:
+        ``(verified, new_hash)``. ``new_hash`` is a fresh hash of the normalized
+        password when the stored hash only matched the password as typed (a hash
+        created before normalization), and ``None`` otherwise.
+
+    Example:
+        ```python
+        verified, new_hash = verify_and_update_password(pw, auth.repo.get(user, "hashed_password"))
+        if verified and new_hash is not None:
+            await auth.repo.update(db, user, {"hashed_password": new_hash})
+        ```
+    """
+    matched = _matching_form(plain_password, hashed_password)
+    if matched is None:
+        return False, None
+    if matched == normalize_password(plain_password):
+        return True, None
+    return True, get_password_hash(plain_password)
+
+
+async def verify_and_update_password_async(
+    plain_password: str, hashed_password: str | None
+) -> tuple[bool, str | None]:
+    """[verify_and_update_password][crudauth.utils.verify_and_update_password] in a worker thread, off the event loop."""
+    return await run_in_threadpool(verify_and_update_password, plain_password, hashed_password)
 
 
 @functools.cache
@@ -114,9 +212,11 @@ def _dummy_hash() -> str:
 def dummy_verify_password(plain_password: str) -> None:
     """Run a throwaway bcrypt verification and discard the result.
 
-    Called on the user-not-found branch of login so the absent-user path pays
-    the same bcrypt cost as the existing-user path; without it, a missing
+    For a hand-written flow's user-not-found branch, so the absent-user path
+    pays the same bcrypt cost as the existing-user path; without it, a missing
     account returns measurably faster and becomes a user-enumeration oracle.
+    [verify_password][crudauth.utils.verify_password] with a ``None`` hash does
+    the same work.
     """
     verify_password(plain_password, _dummy_hash())
 

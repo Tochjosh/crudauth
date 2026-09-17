@@ -215,6 +215,10 @@ For the auth-critical flows, use the primitives that **carry** the hardening, no
 
 The exported pure helpers (`get_password_hash`, `verify_password`, `is_unusable_password`,
 `make_unusable_password`) round it out. Don't reassemble lockout/timing/non-enumeration by hand.
+In an async route use `await get_password_hash_async(...)` / `await verify_password_async(...)`:
+the sync pair runs bcrypt on the event loop and stalls every other request for its duration.
+Passwords are NFKC-normalized before hashing and verifying (the `PasswordPolicy` sees the normalized
+form too); pre-normalization hashes still verify and `authenticate_password` rehashes them on login.
 
 ---
 
