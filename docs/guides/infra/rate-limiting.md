@@ -63,6 +63,9 @@ Override them per action with `rate_limits={...}` on `CRUDAuth`:
 auth = CRUDAuth(..., rate_limits={"register": RateLimit(3, 600)})  # 3 signups / 10 min per IP
 ```
 
+`register` counts only signups that pass validation, so a rejected password doesn't use up the
+budget.
+
 ## Login lockout
 
 <p align="center">

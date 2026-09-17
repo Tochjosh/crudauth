@@ -9,6 +9,9 @@ VERIFY = "verify_email"
 RESET = "reset_password"
 CHANGE = "change_email"
 
+STATE_CLAIM = "state"
+STATE_DIGEST_CHARS = 32
+
 # The message kinds crudauth asks the adapter to deliver. ``verify_email`` is the
 # recovery-factor verification for an email-recovery app; ``verify_recovery`` is the
 # same for any other factor (so a non-email channel isn't handed an "email"-named
@@ -21,6 +24,7 @@ EmailKind = Literal[
     "change_email",
     "welcome",
     "existing_account",
+    "email_changed",
 ]
 EMAIL_KINDS: tuple[EmailKind, ...] = get_args(EmailKind)
 
@@ -40,3 +44,4 @@ SUBJECT_VERIFY = "Verify your email"
 SUBJECT_RESET = "Reset your password"
 SUBJECT_CHANGE = "Confirm your new email"
 SUBJECT_EXISTING_ACCOUNT = "You already have an account"
+SUBJECT_EMAIL_CHANGED = "Your email address was changed"

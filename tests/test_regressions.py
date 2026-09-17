@@ -31,7 +31,6 @@ from crudauth.oauth import (
 from crudauth.ratelimit import LockoutPolicy, MemoryRateLimiterBackend
 from crudauth.repository import UserRepository
 from crudauth.storage import get_session_storage
-from crudauth.transports.bearer.tokens import create_signed_token
 from crudauth.transports.session import SessionManager
 from crudauth.transports.session.schemas import SessionData
 from crudauth.utils import get_password_hash
@@ -462,12 +461,10 @@ async def test_email_change_token_survives_race(sessionmaker, UserModel) -> None
         # someone else already owns the target email
         await repo.create(db, {"email": "taken@x.com", "username": "other", "hashed_password": "h"})
 
-    token = create_signed_token(
-        "test-secret-key-0123456789-0123456789",
-        uid,
-        "change_email",
-        extra_claims={"new_email": "taken@x.com"},
-    )
+    async with sessionmaker() as db:
+        token = svc._mint_token(
+            "change_email", await repo.get_by_id(db, uid), 1, new_email="taken@x.com"
+        )
     async with sessionmaker() as db:
         with pytest.raises(HTTPException) as exc:
             await svc.confirm_email_change(db, token)

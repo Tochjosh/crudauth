@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -23,11 +25,7 @@ from ..ratelimit import RateLimit
 from ..repository import UserRepository
 from ..password import PasswordContext, PasswordPolicy
 from ..storage.base import AbstractSessionStorage
-from ..transports.bearer.tokens import (
-    create_signed_token,
-    verify_signed_token,
-    verify_signed_token_full,
-)
+from ..transports.bearer.tokens import create_signed_token, verify_signed_token_full
 from ..utils import canonical_email, get_password_hash, verify_password
 from .channel import DeliveryChannel, DeliveryIntent, EmailChannel
 from .config import EmailConfig
@@ -37,6 +35,8 @@ from .constants import (
     EXISTING_ACCOUNT_ACTION,
     RESET,
     RESET_ACTION,
+    STATE_CLAIM,
+    STATE_DIGEST_CHARS,
     VERIFY,
     VERIFY_ACTION,
 )
@@ -63,6 +63,12 @@ class EmailFlowService:
     (in the router) and a **silent** per-target-email limit here - silent because
     a 429 on a victim's address would re-introduce the enumeration oracle and
     hand an attacker a DoS lever against that user.
+
+    Each token carries a fingerprint of the account state it authorizes (an
+    HMAC over, never a copy of, that state), so it stops working once that state
+    moves on: a reset token after the password or recovery value changes, an
+    email-change token after the password, email, or ``token_version`` changes,
+    and a verification token after the recovery value changes.
 
     Construction is additive: pass ``config=EmailConfig(...)`` (back-compat, which
     builds an [EmailChannel][crudauth.email.channel.EmailChannel] and seeds the
@@ -110,6 +116,7 @@ class EmailFlowService:
         if channels:
             channel_list.extend(channels)
         self._channels = channel_list
+        self._email_channels = [channel for channel in channel_list if channel.sends_email]
 
         self.verify_ttl_hours = self._resolve_ttl(
             verify_ttl_hours, config, "verify_ttl_hours", DEFAULT_VERIFY_TTL_HOURS
@@ -133,6 +140,12 @@ class EmailFlowService:
             return int(getattr(config, attr))
         return default
 
+    @property
+    def supports_email_change(self) -> bool:
+        """Whether change-email can run: the model has an ``email`` column and at
+        least one channel emails the recipient (``sends_email``)."""
+        return self.repo.has("email") and bool(self._email_channels)
+
     async def _deliver(self, intent: DeliveryIntent, db: AsyncSession | None) -> None:
         """Fire every configured channel best-effort, forwarding the request ``db``.
 
@@ -145,8 +158,13 @@ class EmailFlowService:
         and surfaces nothing - the ``request_*`` response is identical whether the
         user existed or not, and there is deliberately no "at least one succeeded"
         accounting (observing success would reopen the enumeration oracle).
+
+        A ``change_email`` intent goes only to the channels that email the
+        recipient: its token proves control of the new address, so it must not
+        reach a phone or any other destination a channel loads for itself.
         """
-        for channel in self._channels:
+        channels = self._email_channels if intent.kind == "change_email" else self._channels
+        for channel in channels:
             try:
                 await channel.deliver(intent, db)
             except Exception:
@@ -156,6 +174,53 @@ class EmailFlowService:
                     type(channel).__name__,
                     exc_info=True,
                 )
+
+    # --- account-state binding -----------------------------------------------
+    def _state_fingerprint(self, purpose: str, user: Any) -> str:
+        """HMAC, keyed by the app secret, over the account state a token of ``purpose`` authorizes."""
+        repo = self.repo
+        password_hash = repo.get(user, "hashed_password")
+        recovery_value = repo.get(user, repo.recovery) if repo.recovery is not None else None
+        state = {
+            VERIFY: [recovery_value],
+            RESET: [password_hash, recovery_value],
+            CHANGE: [password_hash, repo.get(user, "email"), repo.token_version(user)],
+        }[purpose]
+        message = json.dumps([purpose, *state], default=str).encode()
+        digest = hmac.new(self.secret_key.encode(), message, hashlib.sha256).hexdigest()
+        return digest[:STATE_DIGEST_CHARS]
+
+    def _mint_token(self, purpose: str, user: Any, expires_hours: int, **claims: Any) -> str:
+        """Sign a ``purpose`` token for ``user``, bound to the account's current state."""
+        return create_signed_token(
+            self.secret_key,
+            self.repo.user_id(user),
+            purpose,
+            expires_hours=expires_hours,
+            algorithm=self.algorithm,
+            extra_claims={**claims, STATE_CLAIM: self._state_fingerprint(purpose, user)},
+        )
+
+    async def _redeem_token(
+        self, db: AsyncSession, token: str, purpose: str
+    ) -> tuple[Any, dict[str, Any]]:
+        """Return the user and claims of a valid ``purpose`` token.
+
+        Raises:
+            BadRequestException: If the token is invalid or expired, its user is
+                gone, or the account has left the state the token was minted for.
+        """
+        payload = verify_signed_token_full(
+            token, self.secret_key, purpose, algorithm=self.algorithm
+        )
+        if payload is None:
+            raise BadRequestException("Invalid or expired token")
+        user = await self.repo.get_by_id(db, payload["sub"])
+        if user is None or not hmac.compare_digest(
+            str(payload.get(STATE_CLAIM, "")), self._state_fingerprint(purpose, user)
+        ):
+            raise BadRequestException("Invalid or expired token")
+        return user, payload
 
     # --- one-time-use guard --------------------------------------------------
     async def _consume(self, token: str, ttl_seconds: int) -> bool:
@@ -188,8 +253,9 @@ class EmailFlowService:
         )
         return not limited
 
-    async def notify_existing_account(self, email: str) -> None:
-        """Tell an existing owner someone tried to register with their email.
+    async def notify_existing_account(self, value: str) -> None:
+        """Tell an existing owner someone tried to register with their email or
+        recovery value (``value``, which is also the notice's recipient).
 
         Lets registration stay non-enumerable: the API responds identically
         whether or not the email was already taken, and the real owner gets a
@@ -206,11 +272,11 @@ class EmailFlowService:
             victim's address. A throttled send is a silent no-op - the route
             still returns its uniform response, preserving non-enumeration.
         """
-        if not await self._email_within_limit(EXISTING_ACCOUNT_ACTION, email):
+        if not await self._email_within_limit(EXISTING_ACCOUNT_ACTION, value):
             return
         await self._deliver(
             DeliveryIntent(
-                kind="existing_account", token=None, user={}, recipient=email, expires_in=0
+                kind="existing_account", token=None, user={}, recipient=value, expires_in=0
             ),
             None,
         )
@@ -231,13 +297,7 @@ class EmailFlowService:
         user = await self.repo.get_by_field(db, factor, value)
         if user is None or self.repo.recovery_verified(user):
             return
-        token = create_signed_token(
-            self.secret_key,
-            self.repo.user_id(user),
-            VERIFY,
-            expires_hours=self.verify_ttl_hours,
-            algorithm=self.algorithm,
-        )
+        token = self._mint_token(VERIFY, user, self.verify_ttl_hours)
         await self._deliver(
             DeliveryIntent(
                 kind="verify_email" if factor == "email" else "verify_recovery",
@@ -260,16 +320,12 @@ class EmailFlowService:
             The verified user row.
 
         Raises:
-            BadRequestException: If the token is invalid, expired, or already used.
+            BadRequestException: If the token is invalid, expired, or already used,
+                or the recovery value changed since it was sent.
         """
-        sub = verify_signed_token(token, self.secret_key, VERIFY, algorithm=self.algorithm)
-        if sub is None:
-            raise BadRequestException("Invalid or expired token")
+        user, _ = await self._redeem_token(db, token, VERIFY)
         if not await self._consume(token, self.verify_ttl_hours * SECONDS_PER_HOUR):
             raise BadRequestException("Token already used")
-        user = await self.repo.get_by_id(db, sub)
-        if user is None:
-            raise BadRequestException("Invalid or expired token")
         if not self.repo.recovery_verified(user):
             await self.repo.mark_recovery_verified(db, user)
             await self.hooks.run_after_recovery_verified(
@@ -289,13 +345,7 @@ class EmailFlowService:
         user = await self.repo.get_by_field(db, factor, value)
         if user is None:
             return
-        token = create_signed_token(
-            self.secret_key,
-            self.repo.user_id(user),
-            RESET,
-            expires_hours=self.reset_ttl_hours,
-            algorithm=self.algorithm,
-        )
+        token = self._mint_token(RESET, user, self.reset_ttl_hours)
         await self._deliver(
             DeliveryIntent(
                 kind="reset_password",
@@ -319,7 +369,8 @@ class EmailFlowService:
             The updated user row.
 
         Raises:
-            BadRequestException: If the token is invalid, expired, or already used.
+            BadRequestException: If the token is invalid, expired, or already used,
+                or the password or recovery value changed since it was sent.
             PasswordPolicyException: If ``new_password`` fails the password policy. The
                 token isn't used up, so the user can retry with a stronger password.
 
@@ -332,12 +383,7 @@ class EmailFlowService:
             column; without it (a custom model that omits it) only sessions are
             evicted.
         """
-        sub = verify_signed_token(token, self.secret_key, RESET, algorithm=self.algorithm)
-        if sub is None:
-            raise BadRequestException("Invalid or expired token")
-        user = await self.repo.get_by_id(db, sub)
-        if user is None:
-            raise BadRequestException("Invalid or expired token")
+        user, _ = await self._redeem_token(db, token, RESET)
         await self.password_policy.enforce(
             new_password, PasswordContext.for_user(self.repo, "reset", user), field="new_password"
         )
@@ -382,14 +428,7 @@ class EmailFlowService:
         if not await self._email_within_limit(CHANGE_ACTION, new_email_c):
             return
         if await self.repo.get_by_email(db, new_email_c) is None:
-            token = create_signed_token(
-                self.secret_key,
-                self.repo.user_id(user),
-                CHANGE,
-                expires_hours=self.change_ttl_hours,
-                algorithm=self.algorithm,
-                extra_claims={"new_email": new_email_c},
-            )
+            token = self._mint_token(CHANGE, user, self.change_ttl_hours, new_email=new_email_c)
             await self._deliver(
                 DeliveryIntent(
                     kind="change_email",
@@ -408,7 +447,8 @@ class EmailFlowService:
             The confirmation link is delivered to, and clicked from, the new
             address, so completing this flow proves control of it - the new email
             is therefore marked verified (``email_verified=True``) alongside the
-            address update.
+            address update. The previous address, if any, gets an ``email_changed``
+            notice, so an owner learns their address was replaced.
 
         Note:
             Availability is re-checked before consuming the token so a token
@@ -417,24 +457,31 @@ class EmailFlowService:
             A concurrent confirm to the same address surfaces as ``IntegrityError``,
             which is caught and surfaced as a clean duplicate error.
         """
-        payload = verify_signed_token_full(token, self.secret_key, CHANGE, algorithm=self.algorithm)
-        if payload is None:
-            raise BadRequestException("Invalid or expired token")
+        user, payload = await self._redeem_token(db, token, CHANGE)
         new_email = canonical_email(payload.get("new_email"))
         if not new_email:
             raise BadRequestException("Invalid token")
         if await self.repo.get_by_email(db, new_email) is not None:
             raise DuplicateValueException("Email already in use")
-        user = await self.repo.get_by_id(db, payload["sub"])
-        if user is None:
-            raise BadRequestException("Invalid or expired token")
         if not await self._consume(token, self.change_ttl_hours * SECONDS_PER_HOUR):
             raise BadRequestException("Token already used")
+        old_email = self.repo.get(user, "email")
         try:
             await self.repo.update(db, user, {"email": new_email, "email_verified": True})
         except IntegrityError as exc:
             await db.rollback()
             raise DuplicateValueException("Email already in use") from exc
+        if old_email:
+            await self._deliver(
+                DeliveryIntent(
+                    kind="email_changed",
+                    token=None,
+                    user=self.repo.to_dict(user),
+                    recipient=old_email,
+                    expires_in=0,
+                ),
+                db,
+            )
         await self.hooks.run_after_email_changed(
             self.repo.to_dict(user), db=db, context=HookContext()
         )

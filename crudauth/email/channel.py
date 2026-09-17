@@ -12,11 +12,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from .config import EmailConfig
 from .constants import (
     SUBJECT_CHANGE,
+    SUBJECT_EMAIL_CHANGED,
     SUBJECT_EXISTING_ACCOUNT,
     SUBJECT_RESET,
     SUBJECT_VERIFY,
@@ -44,17 +45,22 @@ class DeliveryIntent:
     Attributes:
         kind: Which message this is (``verify_email`` for an email-recovery verify,
             ``verify_recovery`` for any other factor, ``reset_password`` /
-            ``change_email`` / ``existing_account``). A non-email channel branches on
-            this to pick its own medium-appropriate copy.
-        token: The signed token, or ``None`` for ``existing_account`` (a notice
-            with no action).
+            ``change_email``, or the ``existing_account`` / ``email_changed``
+            notices). A non-email channel branches on this to pick its own
+            medium-appropriate copy.
+        token: The signed token, or ``None`` for a notice (``existing_account``,
+            ``email_changed``), which has no action.
         user: The logical-contract user dict (``repo.to_dict``); empty for the
             ``existing_account`` notice. Contract fields only, so an app column
             (``phone``, ``whatsapp_id``, ...) is NOT here - load it off the ``db``
             handed to [deliver][crudauth.email.channel.DeliveryChannel.deliver].
-        recipient: The resolved recovery destination (the email today; for an
-            email change, the NEW address). A non-email channel typically ignores
-            this and loads its own destination off the user.
+        recipient: Where the message is addressed. For verify, reset and
+            ``existing_account`` it's the recovery factor's value (an email
+            address for email recovery, a phone number for phone recovery). For
+            ``change_email`` it's the NEW email address, and only channels with
+            ``sends_email`` receive that kind, since its token must reach that
+            address and nothing else. For ``email_changed`` it's the previous
+            email address.
         expires_in: Token lifetime in seconds (``0`` when ``token`` is ``None``).
     """
 
@@ -72,6 +78,12 @@ class DeliveryChannel(ABC):
     channel, so raise freely on failure (it never surfaces and never stops the
     next channel). Reliability (retry/queue) belongs inside a channel.
 
+    Attributes:
+        sends_email: Whether this channel emails ``intent.recipient``. Only such
+            channels receive ``change_email``, and change-email mounts only when
+            one is configured. [EmailChannel][crudauth.email.channel.EmailChannel]
+            sets it; set it on a custom channel that emails the recipient.
+
     Example:
         ```python
         class SMSChannel(DeliveryChannel):
@@ -84,6 +96,8 @@ class DeliveryChannel(ABC):
         ```
     """
 
+    sends_email: ClassVar[bool] = False
+
     @abstractmethod
     async def deliver(self, intent: DeliveryIntent, db: AsyncSession | None) -> None:
         """Route, render, and send ``intent``.
@@ -91,8 +105,8 @@ class DeliveryChannel(ABC):
         Raise on failure (crudauth swallows per channel). Must not assume email;
         read ``intent.recipient`` / ``intent.user``.
 
-        ``db`` is the request-scoped session for the actionable flows (verify /
-        reset / change), or ``None`` for the ``existing_account`` notice. Use it
+        ``db`` is the request-scoped session for verify / reset / change and the
+        ``email_changed`` notice, or ``None`` for the ``existing_account`` notice. Use it
         to load an app column you need (e.g.
         ``await db.get(User, intent.user["id"])`` for a phone number). It must be
         used **synchronously** and never committed or captured for deferred work:
@@ -110,6 +124,19 @@ _EMAIL_SPECS: dict[str, tuple[str, str, str]] = {
     "change_email": (SUBJECT_CHANGE, "change_path", "Confirm your new email:"),
 }
 
+_EMAIL_NOTICES: dict[str, tuple[str, str]] = {
+    "existing_account": (
+        SUBJECT_EXISTING_ACCOUNT,
+        "Someone tried to register with this email. You already have an account - "
+        "sign in or reset your password at {frontend_url}.",
+    ),
+    "email_changed": (
+        SUBJECT_EMAIL_CHANGED,
+        "The email address on your account was changed. If you didn't make this "
+        "change, sign in at {frontend_url} to secure your account.",
+    ),
+}
+
 
 class EmailChannel(DeliveryChannel):
     """The built-in channel: renders crudauth's recovery copy and calls the
@@ -119,22 +146,22 @@ class EmailChannel(DeliveryChannel):
     was pluggable; the subject/body/link building lives here now.
     """
 
+    sends_email = True
+
     def __init__(self, config: EmailConfig):
         self._config = config
 
     async def deliver(self, intent: DeliveryIntent, db: AsyncSession | None) -> None:
         cfg = self._config
-        if intent.kind == "existing_account":
+        if intent.kind in _EMAIL_NOTICES:
+            subject, body = _EMAIL_NOTICES[intent.kind]
             await cfg.sender.send(
                 to=intent.recipient,
-                subject=SUBJECT_EXISTING_ACCOUNT,
-                body=(
-                    "Someone tried to register with this email. You already have an "
-                    f"account - sign in or reset your password at {cfg.frontend_url}."
-                ),
-                kind="existing_account",
+                subject=subject,
+                body=body.format(frontend_url=cfg.frontend_url),
+                kind=intent.kind,
                 context=EmailContext(
-                    kind="existing_account", link=None, recipient=intent.recipient, expires_in=0
+                    kind=intent.kind, link=None, recipient=intent.recipient, expires_in=0
                 ),
             )
             return
@@ -146,7 +173,6 @@ class EmailChannel(DeliveryChannel):
             subject=subject,
             body=f"{prefix} {link}",
             kind=intent.kind,
-            # context.link is the SAME assembled URL as in body (one source), never the bare token.
             context=EmailContext(
                 kind=intent.kind,
                 link=link,

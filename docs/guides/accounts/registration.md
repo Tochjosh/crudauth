@@ -96,9 +96,17 @@ ids, the PK) is dropped and warned, never set.
 ## Duplicate emails
 
 Registering with an address that already exists returns the same generic response as a new
-signup, so the endpoint isn't a user-enumeration oracle. If email is configured, the existing
-account receives a security notice (throttled per address), not a welcome. A unique-constraint
-race resolves to that same clean duplicate response rather than a 500.
+signup, so the endpoint isn't a user-enumeration oracle. The same holds for the recovery value
+when it isn't a login field (an email that only recovers a username account, or a phone number)
+and for any other unique column you let registration write. If delivery is configured, the owner
+of a taken email or recovery value receives a security notice (throttled per address), not a
+welcome. Both paths hash the password, so they take the same time too. A username is a public
+handle, so a taken one is reported. A unique-constraint race resolves to that same clean
+duplicate response rather than a 500.
+
+The `register` rate limit counts only signups that pass validation (the body, the password
+policy and the column lengths), so someone retrying a rejected password doesn't use up the
+budget.
 
 ---
 

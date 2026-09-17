@@ -21,8 +21,8 @@ auth = CRUDAuth(..., email=EmailConfig(
 ```
 
 `email=` mounts the recovery routes. crudauth composes `subject` + a plain-text `body` (the link
-included) and calls `send`. **Prefer enqueueing over blocking on SMTP** — registration sends are
-best-effort (failure logged), but verify/reset/change can surface a raised send as a 5xx.
+included) and calls `send`. **Prefer enqueueing over blocking on SMTP** — the request waits on it;
+a raised send is logged and swallowed on every flow, so the message is lost unless the queue retries.
 
 ### EmailContext — render your own HTML (since 0.4)
 
@@ -31,8 +31,8 @@ best-effort (failure logged), but verify/reset/change can surface a raised send 
 ```python
 @dataclass(frozen=True)
 class EmailContext:
-    kind: EmailKind        # verify_email | verify_recovery | reset_password | change_email | existing_account
-    link: str | None       # assembled URL, token embedded; None for existing_account
+    kind: EmailKind        # verify_email | verify_recovery | reset_password | change_email | existing_account | email_changed
+    link: str | None       # assembled URL, token embedded; None for the existing_account / email_changed notices
     recipient: str
     expires_in: int        # seconds; 0 when link is None
 ```
@@ -57,7 +57,7 @@ from crudauth import DeliveryChannel, DeliveryIntent
 class SmsChannel(DeliveryChannel):
     async def deliver(self, intent: DeliveryIntent, db) -> None:
         if intent.token is None:
-            return  # existing_account notice has no action
+            return  # existing_account / email_changed notices have no action
         msg = f"Verify: https://app/recover?token={intent.token}" if intent.kind == "verify_recovery" \
               else f"Reset: https://app/recover?token={intent.token}"
         await sms_client.send(to=intent.recipient, body=msg)
@@ -74,8 +74,11 @@ auth = CRUDAuth(..., channels=[SmsChannel()])
   freely on a provider error: it never surfaces to the caller (no enumeration oracle) and never stops
   the next channel.
 - For a non-email recovery factor, verification arrives as `kind="verify_recovery"` (not the
-  email-named `verify_email`). `reset_password` / `change_email` / `existing_account` are factor-neutral
-  in name.
+  email-named `verify_email`). `reset_password` / `existing_account` are factor-neutral in name.
+- `recipient` is the recovery value (email or phone) for verify/reset/existing_account, the new address
+  for `change_email`, the previous address for `email_changed`.
+- `change_email` reaches only channels with `sends_email = True` (the built-in `EmailChannel` sets it);
+  set it on a custom channel that emails `recipient`. Change-email routes mount only if one exists.
 
 ## Endpoints and flows
 
@@ -87,7 +90,7 @@ Mounted by `email=` (and/or `channels=` when there's a recovery factor):
 | `POST /email/verify-confirm` | `{"token": ...}` | marks the factor verified |
 | `POST /password/reset-request` | `{"<factor>": ...}` | |
 | `POST /password/reset-confirm` | `{"token", "new_password"}` | evicts the user's other sessions |
-| `POST /email/change-request` | `{"new_email", "password"}` | authenticated; mounts only when the model has an `email` column |
+| `POST /email/change-request` | `{"new_email", "password"}` | authenticated; mounts only when the model has an `email` column and a `sends_email` channel |
 | `POST /email/change-confirm` | `{"token"}` | |
 
 ## Security rules
@@ -98,3 +101,8 @@ Mounted by `email=` (and/or `channels=` when there's a recovery factor):
 - A successful **password reset bumps `token_version`**, revoking the user's outstanding bearer tokens
   and other sessions.
 - The `{factor}_verified` flag is set only by redeeming the delivered token; it is unsettable at signup.
+- **Tokens are bound to account state** (an HMAC claim): a reset link dies when the password or recovery
+  value changes, a change-email link when the password, email or `token_version` changes, a verify link
+  when the address changes. A confirmed email change notifies the old address (`email_changed`).
+- `/register` returns the same `202` for a taken email/recovery value/other unique column as for a new
+  signup (a taken username is reported), and the `register` limit counts only validated signups.

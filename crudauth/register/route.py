@@ -17,7 +17,6 @@ from ..exceptions import DuplicateValueException, ValueTooLongException
 from ..hooks import HookContext
 from ..password import PasswordContext
 from ..provisioning import NewUserContext, resolve_new_user_fields
-from ..ratelimit import KeyBy
 from ..utils import get_client_ip, get_password_hash
 
 __all__ = ["RegisterIn", "build_register_route"]
@@ -58,7 +57,7 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
         "RegisterIn", __base__=RegisterIn, password=(auth.password_policy.body_field(), ...)
     )
 
-    @router.post("/register", dependencies=[Depends(auth.rate_limit("register", key=KeyBy.IP))])
+    @router.post("/register")
     async def register(
         body: RegisterModel,  # type: ignore[valid-type]
         request: Request,
@@ -80,12 +79,19 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
 
         Note:
             When email is configured, a brand-new and an already-registered email
-            return the SAME ``202`` + body (the new user gets a verification mail,
-            the owner of an existing address gets a notice) so the response can't
-            confirm whether an account exists. With no email
+            or recovery value return the SAME ``202`` + body (the new user gets a
+            verification message, the owner of the existing value gets a notice),
+            and so does any other unique-constraint collision, so the response
+            can't confirm whether an account exists. Both paths hash the password
+            once, so timing doesn't tell them apart either. With no email
             channel, dev mode surfaces the duplicate instead - there's no way to
             both not-leak and tell a genuine new user. A username collision is
             always allowed to surface (public namespace).
+
+        Note:
+            The ``register`` rate limit counts only requests that pass validation
+            (the body schema, the password policy, and column lengths), so a user
+            retrying a rejected password isn't locked out of signing up.
         """
         ip = get_client_ip(request, auth.runtime.trusted_proxy_hops)
         email_on = auth._email_service is not None
@@ -108,6 +114,16 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
         }
         if too_long:
             raise ValueTooLongException(too_long)
+        await auth._apply_rate_limit(
+            request, response, "register", ip, auth._rate_limits["register"], None
+        )
+        hashed_password = get_password_hash(password)
+        unique_values = {
+            field: value
+            for field, value in {**login_values, **data}.items()
+            if value is not None and auth.repo.is_unique_column(field)
+        }
+        private_fields = {"email", auth.identity.recovery}
 
         async def _send_best_effort(coro: Awaitable[Any]) -> None:
             """Dispatch a registration email without letting a send failure fail
@@ -125,13 +141,20 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
             except Exception:
                 logger.warning("crudauth: registration email failed to send", exc_info=True)
 
+        def _enrolled() -> dict[str, Any]:
+            response.status_code = status.HTTP_202_ACCEPTED
+            return {"detail": _ENROLLED_DETAIL}
+
         async def _on_existing() -> dict[str, Any]:
-            """Uniform response when the email/username is already taken.
+            """Uniform response when a submitted unique value is already taken.
 
             Shared by the read-time pre-check and the ``IntegrityError``
             race-recovery so a concurrent duplicate yields the same clean result
             (202 when email is configured, else a duplicate error) instead of a
-            500, and non-enumeration is preserved.
+            500, and non-enumeration is preserved. The email and the recovery
+            value notify their owner; a login field such as ``username`` always
+            surfaces (public namespace); any other unique column is ``202`` too
+            when email is configured.
 
             Note:
                 The trailing "Account already exists" raise is reached only if a
@@ -139,28 +162,24 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
                 was deleted between detection and this re-query) - a rare race, not
                 dead code.
             """
-            for login_field in login_fields:
-                if await auth.repo.get_by_field(db, login_field, login_values[login_field]) is None:
+            for field, value in unique_values.items():
+                if await auth.repo.get_by_field(db, field, value) is None:
                     continue
-                if login_field == "email":
+                if field in private_fields:
                     if email_on:
-                        await _send_best_effort(
-                            auth._email_service.notify_existing_account(login_values["email"])
-                        )
-                        response.status_code = status.HTTP_202_ACCEPTED
-                        return {"detail": _ENROLLED_DETAIL}
-                    raise DuplicateValueException("Email already registered")
-                raise DuplicateValueException(f"{login_field.capitalize()} already taken")
+                        await _send_best_effort(auth._email_service.notify_existing_account(value))
+                        return _enrolled()
+                    raise DuplicateValueException(f"{field.capitalize()} already registered")
+                if email_on and field not in login_fields:
+                    return _enrolled()
+                raise DuplicateValueException(f"{field.capitalize()} already taken")
             raise DuplicateValueException("Account already exists")
 
-        for login_field in login_fields:
-            if await auth.repo.get_by_field(db, login_field, login_values[login_field]) is not None:
+        for field, value in unique_values.items():
+            if await auth.repo.get_by_field(db, field, value) is not None:
                 return await _on_existing()
 
-        create_data: dict[str, Any] = {
-            **login_values,
-            "hashed_password": get_password_hash(password),
-        }
+        create_data: dict[str, Any] = {**login_values, "hashed_password": hashed_password}
         create_data.update(data)
         create_data.update(auth._new_user_defaults)
         create_data.update(
@@ -199,8 +218,7 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
                     db, auth.repo.get(user, auth.identity.recovery)
                 )
             )
-            response.status_code = status.HTTP_202_ACCEPTED
-            return {"detail": _ENROLLED_DETAIL}
+            return _enrolled()
         return {
             "id": auth.repo.user_id(user),
             "email": auth.repo.get(user, "email"),
