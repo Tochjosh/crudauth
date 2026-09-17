@@ -50,7 +50,7 @@ class MfaConfig:
     """
 
     issuer: str
-    encryption_key: str | Sequence[str]
+    encryption_key: str | bytes | Sequence[str | bytes]
     required: MfaRequirement = False
     oauth: bool = False
     challenge_ttl_seconds: int = DEFAULT_CHALLENGE_TTL_SECONDS
@@ -68,7 +68,10 @@ class MfaConfig:
 
     @property
     def encryption_keys(self) -> list[str]:
-        """``encryption_key`` as a list, the encrypting key first."""
-        if isinstance(self.encryption_key, str):
-            return [self.encryption_key] if self.encryption_key else []
-        return list(self.encryption_key)
+        """``encryption_key`` as a list of strings, the encrypting key first."""
+        keys = (
+            [self.encryption_key]
+            if isinstance(self.encryption_key, (str, bytes))
+            else list(self.encryption_key)
+        )
+        return [key.decode() if isinstance(key, bytes) else key for key in keys if key]

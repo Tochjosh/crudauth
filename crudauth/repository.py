@@ -478,7 +478,7 @@ class UserRepository:
             .where(
                 self._attr("id") == self.user_id(user), or_(last_step.is_(None), last_step < step)
             )
-            .values({self.col("totp_last_step"): step})
+            .values({last_step: step})
         )
         await db.commit()
         await db.refresh(user)
@@ -497,7 +497,7 @@ class UserRepository:
         result = await db.execute(
             update(self.model)
             .where(self._attr("id") == self.user_id(user), matches)
-            .values({self.col(logical): value})
+            .values({column: value})
         )
         await db.commit()
         await db.refresh(user)

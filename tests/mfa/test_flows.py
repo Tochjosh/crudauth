@@ -16,12 +16,15 @@ from crudauth import (
     BearerTransport,
     CookieConfig,
     CRUDAuth,
+    EmailConfig,
+    EmailSender,
     MfaConfig,
     OAuthCredentials,
     Principal,
     SessionTransport,
     SudoConfig,
 )
+from crudauth.mfa.constants import MFA_FIELDS
 from crudauth.oauth import AbstractOAuthProvider, OAuthProviderFactory, OAuthUserInfo
 from crudauth.ratelimit import LockoutConfig
 from crudauth.storage.backends.memory import MemorySessionStorage
@@ -534,7 +537,7 @@ class _Provider(AbstractOAuthProvider):
     ("oauth_mfa", "mode"), [(True, "redirect"), (True, "json"), (False, "redirect")]
 )
 async def test_oauth_logins_are_challenged_only_when_configured(
-    build, monkeypatch, oauth_mfa: bool, mode: str
+    build, monkeypatch, mfa_sessionmaker, oauth_mfa: bool, mode: str
 ) -> None:
     monkeypatch.setitem(OAuthProviderFactory._providers, "stub", _Provider)
     config = MfaConfig(issuer="Acme", encryption_key=MFA_KEY, oauth=oauth_mfa)
@@ -545,6 +548,9 @@ async def test_oauth_logins_are_challenged_only_when_configured(
         redirect_base_url="http://test",
         oauth_response_mode=mode,
     )
+    async with mfa_sessionmaker() as db:
+        user = await auth.repo.get_by_username(db, "alice")
+        await auth.repo.update(db, user, {"email_verified": True})
     async with browser:
         authorize = await browser.get("/oauth/stub/authorize?redirect_to=/dashboard")
         url = authorize.json()["url"] if mode == "json" else authorize.headers["location"]
@@ -658,3 +664,121 @@ async def test_concurrent_wrong_codes_share_the_attempt_cap(build, monkeypatch) 
     await auth.shutdown()
 
     assert len(checked) <= 3
+
+
+class _ResetSender(EmailSender):
+    def __init__(self) -> None:
+        self.tokens: dict[str, str] = {}
+
+    async def send(self, *, to, subject, body, kind, context):
+        self.tokens[kind] = body.split("token=")[-1]
+
+
+async def test_a_password_reset_discards_a_pending_enrollment_secret(build) -> None:
+    sender = _ResetSender()
+    config = MfaConfig(issuer="Acme", encryption_key=MFA_KEY, required=True)
+    auth, app = build(mfa=config, email=EmailConfig(sender=sender, frontend_url="https://app"))
+    await auth.initialize()
+    async with client(app) as intruder, client(app) as owner:
+        seen_by_intruder = (await register_and_login(intruder)).json()["setup"]["secret"]
+        await owner.post("/password/reset-request", json={"email": "alice@x.com"})
+        await owner.post(
+            "/password/reset-confirm",
+            json={"token": sender.tokens["reset_password"], "new_password": "owner-new-pw-1"},
+        )
+        owner_login = await owner.post(
+            "/login", data={"username": "alice", "password": "owner-new-pw-1"}
+        )
+        stale = await intruder.post(
+            "/mfa/challenge", json={"challenge": owner_login.json()["challenge"]}
+        )
+    await auth.shutdown()
+
+    assert owner_login.json()["setup"]["secret"] != seen_by_intruder
+    assert stale.json()["setup"]["secret"] == owner_login.json()["setup"]["secret"]
+
+
+async def test_an_oauth_claim_removes_mfa_set_up_by_whoever_registered_the_account(
+    build, monkeypatch, mfa_sessionmaker
+) -> None:
+    monkeypatch.setitem(OAuthProviderFactory._providers, "stub", _Provider)
+    auth, app, browser, secret, _ = await _enrolled_app(
+        build,
+        oauth={"stub": OAuthCredentials(client_id="id", client_secret="s")},
+        redirect_base_url="http://test",
+    )
+    async with browser:
+        authorize = await browser.get("/oauth/stub/authorize")
+        state = parse_qs(urlparse(authorize.headers["location"]).query)["state"][0]
+        await browser.get(f"/oauth/stub/callback?code=abc&state={state}")
+    async with mfa_sessionmaker() as db:
+        user = await auth.repo.get_by_username(db, "alice")
+    await auth.shutdown()
+
+    assert auth.mfa is not None and not auth.mfa.is_enrolled(user)
+    assert all(auth.repo.get(user, field) is None for field in MFA_FIELDS)
+
+
+async def test_redis_challenges_leave_no_per_user_index(build) -> None:
+    redis = fakeredis.aioredis.FakeRedis()
+    auth, app, browser, secret, _ = await _enrolled_app(build, redis_client=redis)
+    async with browser:
+        token = (await _login(browser)).json()["challenge"]
+        during = await redis.keys("mfa_challenge*")
+        await browser.post("/mfa/verify", json={"challenge": token, "code": code_for(secret)})
+        after = await redis.keys("mfa_challenge*")
+    await auth.shutdown()
+
+    assert len(during) == 1
+    assert after == []
+
+
+async def test_a_refused_cross_site_verify_does_not_use_an_attempt(build) -> None:
+    config = MfaConfig(issuer="Acme", encryption_key=MFA_KEY, max_code_attempts=1)
+    auth, app, browser, secret, _ = await _enrolled_app(build, mfa=config)
+    async with browser:
+        token = (await _login(browser)).json()["challenge"]
+        body = {"challenge": token, "code": code_for(secret)}
+        refused = await browser.post(
+            "/mfa/verify", json=body, headers={"Sec-Fetch-Site": "cross-site"}
+        )
+        verified = await browser.post("/mfa/verify", json=body)
+    await auth.shutdown()
+
+    assert (refused.status_code, verified.status_code) == (403, 200)
+
+
+def test_a_bytes_encryption_key_is_accepted_and_still_compared_to_the_secret_key(
+    mfa_session,
+) -> None:
+    key = Fernet.generate_key()
+    auth = CRUDAuth(
+        session=mfa_session,
+        user_model=MfaUser,
+        SECRET_KEY=SECRET,
+        mfa=MfaConfig(issuer="Acme", encryption_key=key),
+    )
+
+    assert auth.mfa is not None
+    with pytest.raises(ValueError, match="differ from SECRET_KEY"):
+        CRUDAuth(
+            session=mfa_session,
+            user_model=MfaUser,
+            SECRET_KEY=key.decode(),
+            mfa=MfaConfig(issuer="Acme", encryption_key=key),
+        )
+
+
+async def test_a_password_reset_voids_an_outstanding_challenge(build, mfa_sessionmaker) -> None:
+    auth, app, browser, secret, _ = await _enrolled_app(build)
+    async with browser:
+        token = (await _login(browser)).json()["challenge"]
+        async with mfa_sessionmaker() as db:
+            user = await auth.repo.get_by_username(db, "alice")
+            await auth.repo.increment_token_version(db, user)
+        verified = await browser.post(
+            "/mfa/verify", json={"challenge": token, "code": code_for(secret)}
+        )
+    await auth.shutdown()
+
+    assert verified.status_code == 400

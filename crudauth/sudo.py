@@ -79,12 +79,12 @@ class SudoManager:
     def __init__(
         self,
         *,
-        session_manager: "SessionManager",
-        repo: "UserRepository",
-        backend: "RateLimiterBackend | None",
-        hooks: "AuthHooks",
+        session_manager: SessionManager,
+        repo: UserRepository,
+        backend: RateLimiterBackend | None,
+        hooks: AuthHooks,
         config: SudoConfig,
-        mfa: "MfaService | None" = None,
+        mfa: MfaService | None = None,
     ):
         self.session_manager = session_manager
         self.repo = repo
@@ -93,7 +93,7 @@ class SudoManager:
         self.config = config
         self.mfa = mfa
 
-    def _session_id(self, principal: "Principal") -> str:
+    def _session_id(self, principal: Principal) -> str:
         """The principal's session id, or raise 403 for a non-session credential."""
         session_id = principal.metadata.get("session_id")
         if principal.transport != SessionTransport.name or not session_id:
@@ -102,12 +102,12 @@ class SudoManager:
 
     async def elevate(
         self,
-        principal: "Principal",
+        principal: Principal,
         password: str | None = None,
         *,
         code: str | None = None,
-        db: "AsyncSession | None" = None,
-        request: "Request | None" = None,
+        db: AsyncSession | None = None,
+        request: Request | None = None,
     ) -> datetime:
         """Re-verify ``password``, or an authenticator ``code``, and stamp the session as elevated.
 
@@ -165,7 +165,7 @@ class SudoManager:
         return elevated_until
 
     async def _verify(
-        self, user: Any, password: str | None, code: str | None, db: "AsyncSession | None"
+        self, user: Any, password: str | None, code: str | None, db: AsyncSession | None
     ) -> bool:
         if code is not None and self.mfa is not None and db is not None:
             return await self.mfa.verify_totp(db, user, code)
@@ -173,7 +173,7 @@ class SudoManager:
             password, self.repo.get(user, "hashed_password")
         )
 
-    async def is_elevated(self, principal: "Principal") -> bool:
+    async def is_elevated(self, principal: Principal) -> bool:
         """Whether the principal's session holds an unexpired sudo elevation."""
         session_id = principal.metadata.get("session_id")
         if principal.transport != SessionTransport.name or not session_id:

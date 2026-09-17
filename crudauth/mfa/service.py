@@ -74,9 +74,9 @@ class MfaService:
     def __init__(
         self,
         *,
-        runtime: "AuthRuntime",
+        runtime: AuthRuntime,
         config: MfaConfig,
-        challenge_store: "AbstractSessionStorage[MfaChallenge]",
+        challenge_store: AbstractSessionStorage[MfaChallenge],
     ):
         self.runtime = runtime
         self.repo = runtime.repo
@@ -114,6 +114,7 @@ class MfaService:
         }
 
     def _secret(self, user: Any) -> str | None:
+        """The confirmed authenticator's secret, or ``None`` if it can't be decrypted."""
         token = self.repo.get(user, "totp_secret_encrypted")
         if not token:
             return None
@@ -138,11 +139,11 @@ class MfaService:
         }
 
     # --- codes ---------------------------------------------------------------
-    async def _accept_totp(self, db: "AsyncSession", user: Any, secret: str, code: str) -> bool:
+    async def _accept_totp(self, db: AsyncSession, user: Any, secret: str, code: str) -> bool:
         step = matching_step(secret, code)
         return step is not None and await self.repo.claim_totp_step(db, user, step)
 
-    async def verify_totp(self, db: "AsyncSession", user: Any, code: str) -> bool:
+    async def verify_totp(self, db: AsyncSession, user: Any, code: str) -> bool:
         """Check a code from the enrolled authenticator, claiming its time step.
 
         A step is accepted once, so the same code (or an older one) fails afterwards.
@@ -153,7 +154,7 @@ class MfaService:
         return secret is not None and await self._accept_totp(db, user, secret, code)
 
     async def verify_code(
-        self, db: "AsyncSession", user: Any, code: str, *, context: HookContext | None = None
+        self, db: AsyncSession, user: Any, code: str, *, context: HookContext | None = None
     ) -> bool:
         """Check an authenticator code, or else consume a recovery code.
 
@@ -164,7 +165,7 @@ class MfaService:
         return await self._consume_recovery_code(db, user, code, context or HookContext())
 
     async def _consume_recovery_code(
-        self, db: "AsyncSession", user: Any, code: str, context: HookContext
+        self, db: AsyncSession, user: Any, code: str, context: HookContext
     ) -> bool:
         if not self.is_enrolled(user):
             return False
@@ -185,7 +186,7 @@ class MfaService:
         return False
 
     # --- enrollment ----------------------------------------------------------
-    async def begin_setup(self, db: "AsyncSession", user: Any) -> dict[str, str]:
+    async def begin_setup(self, db: AsyncSession, user: Any) -> dict[str, str]:
         """Start (or restart) enrollment with a new secret.
 
         Returns:
@@ -200,27 +201,43 @@ class MfaService:
         await self._store_pending(db, user, secret)
         return self._setup_payload(user, secret)
 
-    async def _store_pending(self, db: "AsyncSession", user: Any, secret: str) -> None:
+    async def _store_pending(self, db: AsyncSession, user: Any, secret: str) -> None:
+        bound = f"{self.repo.token_version(user)}:{secret}"
         await self.repo.update(
             db,
             user,
             {
-                "totp_secret_encrypted": self._cipher.encrypt(secret),
+                "totp_secret_encrypted": self._cipher.encrypt(bound),
                 "totp_confirmed_at": None,
                 "totp_last_step": None,
                 "mfa_recovery_codes": None,
             },
         )
 
-    async def _pending_secret(self, db: "AsyncSession", user: Any) -> str:
-        secret = self._secret(user)
+    def _pending_secret(self, user: Any) -> str | None:
+        """The secret of an unconfirmed setup, if the credentials haven't changed since.
+
+        A pending secret is stored with the ``token_version`` it was issued under, so
+        a password reset or change discards it: whoever saw it before can't have it
+        confirmed by the owner afterwards.
+        """
+        token = self.repo.get(user, "totp_secret_encrypted")
+        if self.repo.get(user, "totp_confirmed_at") is not None or not token:
+            return None
+        version, _, secret = (self._cipher.decrypt(token) or "").partition(":")
+        if not secret or version != str(self.repo.token_version(user)):
+            return None
+        return secret
+
+    async def _pending_or_new_secret(self, db: AsyncSession, user: Any) -> str:
+        secret = self._pending_secret(user)
         if secret is None:
             secret = generate_secret()
             await self._store_pending(db, user, secret)
         return secret
 
     async def confirm_setup(
-        self, db: "AsyncSession", user: Any, code: str, *, context: HookContext | None = None
+        self, db: AsyncSession, user: Any, code: str, *, context: HookContext | None = None
     ) -> list[str]:
         """Enable the pending authenticator once a code from it checks out.
 
@@ -234,25 +251,31 @@ class MfaService:
         """
         if self.is_enrolled(user):
             raise BadRequestException("Two-factor authentication is already enabled.")
-        secret = self._secret(user)
+        secret = self._pending_secret(user)
         if secret is None:
             raise BadRequestException("No authenticator setup is pending.")
         if not await self._accept_totp(db, user, secret, code):
             raise UnauthorizedException("Invalid code")
-        return await self._enable(db, user, context or HookContext())
+        return await self._enable(db, user, secret, context or HookContext())
 
-    async def _enable(self, db: "AsyncSession", user: Any, context: HookContext) -> list[str]:
+    async def _enable(
+        self, db: AsyncSession, user: Any, secret: str, context: HookContext
+    ) -> list[str]:
         codes = generate_recovery_codes(self.config.recovery_code_count)
         await self.repo.update(
             db,
             user,
-            {"totp_confirmed_at": _utcnow(), "mfa_recovery_codes": hash_recovery_codes(codes)},
+            {
+                "totp_secret_encrypted": self._cipher.encrypt(secret),
+                "totp_confirmed_at": _utcnow(),
+                "mfa_recovery_codes": hash_recovery_codes(codes),
+            },
         )
         await self.hooks.run_after_mfa_enabled(self.repo.to_dict(user), db=db, context=context)
         return codes
 
     async def disable(
-        self, db: "AsyncSession", user: Any, *, context: HookContext | None = None
+        self, db: AsyncSession, user: Any, *, context: HookContext | None = None
     ) -> None:
         """Remove the authenticator and recovery codes (an admin reset calls this directly)."""
         await self.repo.update(
@@ -269,7 +292,7 @@ class MfaService:
             self.repo.to_dict(user), db=db, context=context or HookContext()
         )
 
-    async def regenerate_recovery_codes(self, db: "AsyncSession", user: Any) -> list[str]:
+    async def regenerate_recovery_codes(self, db: AsyncSession, user: Any) -> list[str]:
         """Replace every recovery code with a new set.
 
         Raises:
@@ -284,10 +307,10 @@ class MfaService:
     # --- login ---------------------------------------------------------------
     async def challenge_login(
         self,
-        db: "AsyncSession",
+        db: AsyncSession,
         user: Any,
         *,
-        request: "Request",
+        request: Request,
         transport: str,
         lockout_identifier: str,
         options: dict[str, Any],
@@ -314,12 +337,13 @@ class MfaService:
         if not enrolled and not await self.is_required(user):
             await self.runtime.record_login_success(ip_address, lockout_identifier)
             return None
-        setup_secret = None if enrolled else await self._pending_secret(db, user)
+        setup_secret = None if enrolled else await self._pending_or_new_secret(db, user)
         token = secrets.token_urlsafe(CHALLENGE_TOKEN_BYTES)
         ttl = self.config.challenge_ttl_seconds
         await self.challenges.create(
             MfaChallenge(
-                user_id=self.repo.user_id(user),
+                account_id=self.repo.user_id(user),
+                token_version=self.repo.token_version(user),
                 transport=transport,
                 setup=setup_secret is not None,
                 lockout_identifier=lockout_identifier,
@@ -334,7 +358,7 @@ class MfaService:
             body["setup"] = self._setup_payload(user, setup_secret)
         return body
 
-    async def describe_challenge(self, db: "AsyncSession", token: str) -> dict[str, Any]:
+    async def describe_challenge(self, db: AsyncSession, token: str) -> dict[str, Any]:
         """``{"setup": {"secret", "otpauth_uri"} | None}`` for a live challenge.
 
         For a frontend that received only the challenge token (an OAuth redirect)
@@ -344,20 +368,20 @@ class MfaService:
             BadRequestException: If the challenge doesn't exist.
         """
         challenge = await self.challenges.get(_challenge_key(token), MfaChallenge)
-        user = None if challenge is None else await self.repo.get_by_id(db, challenge.user_id)
-        if challenge is None or user is None:
+        user = None if challenge is None else await self.repo.get_by_id(db, challenge.account_id)
+        if challenge is None or user is None or not self.repo.is_active(user):
             raise BadRequestException(INVALID_CHALLENGE)
-        secret = self._secret(user) if challenge.setup else None
+        secret = self._pending_secret(user) if challenge.setup else None
         return {"setup": None if secret is None else self._setup_payload(user, secret)}
 
     async def complete_challenge(
         self,
-        db: "AsyncSession",
+        db: AsyncSession,
         token: str,
         code: str,
         *,
-        request: "Request",
-        response: "Response",
+        request: Request,
+        response: Response,
     ) -> dict[str, Any]:
         """Check the code for a challenge and issue the credential its login started.
 
@@ -372,12 +396,19 @@ class MfaService:
             enrollment and ``redirect_to`` for an OAuth login.
 
         Raises:
-            BadRequestException: Unknown, expired, used-up or exhausted challenge.
+            BadRequestException: Unknown, expired, used-up or exhausted challenge, or
+                the password was reset or changed since the challenge began.
             ForbiddenException: A cross-site request for a cookie-setting login.
             RateLimitException: The login lockout is engaged.
             UnauthorizedException: Wrong code.
         """
         key = _challenge_key(token)
+        pending = await self.challenges.get(key, MfaChallenge)
+        if pending is None:
+            raise BadRequestException(INVALID_CHALLENGE)
+        transport = self._transport(pending.transport)
+        if transport.sets_cookies and is_cross_site(request):
+            raise ForbiddenException("Cross-site login requests are not allowed.")
 
         def count_attempt(challenge: MfaChallenge) -> None:
             challenge.attempts += 1
@@ -387,9 +418,6 @@ class MfaService:
         )
         if challenge is None:
             raise BadRequestException(INVALID_CHALLENGE)
-        transport = self._transport(challenge.transport)
-        if transport.sets_cookies and is_cross_site(request):
-            raise ForbiddenException("Cross-site login requests are not allowed.")
         if challenge.attempts > self.config.max_code_attempts:
             await self.challenges.delete(key)
             raise BadRequestException(INVALID_CHALLENGE)
@@ -403,8 +431,12 @@ class MfaService:
                 raise RateLimitException(
                     "Too many login attempts. Try again later.", retry_after=retry_after
                 )
-        user = await self.repo.get_by_id(db, challenge.user_id)
-        if user is None or not self.repo.is_active(user):
+        user = await self.repo.get_by_id(db, challenge.account_id)
+        if (
+            user is None
+            or not self.repo.is_active(user)
+            or self.repo.token_version(user) != challenge.token_version
+        ):
             await self.challenges.delete(key)
             raise BadRequestException(INVALID_CHALLENGE)
 
@@ -414,8 +446,9 @@ class MfaService:
             transport=challenge.transport,
             request=request,
         )
+        secret = None
         if challenge.setup:
-            secret = None if self.is_enrolled(user) else self._secret(user)
+            secret = None if self.is_enrolled(user) else self._pending_secret(user)
             accepted = secret is not None and await self._accept_totp(db, user, secret, code)
         else:
             accepted = await self.verify_code(db, user, code, context=context)
@@ -426,7 +459,9 @@ class MfaService:
         if await self.challenges.get_and_delete(key, MfaChallenge) is None:
             raise BadRequestException(INVALID_CHALLENGE)
 
-        recovery_codes = await self._enable(db, user, context) if challenge.setup else None
+        recovery_codes = (
+            await self._enable(db, user, secret, context) if secret is not None else None
+        )
         await self.runtime.record_login_success(challenge.ip_address, challenge.lockout_identifier)
         body = await transport.complete_login(request, response, user, challenge.options)
         if recovery_codes is not None:
@@ -435,7 +470,7 @@ class MfaService:
             body["redirect_to"] = challenge.options["redirect_to"]
         return body
 
-    def _transport(self, name: str) -> "Transport":
+    def _transport(self, name: str) -> Transport:
         for transport in self.runtime.transports:
             if transport.name == name:
                 return transport

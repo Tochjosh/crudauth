@@ -58,8 +58,9 @@ fails with `email_unverified`:
 - If a user already exists with that email, the provider account is linked to it (the
   `{provider}_id` column is set), and the user can sign in by password or by that provider. If that
   user never verified its email, whoever registered it hasn't proven they own the address, so the
-  link also claims the account: the password becomes unusable, `token_version` is bumped, every
-  session is signed out, and the email is marked verified. The owner can set a password again with
+  link also claims the account: the password becomes unusable, any
+  [two-factor](mfa.md) enrollment is removed, `token_version` is bumped, every session is signed
+  out, and the email is marked verified. The owner can set a password again with
   a password reset. A user already linked to a different account of the same provider isn't
   relinked (`provider_already_linked`).
 - Otherwise a new user is created from the provider profile. Its username comes from the

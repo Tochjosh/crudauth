@@ -35,7 +35,7 @@ auth = CRUDAuth(
 other field, and `CRUDAuth` raises at startup if any is missing.
 
 `encryption_key` encrypts the authenticator secrets at rest, so a database leak doesn't hand out
-second factors. It's a Fernet key, and it must differ from `SECRET_KEY`:
+second factors. It's a Fernet key (a string or `bytes`), and it must differ from `SECRET_KEY`:
 
 ```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -99,7 +99,8 @@ login, `/mfa/verify` refuses a `Sec-Fetch-Site: cross-site` request, like `/logi
 
 Each code is six ASCII digits (spaces are ignored), valid for its 30-second step and one step either
 side for clock drift. A step is accepted once per account, so a code can't be replayed, even by two
-requests racing each other.
+requests racing each other. A password reset or change voids any challenge still waiting for its
+code.
 
 ## Required enrollment
 
@@ -113,10 +114,19 @@ the secret:
 
 The first valid code from the new authenticator both enrolls the account and finishes the login;
 that `/mfa/verify` response adds `recovery_codes`. If the user leaves before entering the code, the
-next login offers the same secret, so a QR code they already scanned keeps working. A required
-account can't disable MFA (`403`).
+next login offers the same secret, so a QR code they already scanned keeps working, until the
+password is reset or changed, which discards it.
+
+Enrolling during login trusts the password: whoever first completes that login with the right
+password chooses the authenticator. Turn `required` on for accounts whose passwords you trust, or
+have existing users enroll from a signed-in session (`/mfa/totp/setup`) before you require it. A
+required account can't disable MFA (`403`).
 
 ## Recovery codes, disabling
+
+Enabling MFA doesn't sign out the account's other sessions. If you want it to, revoke them in
+`on_after_mfa_enabled`. An account without a password (OAuth-only) enrolls without one, since there's
+nothing to check.
 
 `POST /mfa/recovery-codes/regenerate` replaces all recovery codes, and `POST /mfa/totp/disable` turns
 MFA off. Both take `{"code"}`: a current authenticator code, or a recovery code when the device is
@@ -132,7 +142,9 @@ until = await auth.sudo.elevate(user, code=body.code, db=db, request=request)
 
 ## OAuth
 
-OAuth logins skip MFA by default: the identity provider owns the second factor there. With
+OAuth logins skip MFA by default: the identity provider owns the second factor there. When an OAuth
+login [claims an account](oauth.md#account-linking) whose email was never verified, it also removes
+any MFA enrollment on it, since whoever registered that account set it up. With
 `MfaConfig(oauth=True)`, the callback returns a challenge for an account with MFA instead of a
 session. In JSON mode it's the challenge body; in redirect mode it's a redirect to
 `redirect_base_url#mfa_challenge=<challenge>`. For a setup challenge that arrives this way, `POST

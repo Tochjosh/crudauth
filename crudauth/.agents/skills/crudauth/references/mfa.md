@@ -23,16 +23,18 @@ Startup raises if a column is missing (map with `column_map=`), the key isn't a 
 
 - An enrolled account (or a required one) gets `{"mfa_required": true, "challenge", "expires_in"}` from
   `/login` / `/token` instead of a credential; a required, unenrolled account also gets
-  `setup: {"secret", "otpauth_uri"}` (the pending secret is reused if the login is retried).
+  `setup: {"secret", "otpauth_uri"}` (the pending secret is reused if the login is retried, until a
+  password reset or change discards it). Enrolling at login trusts the password.
 - `POST /mfa/verify {"challenge", "code"}` issues what the login started (session cookies or tokens) via
   the transport's `complete_login`; after setup it adds `recovery_codes`; `on_after_login` fires here.
 - Challenges: hashed in the session store, `challenge_ttl_seconds` (300), single use, dead after
   `max_code_attempts` (5) wrong codes. Wrong codes count against the login lockout; a correct password
-  doesn't clear it, a correct code does. Session challenges refuse `Sec-Fetch-Site: cross-site`.
+  doesn't clear it, a correct code does. Session challenges refuse `Sec-Fetch-Site: cross-site`. A
+  password reset or change (`token_version` bump) voids an outstanding challenge.
 - Codes: 6 ASCII digits (spaces ignored), 30 s steps, ±1 step drift, constant-time; a step is claimed
   atomically (`repo.claim_totp_step`), so no replay, even concurrently. A recovery code works in place
   of a code.
-- OAuth: skipped unless `MfaConfig(oauth=True)`; then the callback returns the challenge (JSON) or
+- OAuth: an OAuth claim of an unverified account removes its MFA enrollment. Skipped unless `MfaConfig(oauth=True)`; then the callback returns the challenge (JSON) or
   redirects to `redirect_base_url#mfa_challenge=...`. `POST /mfa/challenge {"challenge"}` returns
   `setup` details; the verify response carries `redirect_to`.
 - A hand-written login: `authenticate_password(..., record_success=False)`, then

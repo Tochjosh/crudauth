@@ -9,7 +9,7 @@ from ..exceptions import ForbiddenException, UnauthorizedException
 from ..hooks import HookContext
 from ..principal import Principal
 from ..ratelimit import KeyBy
-from ..utils import is_unusable_password, verify_password_async
+from ..utils import get_client_ip, is_unusable_password, verify_password_async
 from .service import MfaService
 
 __all__ = ["build_mfa_router"]
@@ -53,6 +53,7 @@ def build_mfa_router(*, auth: Any, service: MfaService) -> APIRouter:
 
     def _context(request: Request, principal: Principal) -> HookContext:
         return HookContext(
+            ip_address=get_client_ip(request, auth.runtime.trusted_proxy_hops),
             user_agent=request.headers.get("user-agent"),
             transport=principal.transport,
             request=request,
