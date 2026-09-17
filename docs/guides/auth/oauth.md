@@ -101,13 +101,77 @@ The state is used up either way, so a retry starts again from `authorize`.
 `GET /oauth/{provider}/authorize` stores a state entry per request, so it's rate limited per IP
 (`oauth_authorize`, 30 per hour by default; tune it with `rate_limits=`).
 
+## Any OpenID Connect provider
+
+Keycloak, Zitadel, Authentik, Auth0, Okta, Entra ID and anything else that speaks OpenID Connect
+needs no provider class. Give the credentials the provider's `issuer` and CRUDAuth reads its
+endpoints from `{issuer}/.well-known/openid-configuration`:
+
+```python
+auth = CRUDAuth(
+    session=get_session, user_model=User, SECRET_KEY="change-me",
+    redirect_base_url="https://app.example.com",
+    transports=[SessionTransport()],
+    oauth={
+        "keycloak": OAuthCredentials(
+            client_id="...",
+            client_secret="...",
+            issuer="https://sso.example.com/realms/main",
+        ),
+    },
+)
+```
+
+The key you choose is the provider name, so this one links accounts on a `keycloak_id` column and
+serves `/oauth/keycloak/authorize`. Scopes default to `openid profile email`; override them with
+`scopes=`. Leave `client_secret` out for a public PKCE client, as with any other provider.
+
+Discovery is a network call, so it runs when you start the app:
+
+```python
+@asynccontextmanager
+async def lifespan(app):
+    await auth.initialize()
+    yield
+    await auth.shutdown()
+```
+
+That's the same lifespan call Redis-backed storage needs. Without it the provider has no endpoints
+and says so on the first request rather than sending users somewhere empty.
+
+What the discovery step checks, because a wrong answer here would send your users' credentials to
+the wrong place:
+
+- The document must declare the same issuer you configured. A provider answering for someone else
+  is rejected at startup.
+- The issuer must be `https`, except on `localhost` and `127.0.0.1` for local development, and
+  can't carry a query or fragment.
+- The document must name an authorization, token and userinfo endpoint.
+- `email_verified` is honored exactly as the provider states it. A provider that doesn't claim a
+  verified email can't auto-link to an existing account (see [Account linking](#account-linking)).
+
+Client authentication follows what the document advertises: the secret rides in the request body
+(`client_secret_post`) unless the provider accepts only HTTP Basic (`client_secret_basic`).
+
+If you already know the endpoints, or you're driving OAuth yourself, build the provider directly:
+
+```python
+from crudauth.oauth import GenericOIDCProvider
+
+provider = await GenericOIDCProvider.from_discovery(
+    "https://sso.example.com/realms/main",
+    client_id, client_secret, "https://app.example.com/oauth/keycloak/callback",
+    provider_name="keycloak",
+)
+```
+
 ## Custom providers
 
-Add a provider by implementing the `AbstractOAuthProvider` port and registering it with
-`OAuthProviderFactory`, then pass its credentials in `oauth={...}` like the built-ins. Set
-`requires_client_secret = True` on the class if the provider never accepts a public client, so a
-missing secret fails at startup instead of at the first login. See the
-[OAuth reference](../../api/oauth.md) for the port and factory.
+A provider that isn't OpenID Connect (GitHub's OAuth, for instance) needs a class: implement the
+`AbstractOAuthProvider` port, register it with `OAuthProviderFactory`, then pass its credentials in
+`oauth={...}` like the built-ins. Set `requires_client_secret = True` on the class if the provider
+never accepts a public client, so a missing secret fails at startup instead of at the first login.
+See the [OAuth reference](../../api/oauth.md) for the port and factory.
 
 ## Custom paths and JSON responses
 

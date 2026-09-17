@@ -50,3 +50,13 @@ GITHUB_TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
 GITHUB_USERINFO_ENDPOINT = "https://api.github.com/user"
 GITHUB_EMAILS_ENDPOINT = "https://api.github.com/user/emails"
 GITHUB_DEFAULT_SCOPES = ["read:user", "user:email"]
+
+# Generic OIDC: the discovery path, the minimal scopes for a profile lookup, and
+# the hosts where a plain-http issuer is tolerated (local development).
+OIDC_DISCOVERY_PATH = "/.well-known/openid-configuration"
+OIDC_DEFAULT_SCOPES = ["openid", "profile", "email"]
+OIDC_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# Client authentication at the token endpoint, as named by OIDC Discovery.
+TOKEN_AUTH_POST = "client_secret_post"
+TOKEN_AUTH_BASIC = "client_secret_basic"

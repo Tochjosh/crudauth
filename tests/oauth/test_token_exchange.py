@@ -37,7 +37,8 @@ class IdentityProvider(AbstractOAuthProvider):
         )
 
 
-def _capture_provider_requests(monkeypatch) -> list[httpx.Request]:
+def _capture_provider_requests(provider: AbstractOAuthProvider) -> list[httpx.Request]:
+    """Serve the provider's token and userinfo endpoints, recording every request."""
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -46,12 +47,7 @@ def _capture_provider_requests(monkeypatch) -> list[httpx.Request]:
             return httpx.Response(200, json={"access_token": "tok", "token_type": "Bearer"})
         return httpx.Response(200, json={"sub": "idp-1", "email": "public@x.com"})
 
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        httpx,
-        "AsyncClient",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    provider.transport = httpx.MockTransport(handler)
     return requests
 
 
@@ -64,10 +60,10 @@ def _form(request: httpx.Request) -> dict[str, str]:
     [("s3cret", {"client_secret": "s3cret"}), ("", {})],
 )
 async def test_exchange_code_sends_the_secret_only_when_set(
-    monkeypatch, client_secret: str, expected: dict[str, str]
+    client_secret: str, expected: dict[str, str]
 ) -> None:
-    requests = _capture_provider_requests(monkeypatch)
     provider = IdentityProvider("cid", client_secret, "https://app/cb")
+    requests = _capture_provider_requests(provider)
 
     token = await provider.exchange_code("code-1", code_verifier="ver-1")
 
@@ -98,7 +94,7 @@ async def test_public_client_signs_in_without_a_secret(get_session, UserModel, m
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        requests = _capture_provider_requests(monkeypatch)
+        requests = _capture_provider_requests(auth.oauth_providers["stub"])
         authorize = await client.get("/oauth/stub/authorize")
         state = parse_qs(urlparse(authorize.headers["location"]).query)["state"][0]
         callback = await client.get(f"/oauth/stub/callback?code=abc&state={state}")

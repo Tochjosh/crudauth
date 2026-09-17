@@ -19,10 +19,27 @@ auth = CRUDAuth(
 )
 ```
 
-`OAuthCredentials(client_id, client_secret="", scopes=None)`; leave `client_secret` empty for a
-public (PKCE-only) client. Built-in providers: `"google"`, `"github"` (they self-register on import,
-and raise at startup without a secret). `AuthUserMixin` includes `google_id` / `github_id`; a custom
-shape needs `oauth=True`.
+`OAuthCredentials(client_id, client_secret="", scopes=None, issuer=None)`; leave `client_secret`
+empty for a public (PKCE-only) client. Built-in providers: `"google"`, `"github"` (they self-register
+on import, and raise at startup without a secret). `AuthUserMixin` includes `google_id` /
+`github_id`; a custom shape needs `oauth=True`.
+
+Any OIDC provider (Keycloak, Zitadel, Authentik, Auth0, Okta, Entra ID) needs no class — set
+`issuer` and `GenericOIDCProvider` is used:
+
+```python
+oauth={"keycloak": OAuthCredentials(client_id=..., client_secret=...,
+                                    issuer="https://sso.example.com/realms/main")}
+```
+
+The dict key is the provider name (`keycloak` -> `keycloak_id` column, `/oauth/keycloak/...`).
+Endpoints come from `{issuer}/.well-known/openid-configuration` during `await auth.initialize()`,
+so the lifespan call is required; the provider raises on first use if it was skipped. Startup
+rejects a document declaring a different issuer, a non-https issuer (except localhost), or a
+document missing an endpoint. Scopes default to `openid profile email`; client authentication
+follows the document (`client_secret_post`, or Basic when that's all the provider accepts);
+`email_verified` is used exactly as the provider states it. `GenericOIDCProvider.from_discovery(...)`
+builds one outside `CRUDAuth`.
 
 ## Endpoints and the button
 

@@ -28,6 +28,7 @@ class User(Base, AuthUserMixin):
     # (built-ins google_id/github_id come from AuthUserMixin).
     stub_id: Mapped[str | None] = mapped_column(default=None)
     redir_id: Mapped[str | None] = mapped_column(default=None)
+    oidc_id: Mapped[str | None] = mapped_column(default=None)
 
 
 @pytest_asyncio.fixture
