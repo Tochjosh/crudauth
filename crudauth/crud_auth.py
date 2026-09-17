@@ -75,7 +75,7 @@ __all__ = ["CRUDAuth"]
 TransportT = TypeVar("TransportT", bound=Transport)
 
 MEMORY_TOKEN_STORES = "one-time-token/OAuth-state stores"
-MEMORY_MFA_STORE = "MFA-challenge store"
+MEMORY_MFA_STORE = "MFA store"
 
 
 class CRUDAuth:
