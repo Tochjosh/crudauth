@@ -11,6 +11,7 @@ CHANGE = "change_email"
 
 STATE_CLAIM = "state"
 STATE_DIGEST_CHARS = 32
+REDIRECT_CLAIM = "redirect_to"
 
 # The message kinds crudauth asks the adapter to deliver. ``verify_email`` is the
 # recovery-factor verification for an email-recovery app; ``verify_recovery`` is the
