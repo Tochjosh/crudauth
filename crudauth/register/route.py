@@ -17,6 +17,7 @@ from ..exceptions import DuplicateValueException, ValueTooLongException
 from ..hooks import HookContext
 from ..password import PasswordContext
 from ..provisioning import NewUserContext, resolve_new_user_fields
+from ..ratelimit.dependency import enforce_rate_limit
 from ..utils import client_ip_key, get_client_ip, get_password_hash_async
 
 __all__ = ["RegisterIn", "build_register_route"]
@@ -94,7 +95,7 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
             retrying a rejected password isn't locked out of signing up.
         """
         ip = get_client_ip(request, auth.runtime.trusted_proxy_hops)
-        email_on = auth._email_service is not None
+        email_on = auth.emails is not None
         login_fields = auth.identity.login
         data = cast(BaseModel, body).model_dump()
         password = data.pop("password")
@@ -114,8 +115,13 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
         }
         if too_long:
             raise ValueTooLongException(too_long)
-        await auth._apply_rate_limit(
-            request, response, "register", client_ip_key(ip), auth._rate_limits["register"], None
+        await enforce_rate_limit(
+            auth.rate_limiter,
+            request,
+            response,
+            action="register",
+            identity=client_ip_key(ip),
+            limit=auth.rate_limits["register"],
         )
         hashed_password = await get_password_hash_async(password)
         unique_values = {
@@ -167,7 +173,7 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
                     continue
                 if field in private_fields:
                     if email_on:
-                        await _send_best_effort(auth._email_service.notify_existing_account(value))
+                        await _send_best_effort(auth.emails.notify_existing_account(value))
                         return _enrolled()
                     raise DuplicateValueException(f"{field.capitalize()} already registered")
                 if email_on and field not in login_fields:
@@ -181,7 +187,7 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
 
         create_data: dict[str, Any] = {**login_values, "hashed_password": hashed_password}
         create_data.update(data)
-        create_data.update(auth._new_user_defaults)
+        create_data.update(auth.new_user_defaults)
         create_data.update(
             await resolve_new_user_fields(
                 auth.new_user_fields,
@@ -214,7 +220,7 @@ def build_register_route(auth: Any, schema: type[BaseModel] | None) -> APIRouter
 
         if email_on and auth.identity.recovery is not None:
             await _send_best_effort(
-                auth._email_service.request_recovery_verification(
+                auth.emails.request_recovery_verification(
                     db, auth.repo.get(user, auth.identity.recovery)
                 )
             )

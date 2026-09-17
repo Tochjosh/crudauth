@@ -226,7 +226,7 @@ async def test_a_challenge_expires(build, monkeypatch) -> None:
     auth, app, browser, secret, _ = await _enrolled_app(build)
     async with browser:
         token = (await _login(browser)).json()["challenge"]
-        store = auth._mfa_challenge_store
+        store = auth.mfa.challenges
         assert isinstance(store, MemorySessionStorage)
         for key in list(store.expiry):
             store.expiry[key] = store.expiry[key].replace(year=2000)

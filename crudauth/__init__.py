@@ -41,7 +41,7 @@ from .exceptions import (
     UnprocessableEntityException,
     ValueTooLongException,
 )
-from .crud_auth import CRUDAuth, SessionInfo
+from .crud_auth import CRUDAuth
 from .email.service import EmailFlowService
 from .hooks import AuthHooks, HookContext
 from .identity import IdentityConfig
@@ -54,6 +54,7 @@ from .provisioning import NewUserContext, NewUserFields
 from .repository import UserRepository
 from .sudo import SudoConfig, SudoManager
 from .transports import BearerTransport, SessionTransport
+from .transports.session.management import SessionInfo
 from .transports.session.manager import SessionManager
 from .utils import (
     get_password_hash,
