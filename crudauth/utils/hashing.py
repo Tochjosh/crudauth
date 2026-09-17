@@ -1,22 +1,15 @@
-"""Cross-cutting helpers: password hashing, email normalization, request IP."""
+"""Password hashing and verification, and the unusable-password sentinel."""
 
 from __future__ import annotations
 
 import base64
 import functools
 import hashlib
-import inspect
-import ipaddress
 import secrets
 import unicodedata
-from typing import Any, Callable, overload
-from urllib.parse import urlsplit
 
 import bcrypt
-from fastapi import Request
 from fastapi.concurrency import run_in_threadpool
-
-from .constants import IPV6_CLIENT_PREFIX_LENGTH
 
 __all__ = [
     "normalize_password",
@@ -29,32 +22,7 @@ __all__ = [
     "dummy_verify_password",
     "make_unusable_password",
     "is_unusable_password",
-    "canonical_email",
-    "canonical_identifier",
-    "mask_email",
-    "get_client_ip",
-    "is_cross_site",
-    "client_ip_key",
-    "safe_redirect_path",
 ]
-
-
-def takes_two_arguments(callback: Callable[..., Any]) -> bool:
-    """Whether ``callback`` takes at least two required positional arguments.
-
-    Decides whether a callback that may accept an optional second argument (a
-    rate-limit key, a password validator) is called with it.
-    """
-    try:
-        params = inspect.signature(callback).parameters
-    except (ValueError, TypeError):
-        return False
-    required_positional = sum(
-        1
-        for p in params.values()
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
-    )
-    return required_positional >= 2
 
 
 def _bcrypt_input(password: str) -> bytes:
@@ -91,7 +59,7 @@ def get_password_hash(password: str) -> str:
 
     The password is NFKC-normalized (see [normalize_password]
     [crudauth.utils.normalize_password]) and SHA-256 pre-hashed before bcrypt
-    (see [_bcrypt_input][crudauth.utils._bcrypt_input]), so there is no effective
+    (see [_bcrypt_input][crudauth.utils.hashing._bcrypt_input]), so there is no effective
     length ceiling and no silent truncation. This call blocks for the bcrypt
     work; use [get_password_hash_async][crudauth.utils.get_password_hash_async]
     inside an async route.
@@ -256,148 +224,3 @@ def is_unusable_password(hashed_password: str) -> bool:
         ```
     """
     return not hashed_password or hashed_password.startswith("!")
-
-
-@overload
-def canonical_email(email: str) -> str: ...
-@overload
-def canonical_email(email: None) -> None: ...
-def canonical_email(email: str | None) -> str | None:
-    """Normalize an email for storage/comparison (trim + lowercase).
-
-    Ensures a user created via Google as ``Foo@x.com`` can log in by password as
-    ``foo@x.com`` without surprises.
-    """
-    if email is None:
-        return None
-    return email.strip().lower()
-
-
-def mask_email(email: str) -> str:
-    """Mask an email for display: ``john@example.com`` -> ``j***@example.com``.
-
-    A display helper for shoulder-surfing / casual logs - **not** a security
-    control (it's obfuscation, not a guarantee). Returns ``"***"`` when there's
-    no ``@``; keeps only the first local-part character (so a single-char local
-    part can't leak more than that one character).
-
-    Example:
-        ```python
-        mask_email("john@example.com")  # "j***@example.com"
-        mask_email("a@x.io")            # "a***@x.io"
-        mask_email("not-an-email")      # "***"
-        ```
-    """
-    if not email or "@" not in email:
-        return "***"
-    local, domain = email.split("@", 1)
-    if len(local) <= 1:
-        return f"{local}***@{domain}"
-    return f"{local[0]}***@{domain}"
-
-
-def canonical_identifier(identifier: str) -> str:
-    """Normalize a login identifier into its lockout key (trim + casefold).
-
-    Case variants of one identifier (``v@x.com`` / ``V@x.com``, ``bob`` / ``BOB``)
-    collapse to a single key, so an attacker can't reset the per-username counter
-    by varying the case while a case-insensitive lookup or collation still
-    reaches the same account. A key coarser than the lookup only makes the
-    lockout stricter.
-    """
-    return identifier.strip().casefold()
-
-
-def is_cross_site(request: Request) -> bool:
-    """Whether the browser marked ``request`` as sent from another site (``Sec-Fetch-Site``).
-
-    A request without the header (an API client, an older browser) isn't cross-site.
-    """
-    return request.headers.get("sec-fetch-site") == "cross-site"
-
-
-def get_client_ip(request: Request, trusted_hops: int = 0) -> str:
-    """Resolve the client IP with a trusted-proxy boundary.
-
-    ``X-Forwarded-For`` is client-controllable at its left end, so honoring it
-    blindly lets an attacker forge a fresh IP per request and slip every per-IP
-    rate limit and lockout. This function only consults the header when the app
-    declares how many trusted proxies sit in front of it.
-
-    Args:
-        request: The incoming request.
-        trusted_hops: Number of trusted reverse proxies in front of the app.
-            ``0`` (default) ignores forwarding headers entirely and uses the
-            socket peer - correct when the app is directly exposed. ``N`` reads
-            the ``N``-th ``X-Forwarded-For`` entry from the right: each trusted
-            proxy appends the address it received the request from, so that
-            entry is the client address your outermost proxy saw, and values an
-            attacker prepends sit further left where they are never read. A
-            chain shorter than ``N`` resolves to its left-most entry. Repeated
-            ``X-Forwarded-For`` header lines are read as one list, in order.
-
-    Returns:
-        The resolved client IP, or ``"unknown"`` if it cannot be determined.
-
-    Example:
-        ```python
-        # App behind a single trusted reverse proxy (e.g. nginx, Caddy):
-        CRUDAuth(..., trusted_proxy_hops=1)
-        ```
-    """
-    if trusted_hops > 0:
-        forwarded = ",".join(request.headers.getlist("x-forwarded-for"))
-        parts = [p.strip() for p in forwarded.split(",") if p.strip()]
-        if parts:
-            return parts[-min(trusted_hops, len(parts))]
-    if request.client is not None:
-        return request.client.host
-    return "unknown"
-
-
-def client_ip_key(ip: str) -> str:
-    """The rate-limit and lockout key for a client IP.
-
-    An IPv4 address keys as itself. An IPv6 client keys by its ``/64`` network,
-    the smallest block a single subscriber is normally assigned, so rotating
-    addresses inside one allocation can't mint fresh budgets. An IPv4-mapped IPv6
-    address keys as its IPv4 address. Anything that isn't an IP (``"unknown"``)
-    is returned unchanged.
-
-    Example:
-        ```python
-        client_ip_key("2001:db8:1:2:3:4:5:6")  # "2001:db8:1:2::/64"
-        client_ip_key("::ffff:203.0.113.7")    # "203.0.113.7"
-        ```
-    """
-    try:
-        address = ipaddress.ip_address(ip)
-    except ValueError:
-        return ip
-    if isinstance(address, ipaddress.IPv4Address):
-        return str(address)
-    if address.ipv4_mapped is not None:
-        return str(address.ipv4_mapped)
-    return str(ipaddress.IPv6Network((address, IPV6_CLIENT_PREFIX_LENGTH), strict=False))
-
-
-def safe_redirect_path(target: str | None, default: str = "/") -> str:
-    """Return a safe same-origin redirect path, or ``default`` when rejected.
-
-    Only single-slash-rooted relative paths are accepted. Absolute URLs,
-    protocol-relative URLs, backslashes, control characters, and values with a
-    URL scheme or network location are rejected. Use this for client-supplied
-    post-login or post-logout redirect targets to prevent open redirects.
-
-    Args:
-        target: The untrusted redirect target.
-        default: The fallback path returned for an unsafe or missing target.
-    """
-    if not target or not target.startswith("/") or target.startswith("//"):
-        return default
-    if "\\" in target or any(ord(c) < 0x20 for c in target):
-        return default
-    parts = urlsplit(target)
-    if parts.scheme or parts.netloc:
-        return default
-    return target

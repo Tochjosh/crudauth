@@ -22,7 +22,8 @@ from crudauth import (
     SessionTransport,
     SudoConfig,
 )
-from crudauth.utils import _bcrypt_input, make_unusable_password, verify_password
+from crudauth.utils import make_unusable_password, verify_password
+from crudauth.utils.hashing import _bcrypt_input
 
 SECRET = "test-secret-key-0123456789-0123456789"
 PRECOMPOSED = "caf\u00e9-secret"

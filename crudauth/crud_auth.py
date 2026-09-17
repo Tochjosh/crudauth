@@ -13,38 +13,33 @@ async def me(user: Principal = Depends(auth.current_user())):
 import inspect
 import logging
 from dataclasses import asdict
-from datetime import datetime
-from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, Literal, Sequence, cast
+from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, Literal, Sequence, TypeVar
 
-from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, Field, create_model
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel
 
-from .register import build_register_route
-from .constants import (
-    DEFAULT_ALGORITHM,
-    OAUTH_STATE_TTL_SECONDS,
-    USED_TOKEN_TTL_SECONDS,
-)
+from .account import build_account_router
+from .constants import DEFAULT_ALGORITHM, OAUTH_STATE_TTL_SECONDS, USED_TOKEN_TTL_SECONDS
 from .core import AuthRuntime, CookieConfig, Transport
 from .email.channel import DeliveryChannel
 from .email.router import build_email_router
 from .email.service import EmailFlowService
-from .exceptions import (
-    BadRequestException,
-    ForbiddenException,
-    NotFoundException,
-    RateLimitException,
-    UnauthorizedException,
-)
-from .hooks import AuthHooks, HookContext
+from .exceptions import ForbiddenException, UnauthorizedException
+from .hooks import AuthHooks
 from .identity import IdentityConfig
 from .mfa import MfaConfig, MfaService
 from .mfa.constants import CHALLENGE_STORAGE_PREFIX, MFA_FIELDS
 from .mfa.router import build_mfa_router
-from .oauth import OAuthAccountService, OAuthProviderFactory
+from .oauth import (
+    AbstractOAuthProvider,
+    OAuthAccountService,
+    OAuthCredentials,
+    OAuthProviderFactory,
+)
+from .oauth.paths import callback_url, resolve_oauth_paths
 from .oauth.router import build_oauth_router
-from .principal import Principal
 from .password import PasswordContext, PasswordPolicy, PasswordSource
+from .principal import Principal
 from .provisioning import NewUserFields
 from .ratelimit import (
     DEFAULT_RATE_LIMITS,
@@ -56,25 +51,18 @@ from .ratelimit import (
     RateLimitResolver,
     redis_rate_limiter,
 )
-from .ratelimit.constants import RATE_LIMIT_NAMESPACE
+from .ratelimit.dependency import limit_by_request, limit_by_user
+from .register import build_register_route
 from .repository import REGISTRATION_ALLOWED_FIELDS, UserRepository
 from .resolution import PrincipalResolver
 from .storage import MemorySessionStorage, get_session_storage
 from .storage.backends.redis import redis_client_from_url
-from .sudo import SudoConfig, SudoManager
 from .storage.constants import BACKEND_MEMORY, BACKEND_REDIS
+from .sudo import SudoConfig, SudoManager
 from .transports.bearer.transport import BearerTransport
-from .transports.session.constants import REMEMBER_ME_META_KEY
+from .transports.session.management import build_session_management_router
 from .transports.session.manager import SessionManager
 from .transports.session.transport import SessionTransport
-from .utils import (
-    client_ip_key,
-    get_client_ip,
-    get_password_hash_async,
-    is_unusable_password,
-    takes_two_arguments,
-    verify_password_async,
-)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .ratelimit import RateLimiterBackend
@@ -84,42 +72,10 @@ logger = logging.getLogger("crudauth")
 
 __all__ = ["CRUDAuth"]
 
+TransportT = TypeVar("TransportT", bound=Transport)
 
-class _SetPasswordIn(BaseModel):
-    new_password: str
-
-
-class _ChangePasswordIn(BaseModel):
-    current_password: str
-    new_password: str
-
-
-class SessionInfo(BaseModel):
-    """One active session, as returned by ``GET /sessions`` (the opt-in management route).
-
-    ``id`` is the session's public handle (the SHA-256 of its id), what
-    ``DELETE /sessions/{id}`` takes; the session id itself is the cookie value and
-    is never returned. ``device`` is the parsed user-agent info (browser/os/device
-    flags), empty when UA parsing isn't available; timestamps serialize to ISO-8601.
-
-    Example:
-        ```python
-        # each entry in the GET /sessions response:
-        SessionInfo(
-            id="5d41...",
-            device={"browser": "Chrome", "os": "macOS", "is_mobile": False},
-            ip="203.0.113.7",
-            created_at=created, last_activity=seen, current=True,
-        )
-        ```
-    """
-
-    id: str
-    device: dict[str, Any] = Field(default_factory=dict)
-    ip: str = ""
-    created_at: datetime
-    last_activity: datetime
-    current: bool = False
+MEMORY_TOKEN_STORES = "one-time-token/OAuth-state stores"
+MEMORY_MFA_STORE = "MFA store"
 
 
 class CRUDAuth:
@@ -309,87 +265,110 @@ class CRUDAuth:
             recovery=self.identity.recovery,
         )
         self._validate_identity(oauth=oauth, email=email, channels=channels)
-        self.new_user_fields = new_user_fields
-        self._new_user_defaults = self.repo.filter_provisioning_data(new_user_defaults or {})
         self.hooks = hooks or AuthHooks()
-        self.transports: list[Transport] = list(transports) if transports else [SessionTransport()]
+        self.new_user_fields = new_user_fields
+        self.new_user_defaults = self.repo.filter_provisioning_data(new_user_defaults or {})
         self._register_schema = register_schema
         self._warn_on_register_extra_fields(register_extra_fields)
         self._warn_on_privileged_register_fields(register_schema)
-        unknown_actions = sorted(set(rate_limits or {}) - set(DEFAULT_RATE_LIMITS))
+        self._rate_limits = self._merge_rate_limits(rate_limits)
+
+        self.transports: list[Transport] = list(transports) if transports else [SessionTransport()]
+        self._session_transport = self._first_transport(SessionTransport)
+        self._bearer_transport = self._first_transport(BearerTransport)
+        self._owned_redis = redis_client_from_url(redis_url) if redis_url is not None else None
+        self.runtime = self._build_runtime(
+            secret_key=SECRET_KEY,
+            redirect_base_url=redirect_base_url,
+            algorithm=algorithm,
+            cookies=cookies,
+            redis_client=redis_client if redis_client is not None else self._owned_redis,
+            rate_limiter=rate_limiter,
+            lockout=lockout,
+            trusted_proxy_hops=trusted_proxy_hops,
+        )
+        self._principals = PrincipalResolver(self.runtime)
+        for transport in self.transports:
+            transport.bind(self.runtime)
+
+        self._stores: list[tuple[str, AbstractSessionStorage[Any]]] = []
+        self.sudo: SudoManager | None = None
+        self._email_service: EmailFlowService | None = None
+        self._oauth_service: OAuthAccountService | None = None
+        self._oauth_router: APIRouter | None = None
+        if mfa is not None:
+            self._build_mfa(mfa)
+        if sudo is not None:
+            self._build_sudo(sudo)
+        if email is not None or channels:
+            self._build_email(email, channels)
+        if oauth:
+            self._build_oauth(oauth, redirect_base_url, oauth_paths, oauth_response_mode)
+
+        if oauth and mfa is not None:
+            self._warn_on_oauth_skipping_required_mfa(mfa)
+        if warn_on_memory_backend:
+            self._warn_on_memory_backend()
+
+    # --- configuration -------------------------------------------------------
+    @staticmethod
+    def _merge_rate_limits(overrides: dict[str, RateLimit] | None) -> dict[str, RateLimit]:
+        unknown_actions = sorted(set(overrides or {}) - set(DEFAULT_RATE_LIMITS))
         if unknown_actions:
             raise ValueError(
                 f"Unknown rate_limits key(s) {unknown_actions}; expected "
                 f"{sorted(DEFAULT_RATE_LIMITS)}. Pass a custom action's limit to "
                 "auth.rate_limit(action, RateLimit(...))."
             )
-        self._rate_limits: dict[str, RateLimit] = {**DEFAULT_RATE_LIMITS, **(rate_limits or {})}
-        self._owned_redis = redis_client_from_url(redis_url) if redis_url is not None else None
-        shared_redis = redis_client if redis_client is not None else self._owned_redis
+        return {**DEFAULT_RATE_LIMITS, **(overrides or {})}
 
-        self.runtime = AuthRuntime(
-            secret_key=SECRET_KEY,
+    def _first_transport(self, kind: type[TransportT]) -> TransportT | None:
+        return next((t for t in self.transports if isinstance(t, kind)), None)
+
+    def _build_runtime(
+        self,
+        *,
+        secret_key: str,
+        redirect_base_url: str | None,
+        algorithm: str,
+        cookies: CookieConfig | None,
+        redis_client: Any,
+        rate_limiter: "RateLimiterBackend | None",
+        lockout: LockoutConfig | None,
+        trusted_proxy_hops: int,
+    ) -> AuthRuntime:
+        """The state transports and services share, before any transport is bound.
+
+        The rate limiter defaults to Redis when a Redis client is configured, else
+        memory, and the login lockout is built on it here because both transports
+        read ``runtime.lockout`` when they bind.
+        """
+        limiter = rate_limiter or (
+            redis_rate_limiter(client=redis_client)
+            if redis_client is not None
+            else MemoryRateLimiterBackend()
+        )
+        return AuthRuntime(
+            secret_key=secret_key,
             repo=self.repo,
             hooks=self.hooks,
             redirect_base_url=redirect_base_url,
-            db_dependency=session,
+            db_dependency=self.session,
             algorithm=algorithm,
             cookie_config=cookies or CookieConfig(),
-            rate_limiter=rate_limiter
-            or (
-                redis_rate_limiter(client=shared_redis)
-                if shared_redis is not None
-                else MemoryRateLimiterBackend()
-            ),
+            rate_limiter=limiter,
+            lockout=self._build_lockout(lockout, limiter),
             trusted_proxy_hops=trusted_proxy_hops,
-            redis_client=shared_redis,
+            redis_client=redis_client,
             transports=self.transports,
         )
-        self._principals = PrincipalResolver(self.runtime)
-        self._session_transport = next(
-            (t for t in self.transports if isinstance(t, SessionTransport)), None
-        )
-        self._bearer_transport = next(
-            (t for t in self.transports if isinstance(t, BearerTransport)), None
-        )
-        self.runtime.lockout = self._build_lockout(lockout)
-        for transport in self.transports:
-            transport.bind(self.runtime)
 
-        self._mfa_challenge_store: AbstractSessionStorage[Any] | None = None
-        if mfa is not None:
-            self._build_mfa(mfa, SECRET_KEY)
-
-        self.sudo: SudoManager | None = None
-        if sudo is not None:
-            self._build_sudo(sudo)
-
-        self._email_service: EmailFlowService | None = None
-        self._email_token_store: AbstractSessionStorage[Any] | None = None
-        if email is not None or channels:
-            self._build_email(email, channels, algorithm)
-
-        self._oauth_router: APIRouter | None = None
-        self._oauth_service: OAuthAccountService | None = None
-        self._oauth_state_storage: AbstractSessionStorage[Any] | None = None
-        if oauth:
-            self._build_oauth(oauth, redirect_base_url, oauth_paths, oauth_response_mode)
-        if oauth and mfa is not None and mfa.required is not False and not mfa.oauth:
-            logger.warning(
-                "crudauth: MfaConfig.required is set but OAuth logins skip MFA "
-                "(MfaConfig.oauth=False), so a required account with a linked provider can "
-                "sign in without a code. Set MfaConfig(oauth=True) to challenge them."
-            )
-
-        if warn_on_memory_backend:
-            self._warn_on_memory_backend()
-
-    def _build_lockout(self, lockout: LockoutConfig | None) -> "LockoutPolicy | None":
-        """Build the one shared login-lockout policy (or ``None`` if no limiter).
+    def _build_lockout(
+        self, lockout: LockoutConfig | None, rate_limiter: "RateLimiterBackend"
+    ) -> LockoutPolicy:
+        """Build the one shared login-lockout policy.
 
         Note:
-            Called before transports are bound, because both the session and
-            bearer transports read ``runtime.lockout`` in their ``bind``/routes.
             The tuning comes from ``lockout=`` or a session transport's ``login_*``
             arguments, else the ``LockoutConfig`` defaults.
         """
@@ -399,10 +378,8 @@ class CRUDAuth:
                 "Login lockout is configured twice: pass either CRUDAuth(lockout=LockoutConfig(...)) "
                 "or SessionTransport's login_* arguments, not both."
             )
-        if self.runtime.rate_limiter is None:
-            return None
         config = lockout or transport_lockout or LockoutConfig()
-        return LockoutPolicy(self.runtime.rate_limiter, **asdict(config), fail_open=False)
+        return LockoutPolicy(rate_limiter, **asdict(config), fail_open=False)
 
     def _validate_identity(
         self,
@@ -443,6 +420,15 @@ class CRUDAuth:
             )
         if email is not None and not self.repo.has("email"):
             raise ValueError("email=EmailConfig(...) requires an 'email' column on the user model.")
+
+    @staticmethod
+    def _warn_on_oauth_skipping_required_mfa(mfa: MfaConfig) -> None:
+        if mfa.required is not False and not mfa.oauth:
+            logger.warning(
+                "crudauth: MfaConfig.required is set but OAuth logins skip MFA "
+                "(MfaConfig.oauth=False), so a required account with a linked provider can "
+                "sign in without a code. Set MfaConfig(oauth=True) to challenge them."
+            )
 
     def _warn_on_register_extra_fields(self, extra: set[str] | None) -> None:
         """Warn when ``register_extra_fields`` tries to opt in a privileged field.
@@ -494,13 +480,25 @@ class CRUDAuth:
                 sorted(droppable),
             )
 
-    # --- backend detection ---------------------------------------------------
+    # --- storage -------------------------------------------------------------
     def _backend_config(self) -> tuple[str, Any]:
         if self.runtime.redis_client is not None:
             return BACKEND_REDIS, self.runtime.redis_client
         if self._session_transport is not None and self._session_transport.backend is not None:
             return self._session_transport.backend, self._session_transport.redis_client
         return BACKEND_MEMORY, None
+
+    def _new_store(self, label: str, prefix: str, expiration: int) -> "AbstractSessionStorage[Any]":
+        """A store on the configured backend, opened and closed with ``auth``.
+
+        ``label`` names it in the in-memory backend warning.
+        """
+        backend, redis_client = self._backend_config()
+        store = get_session_storage(
+            backend, prefix=prefix, expiration=expiration, client=redis_client
+        )
+        self._stores.append((label, store))
+        return store
 
     def _warn_on_memory_backend(self) -> None:
         """Warn when an in-memory backend is active (the zero-config default).
@@ -516,11 +514,12 @@ class CRUDAuth:
             isinstance(t, SessionTransport) and t.backend == BACKEND_MEMORY for t in self.transports
         ):
             memory.append("sessions/CSRF")
-        stores = (self._email_token_store, self._oauth_state_storage)
-        if any(isinstance(store, MemorySessionStorage) for store in stores):
-            memory.append("one-time-token/OAuth-state stores")
-        if isinstance(self._mfa_challenge_store, MemorySessionStorage):
-            memory.append("MFA-challenge store")
+        for label in (MEMORY_TOKEN_STORES, MEMORY_MFA_STORE):
+            if any(
+                name == label and isinstance(store, MemorySessionStorage)
+                for name, store in self._stores
+            ):
+                memory.append(label)
         if not memory:
             return
         logger.warning(
@@ -531,7 +530,114 @@ class CRUDAuth:
             ", ".join(memory),
         )
 
-    # --- public: session manager --------------------------------------------
+    # --- features ------------------------------------------------------------
+    def _require_session_manager(self, message: str) -> SessionManager:
+        if self._session_manager is None:
+            raise ValueError(message)
+        return self._session_manager
+
+    def _build_email(self, email: Any, channels: list[DeliveryChannel] | None) -> None:
+        token_store = self._new_store(MEMORY_TOKEN_STORES, "used_token:", USED_TOKEN_TTL_SECONDS)
+        self._email_service = EmailFlowService(
+            repo=self.repo,
+            secret_key=self.runtime.secret_key,
+            config=email,
+            channels=channels,
+            hooks=self.hooks,
+            algorithm=self.runtime.algorithm,
+            token_store=token_store,
+            session_manager=self._session_manager,
+            rate_limiter=self.runtime.rate_limiter,
+            rate_limits=self._rate_limits,
+            password_policy=self.password_policy,
+        )
+        self.runtime.email_service = self._email_service
+
+    def _build_oauth(
+        self,
+        oauth: dict[str, Any],
+        redirect_base_url: str | None,
+        oauth_paths: dict[str, str] | None,
+        response_mode: Literal["redirect", "json"],
+    ) -> None:
+        sessions = self._require_session_manager(
+            "OAuth establishes a session on callback; add a SessionTransport to transports=[...]."
+        )
+        if not redirect_base_url:
+            raise ValueError("redirect_base_url is required when oauth=... is configured")
+        paths = resolve_oauth_paths(oauth_paths)
+        providers = {
+            name: self._oauth_provider(
+                name, credentials, callback_url(redirect_base_url, paths, name)
+            )
+            for name, credentials in oauth.items()
+        }
+        state_storage = self._new_store(
+            MEMORY_TOKEN_STORES, "oauth_state:", OAUTH_STATE_TTL_SECONDS
+        )
+        self._oauth_service = OAuthAccountService(
+            self.repo, self.new_user_fields, self.new_user_defaults, session_manager=sessions
+        )
+        self._oauth_router = build_oauth_router(
+            runtime=self.runtime,
+            providers=providers,
+            state_storage=state_storage,
+            account_service=self._oauth_service,
+            session_manager=sessions,
+            authorize_rate_limit=self.rate_limit("oauth_authorize"),
+            default_redirect=redirect_base_url,
+            response_mode=response_mode,
+            **paths,
+        )
+
+    def _oauth_provider(
+        self, name: str, credentials: OAuthCredentials, redirect_uri: str
+    ) -> AbstractOAuthProvider:
+        if not self.repo.has(f"{name}_id"):
+            raise ValueError(
+                f"OAuth provider {name!r} needs a '{name}_id' column on the user model "
+                f"to store and match its account id. Add it (e.g. "
+                f"'{name}_id: Mapped[str | None] = mapped_column(unique=True, index=True, "
+                f"default=None)') or map it via column_map=."
+            )
+        return OAuthProviderFactory.create_provider(
+            name,
+            client_id=credentials.client_id,
+            client_secret=credentials.client_secret,
+            redirect_uri=redirect_uri,
+            scopes=credentials.scopes,
+        )
+
+    def _build_mfa(self, config: MfaConfig) -> None:
+        missing = [field for field in MFA_FIELDS if not self.repo.has(field)]
+        if missing:
+            raise ValueError(
+                f"mfa=MfaConfig(...) needs the MFA columns {missing} on the user model. "
+                "Use make_auth_identity(mfa=True), or map them via column_map=."
+            )
+        if self.runtime.secret_key in config.encryption_keys:
+            raise ValueError("MfaConfig.encryption_key must differ from SECRET_KEY.")
+        challenge_store = self._new_store(
+            MEMORY_MFA_STORE, CHALLENGE_STORAGE_PREFIX, config.challenge_ttl_seconds
+        )
+        self.runtime.mfa = MfaService(
+            runtime=self.runtime, config=config, challenge_store=challenge_store
+        )
+
+    def _build_sudo(self, config: SudoConfig) -> None:
+        self.sudo = SudoManager(
+            session_manager=self._require_session_manager(
+                "Sudo stamps the elevation on a server-side session; add a "
+                "SessionTransport to transports=[...]."
+            ),
+            repo=self.repo,
+            backend=self.runtime.rate_limiter,
+            hooks=self.hooks,
+            config=config,
+            mfa=self.runtime.mfa,
+        )
+
+    # --- services ------------------------------------------------------------
     async def validate_password(
         self,
         password: str,
@@ -606,142 +712,15 @@ class CRUDAuth:
             raise RuntimeError("OAuth is not configured")
         return self._oauth_router
 
-    # --- email wiring --------------------------------------------------------
-    def _build_email(
-        self, email: Any, channels: list[DeliveryChannel] | None, algorithm: str
-    ) -> None:
-        backend, redis_client = self._backend_config()
-        token_store = get_session_storage(
-            backend, prefix="used_token:", expiration=USED_TOKEN_TTL_SECONDS, client=redis_client
-        )
-        self._email_token_store = token_store
-        self._email_service = EmailFlowService(
-            repo=self.repo,
-            secret_key=self.runtime.secret_key,
-            config=email,
-            channels=channels,
-            hooks=self.hooks,
-            algorithm=algorithm,
-            token_store=token_store,
-            session_manager=self._session_manager,
-            rate_limiter=self.runtime.rate_limiter,
-            rate_limits=self._rate_limits,
-            password_policy=self.password_policy,
-        )
-        self.runtime.email_service = self._email_service
-
-    # --- oauth wiring --------------------------------------------------------
-    def _build_oauth(
-        self,
-        oauth: dict[str, Any],
-        redirect_base_url: str | None,
-        oauth_paths: dict[str, str] | None = None,
-        oauth_response_mode: Literal["redirect", "json"] = "redirect",
-    ) -> None:
-        if self._session_transport is None:
-            raise ValueError(
-                "OAuth establishes a session on callback; add a SessionTransport to transports=[...]."
-            )
-        if not redirect_base_url:
-            raise ValueError("redirect_base_url is required when oauth=... is configured")
-
-        default_paths = {
-            "prefix": "/oauth",
-            "authorize_path": "/{provider}/authorize",
-            "callback_path": "/{provider}/callback",
-        }
-        unknown_paths = sorted(set(oauth_paths or {}) - set(default_paths))
-        if unknown_paths:
-            raise ValueError(
-                f"Unknown oauth_paths key(s) {unknown_paths}; expected {sorted(default_paths)}."
-            )
-        paths = {**default_paths, **(oauth_paths or {})}
-        providers = {}
-        for name, creds in oauth.items():
-            if not self.repo.has(f"{name}_id"):
-                raise ValueError(
-                    f"OAuth provider {name!r} needs a '{name}_id' column on the user model "
-                    f"to store and match its account id. Add it (e.g. "
-                    f"'{name}_id: Mapped[str | None] = mapped_column(unique=True, index=True, "
-                    f"default=None)') or map it via column_map=."
-                )
-            callback_route = paths["callback_path"].replace("{provider}", name)
-            route = "/".join(
-                part.strip("/") for part in (paths["prefix"], callback_route) if part.strip("/")
-            )
-            redirect_uri = f"{redirect_base_url.rstrip('/')}/{route}"
-            providers[name] = OAuthProviderFactory.create_provider(
-                name,
-                client_id=creds.client_id,
-                client_secret=creds.client_secret,
-                redirect_uri=redirect_uri,
-                scopes=creds.scopes,
-            )
-
-        backend, redis_client = self._backend_config()
-        state_storage = get_session_storage(
-            backend, prefix="oauth_state:", expiration=OAUTH_STATE_TTL_SECONDS, client=redis_client
-        )
-        self._oauth_state_storage = state_storage
-        self._oauth_service = OAuthAccountService(
-            self.repo,
-            self.new_user_fields,
-            self._new_user_defaults,
-            session_manager=self.sessions,
-        )
-        self._oauth_router = build_oauth_router(
-            runtime=self.runtime,
-            providers=providers,
-            state_storage=state_storage,
-            account_service=self._oauth_service,
-            session_manager=self.sessions,
-            authorize_rate_limit=self.rate_limit("oauth_authorize"),
-            default_redirect=redirect_base_url,
-            response_mode=oauth_response_mode,
-            **paths,
-        )
-
-    # --- mfa wiring ----------------------------------------------------------
-    def _build_mfa(self, config: MfaConfig, secret_key: str) -> None:
-        missing = [field for field in MFA_FIELDS if not self.repo.has(field)]
-        if missing:
-            raise ValueError(
-                f"mfa=MfaConfig(...) needs the MFA columns {missing} on the user model. "
-                "Use make_auth_identity(mfa=True), or map them via column_map=."
-            )
-        if secret_key in config.encryption_keys:
-            raise ValueError("MfaConfig.encryption_key must differ from SECRET_KEY.")
-        backend, redis_client = self._backend_config()
-        self._mfa_challenge_store = get_session_storage(
-            backend,
-            prefix=CHALLENGE_STORAGE_PREFIX,
-            expiration=config.challenge_ttl_seconds,
-            client=redis_client,
-        )
-        self.runtime.mfa = MfaService(
-            runtime=self.runtime, config=config, challenge_store=self._mfa_challenge_store
-        )
-
     @property
     def mfa(self) -> MfaService | None:
         """The [MfaService][crudauth.mfa.service.MfaService], or ``None`` when MFA isn't configured."""
         return self.runtime.mfa
 
-    # --- sudo wiring ---------------------------------------------------------
-    def _build_sudo(self, config: SudoConfig) -> None:
-        if self._session_transport is None:
-            raise ValueError(
-                "Sudo stamps the elevation on a server-side session; add a "
-                "SessionTransport to transports=[...]."
-            )
-        self.sudo = SudoManager(
-            session_manager=self.sessions,
-            repo=self.repo,
-            backend=self.runtime.rate_limiter,
-            hooks=self.hooks,
-            config=config,
-            mfa=self.runtime.mfa,
-        )
+    @property
+    def rate_limits(self) -> dict[str, RateLimit]:
+        """The per-action limits in effect: the defaults with ``rate_limits=`` applied."""
+        return dict(self._rate_limits)
 
     # --- the current_user() factory -----------------------------------------
     async def resolve_principal(
@@ -968,325 +947,38 @@ class CRUDAuth:
             async def contact(...): ...
             ```
         """
-        resolved = limit or self._rate_limits.get(action) or DEFAULT_RATE_LIMITS.get(action)
+        resolved = limit or self._rate_limits.get(action)
         if resolved is None:
             raise ValueError(
                 f"No rate limit configured for action {action!r}; pass limit=RateLimit(...)."
             )
         selected = self._select_transports(transport)
-
-        if key is KeyBy.USER:
-            user_dep = self.current_user(transport=transport)
-
-            async def by_user(
-                request: Request,
-                response: Response,
-                principal: Annotated[Principal, Depends(user_dep)],
-            ) -> None:
-                ident = str(principal.user_id)
-                await self._apply_rate_limit(request, response, action, ident, resolved, principal)
-
-            return by_user
-
-        trusted_hops = self.runtime.trusted_proxy_hops
-        needs_principal = callable(resolved)
-
-        if key is KeyBy.IP:
-
-            def ident_for(request: Request, principal: Principal | None) -> str:
-                return client_ip_key(get_client_ip(request, trusted_hops))
-
-        elif key is KeyBy.USER_OR_IP:
-            needs_principal = True
-
-            def ident_for(request: Request, principal: Principal | None) -> str:
-                if principal is not None:
-                    return f"user:{principal.user_id}"
-                return f"ip:{client_ip_key(get_client_ip(request, trusted_hops))}"
-
-        elif callable(key):
-            key_callback = key
-            takes_principal = takes_two_arguments(key_callback)
-            needs_principal = needs_principal or takes_principal
-
-            def ident_for(request: Request, principal: Principal | None) -> str:
-                if takes_principal:
-                    return key_callback(request, principal)
-                return key_callback(request)
-
-        else:
-            raise ValueError(f"Unsupported rate limit key: {key!r}")
-
-        if not needs_principal:
-
-            async def without_principal(request: Request, response: Response) -> None:
-                ident = ident_for(request, None)
-                await self._apply_rate_limit(request, response, action, ident, resolved, None)
-
-            return without_principal
-
-        async def with_principal(
-            request: Request, response: Response, db: Annotated[Any, Depends(self.session)]
-        ) -> None:
-            principal = await self._principals.resolve(request, db, selected, enforce_csrf=False)
-            ident = ident_for(request, principal)
-            await self._apply_rate_limit(request, response, action, ident, resolved, principal)
-
-        return with_principal
-
-    async def _apply_rate_limit(
-        self,
-        request: Request,
-        response: Response,
-        action: str,
-        ident: str,
-        limit: RateLimit | RateLimitResolver,
-        principal: Principal | None,
-    ) -> None:
-        """Run the window check, set ``X-RateLimit-*`` headers, raise 429 if over.
-
-        Note:
-            Headers set on the injected ``Response`` are dropped when the
-            dependency raises, so the limit headers are also attached to the
-            ``RateLimitException`` on the over-limit path.
-        """
-        effective: RateLimit | None
-        if callable(limit):
-            result = limit(request, principal)
-            if inspect.isawaitable(result):
-                result = await result
-            effective = result
-        else:
-            effective = limit
-        if effective is None:
-            return
         backend = self.runtime.rate_limiter
-        if backend is None or effective.disabled:
-            return
-        count, limited, retry_after = await backend.increment_and_check(
-            f"{RATE_LIMIT_NAMESPACE}:{action}:{ident}",
-            effective.times,
-            effective.seconds,
-            fail_open=True,
-        )
-        response.headers["X-RateLimit-Limit"] = str(effective.times)
-        response.headers["X-RateLimit-Remaining"] = str(max(0, effective.times - count))
-        if limited:
-            raise RateLimitException(
-                "Too many requests. Try again later.",
-                retry_after=retry_after,
-                headers={
-                    "X-RateLimit-Limit": str(effective.times),
-                    "X-RateLimit-Remaining": "0",
-                },
+        if key is KeyBy.USER:
+            return limit_by_user(
+                backend,
+                action=action,
+                limit=resolved,
+                current_user=self.current_user(transport=transport),
             )
+
+        async def principal(request: Request, db: Any) -> Principal | None:
+            return await self._principals.resolve(request, db, selected, enforce_csrf=False)
+
+        return limit_by_request(
+            backend,
+            action=action,
+            limit=resolved,
+            key=key,
+            trusted_proxy_hops=self.runtime.trusted_proxy_hops,
+            session=self.session,
+            principal=principal,
+        )
 
     @property
     def rate_limiter(self) -> "RateLimiterBackend | None":
         """The configured rate-limit backend."""
         return self.runtime.rate_limiter
-
-    # --- shared routes -------------------------------------------------------
-    def _shared_router(self) -> APIRouter:
-        router = APIRouter(tags=["auth"])
-        router.include_router(build_register_route(self, self._register_schema))
-        password_field = (self.password_policy.body_field(), ...)
-        SetPasswordModel = create_model(
-            "_SetPasswordIn", __base__=_SetPasswordIn, new_password=password_field
-        )
-        ChangePasswordModel = create_model(
-            "_ChangePasswordIn", __base__=_ChangePasswordIn, new_password=password_field
-        )
-
-        @router.get("/me")
-        async def me(user: Annotated[Principal, Depends(self.current_user())]):
-            """Return the authenticated user's identity, scopes, and auth transport."""
-            return {
-                "user_id": user.user_id,
-                "username": self.repo.get(user.user, "username") if user.user else None,
-                "email": self.repo.get(user.user, "email") if user.user else None,
-                "is_superuser": user.is_superuser,
-                "scopes": list(user.scopes),
-                "via": user.transport,
-            }
-
-        @router.post("/set-password")
-        async def set_password(
-            body: SetPasswordModel,  # type: ignore[valid-type]
-            principal: Annotated[Principal, Depends(self.current_user())],
-            db: Annotated[Any, Depends(self.session)],
-        ):
-            """Set a password for an account that doesn't have one (OAuth-only).
-
-            Note:
-                The active session/credential IS the re-authentication - there's
-                no current password to check because the account never had one.
-                This is **set**, not **change**: it refuses (400) if the account
-                already has a usable password (use the password-reset flow to
-                change an existing one). It does not evict other sessions/tokens
-                (establishing a first credential isn't a compromise response).
-
-            Note:
-                Allowed over any transport. On the session path the POST already
-                carries CSRF; on the bearer path there's no CSRF surface (the
-                token is sent explicitly, not auto-attached), and a valid bearer
-                token is itself proof of the active credential - the same re-auth
-                argument. Narrow with ``transport="session"`` if your policy
-                requires first-password establishment to be browser-only.
-            """
-            user = principal.user
-            new_password = cast(_SetPasswordIn, body).new_password
-            if not is_unusable_password(self.repo.get(user, "hashed_password", "")):
-                raise BadRequestException(
-                    "Account already has a password; use the password reset flow to change it."
-                )
-            await self.validate_password(
-                new_password, user=user, source="set", field="new_password"
-            )
-            await self.repo.update(
-                db, user, {"hashed_password": await get_password_hash_async(new_password)}
-            )
-            return {"detail": "Password set."}
-
-        @router.post(
-            "/change-password",
-            dependencies=[Depends(self.rate_limit("change_password", key=KeyBy.USER))],
-        )
-        async def change_password(
-            body: ChangePasswordModel,  # type: ignore[valid-type]
-            request: Request,
-            principal: Annotated[Principal, Depends(self.current_user())],
-            db: Annotated[Any, Depends(self.session)],
-        ):
-            """Change the password for an authenticated account, verifying the current one.
-
-            Note:
-                Re-auth is the *current password*: the active session/token proves
-                presence, the current password proves intent. Allowed over any
-                transport - CSRF is automatic on the session path, and bearer has
-                no CSRF surface. An account with no usable password gets a 400
-                (use ``/set-password`` to create the first one).
-
-            Note:
-                A password change is a compromise response: it bumps
-                ``token_version`` (evicting bearer tokens; a no-op without the
-                column) and revokes the user's OTHER sessions, keeping the current
-                one. Same eviction shape as a password reset.
-            """
-            user = principal.user
-            current_hash = self.repo.get(user, "hashed_password", "")
-            if is_unusable_password(current_hash):
-                raise BadRequestException(
-                    "Account has no password; use /set-password to create one."
-                )
-            change = cast(_ChangePasswordIn, body)
-            if not await verify_password_async(change.current_password, current_hash):
-                raise UnauthorizedException("Current password is incorrect.")
-            await self.validate_password(
-                change.new_password, user=user, source="change", field="new_password"
-            )
-            await self.repo.update(
-                db, user, {"hashed_password": await get_password_hash_async(change.new_password)}
-            )
-            await self.repo.increment_token_version(db, user)
-            sessions = self._session_manager
-            if sessions is not None:
-                current_sid = principal.metadata.get("session_id")
-                if current_sid:
-                    await sessions.set_token_version(current_sid, self.repo.token_version(user))
-                await sessions.revoke_all(principal.user_id, exclude=current_sid)
-            await self.hooks.run_after_password_changed(
-                self.repo.to_dict(user),
-                db=db,
-                context=HookContext(transport=principal.transport, request=request),
-            )
-            return {"detail": "Password changed."}
-
-        if self._session_transport is not None and self._session_transport.management_routes:
-            self._add_session_management_routes(router)
-
-        return router
-
-    def _add_session_management_routes(self, router: APIRouter) -> None:
-        """Mount the opt-in session/CSRF management routes (``SessionTransport(management_routes=True)``)."""
-        sessions = self.sessions
-        assert sessions is not None
-        session_user = self.current_user(transport="session")
-
-        @router.post(
-            "/logout-all",
-            dependencies=[Depends(self.rate_limit("logout_all", key=KeyBy.USER))],
-        )
-        async def logout_all(
-            response: Response,
-            principal: Annotated[Principal, Depends(session_user)],
-            keep_current: bool = False,
-        ):
-            """Sign out of all sessions. ``keep_current=True`` keeps the calling session."""
-            current_sid = principal.metadata.get("session_id")
-            revoked = await sessions.revoke_all(
-                principal.user_id, exclude=current_sid if keep_current else None
-            )
-            if not keep_current:
-                sessions.clear_session_cookies(response)
-            return {"detail": "Signed out of all sessions.", "revoked": revoked}
-
-        @router.get("/sessions", response_model=list[SessionInfo])
-        async def list_sessions(principal: Annotated[Principal, Depends(session_user)]):
-            """List the user's active sessions. ``[]`` if the backend can't index by user."""
-            return await sessions.list_for_user(
-                principal.user_id, current_session_id=principal.metadata.get("session_id")
-            )
-
-        @router.delete("/sessions/{session_handle}")
-        async def revoke_session(
-            session_handle: str,
-            response: Response,
-            principal: Annotated[Principal, Depends(session_user)],
-        ):
-            """Revoke one session by the ``id`` listed in ``GET /sessions`` (404 also covers 'not yours')."""
-            if not await sessions.revoke_by_handle(session_handle, owner_id=principal.user_id):
-                raise NotFoundException("Session not found.")
-            current_sid = principal.metadata.get("session_id")
-            if current_sid and sessions.session_handle(current_sid) == session_handle:
-                sessions.clear_session_cookies(response)
-            return {"detail": "Session revoked."}
-
-        @router.post(
-            "/csrf/refresh",
-            dependencies=[Depends(self.rate_limit("csrf_refresh", key=KeyBy.IP))],
-        )
-        async def csrf_refresh(request: Request, response: Response):
-            """Re-mint the CSRF cookie when it's lost but the session is still valid.
-
-            Note:
-                Deliberately NOT behind ``current_user`` - requiring a valid CSRF
-                header to refresh CSRF would defeat the recovery purpose. It
-                resolves the session cookie directly. An attacker can *trigger*
-                this cross-origin (the session cookie auto-rides) but cannot
-                *read* the response or the new cookie (CORS), so they never learn
-                the token; and the self-heal guard returns the existing token
-                unchanged when it's already valid, so a triggered call never
-                rotates a healthy token.
-            """
-            if sessions.csrf_storage is None:
-                raise BadRequestException("CSRF is disabled.")
-            session_id = request.cookies.get(sessions.session_cookie_name)
-            session = await sessions.validate_session(session_id) if session_id else None
-            if session is None or session_id is None:
-                raise UnauthorizedException("Not authenticated")
-            cookie = request.cookies.get(sessions.csrf_cookie_name)
-            if cookie and await sessions.validate_csrf_token(session_id, cookie):
-                token = cookie
-            else:
-                token = await sessions.regenerate_csrf_token(session_id)
-                max_age = (
-                    sessions.timeout_seconds_for(session.metadata)
-                    if session.metadata.get(REMEMBER_ME_META_KEY)
-                    else None
-                )
-                sessions.set_csrf_cookie(response, token, max_age=max_age)
-            return {"csrf_token": token}
 
     # --- assembled routers ---------------------------------------------------
     @property
@@ -1303,11 +995,14 @@ class CRUDAuth:
             ```
         """
         router = APIRouter()
-        router.include_router(self._shared_router())
-        for t in self.transports:
-            sub = t.contributes_routes()
-            if sub is not None:
-                router.include_router(sub)
+        router.include_router(build_register_route(self, self._register_schema))
+        router.include_router(build_account_router(self, self._session_manager))
+        if self._session_transport is not None and self._session_transport.management_routes:
+            router.include_router(build_session_management_router(self, self.sessions))
+        for transport in self.transports:
+            routes = transport.contributes_routes()
+            if routes is not None:
+                router.include_router(routes)
         if self._oauth_router is not None:
             router.include_router(self._oauth_router)
         if self._email_service is not None:
@@ -1357,14 +1052,10 @@ class CRUDAuth:
         """
         if self.runtime.rate_limiter is not None:
             await self.runtime.rate_limiter.initialize()
-        for t in self.transports:
-            await t.initialize()
-        if self._oauth_state_storage is not None:
-            await self._oauth_state_storage.initialize()
-        if self._email_token_store is not None:
-            await self._email_token_store.initialize()
-        if self._mfa_challenge_store is not None:
-            await self._mfa_challenge_store.initialize()
+        for transport in self.transports:
+            await transport.initialize()
+        for _, store in self._stores:
+            await store.initialize()
 
     async def shutdown(self) -> None:
         """Close connections. Call in lifespan teardown.
@@ -1373,12 +1064,7 @@ class CRUDAuth:
         failure is re-raised once all of them were attempted.
         """
         closers: list[Callable[[], Awaitable[None]]] = [t.shutdown for t in self.transports]
-        if self._oauth_state_storage is not None:
-            closers.append(self._oauth_state_storage.close)
-        if self._email_token_store is not None:
-            closers.append(self._email_token_store.close)
-        if self._mfa_challenge_store is not None:
-            closers.append(self._mfa_challenge_store.close)
+        closers.extend(store.close for _, store in self._stores)
         if self.runtime.rate_limiter is not None:
             closers.append(self.runtime.rate_limiter.close)
         if self._owned_redis is not None:

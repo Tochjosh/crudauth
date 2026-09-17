@@ -246,7 +246,7 @@ def test_defaults_gated_at_construction(get_session, UserModel, caplog) -> None:
             transports=[SessionTransport(cookies=CookieConfig(secure=False))],
             new_user_defaults={"role": "staff", "is_superuser": True},
         )
-    assert auth._new_user_defaults == {"role": "staff"}  # is_superuser dropped
+    assert auth.new_user_defaults == {"role": "staff"}  # is_superuser dropped
     assert "new_user_fields" in caplog.text
 
 
