@@ -12,8 +12,9 @@ async def me(user: Principal = Depends(auth.current_user())):
 
 import inspect
 import logging
+from dataclasses import asdict
 from datetime import datetime
-from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal, Sequence, cast
+from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, Literal, Sequence, cast
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, Field, create_model
@@ -21,10 +22,6 @@ from pydantic import BaseModel, Field, create_model
 from .register import build_register_route
 from .constants import (
     DEFAULT_ALGORITHM,
-    DEFAULT_LOGIN_ATTEMPT_WINDOW_SECONDS,
-    DEFAULT_LOGIN_LOCKOUT_BASE_SECONDS,
-    DEFAULT_LOGIN_LOCKOUT_MAX_SECONDS,
-    DEFAULT_LOGIN_MAX_ATTEMPTS,
     OAUTH_STATE_TTL_SECONDS,
     USED_TOKEN_TTL_SECONDS,
 )
@@ -49,6 +46,7 @@ from .provisioning import NewUserFields
 from .ratelimit import (
     DEFAULT_RATE_LIMITS,
     KeyBy,
+    LockoutConfig,
     LockoutPolicy,
     MemoryRateLimiterBackend,
     RateLimit,
@@ -67,6 +65,7 @@ from .transports.session.constants import REMEMBER_ME_META_KEY
 from .transports.session.manager import SessionManager
 from .transports.session.transport import SessionTransport
 from .utils import (
+    client_ip_key,
     get_client_ip,
     get_password_hash_async,
     is_unusable_password,
@@ -165,6 +164,7 @@ class CRUDAuth:
         redis_url: str | None = None,
         redis_client: Any = None,
         rate_limits: dict[str, RateLimit] | None = None,
+        lockout: LockoutConfig | None = None,
         trusted_proxy_hops: int = 0,
         sudo: SudoConfig | None = None,
         warn_on_memory_backend: bool = True,
@@ -205,6 +205,8 @@ class CRUDAuth:
                 alongside the email channel if ``email`` is also set, every channel
                 best-effort. With ``channels`` and no ``email``, the recovery
                 endpoints still mount (token lifetimes fall back to the defaults).
+                Both ``email`` and ``channels`` need a recovery factor
+                (``identity.recovery``).
             hooks: Lifecycle callbacks ([AuthHooks][crudauth.hooks.AuthHooks]).
             redirect_base_url: Public base URL used to build OAuth redirect URIs
                 and the post-login redirect default.
@@ -250,7 +252,12 @@ class CRUDAuth:
                 owns it, so ``shutdown()`` doesn't close it. Mutually exclusive with
                 ``redis_url``.
             rate_limits: Per-action overrides merged over
-                :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS`.
+                :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS`. Keys must be
+                built-in actions; a custom action takes its limit in
+                ``auth.rate_limit(action, RateLimit(...))``.
+            lockout: [LockoutConfig][crudauth.ratelimit.config.LockoutConfig] for the
+                escalating login lockout shared by ``/login`` and ``/token``,
+                whichever transports are configured. Defaults to ``LockoutConfig()``.
             trusted_proxy_hops: Number of trusted reverse proxies in front of the
                 app. ``0`` (default) ignores ``X-Forwarded-For`` and keys per-IP
                 rate limits / lockout on the socket peer; set to the count of
@@ -273,8 +280,11 @@ class CRUDAuth:
         Raises:
             ValueError: If ``SECRET_KEY`` is empty; if ``oauth`` or ``sudo`` is
                 set without a session transport (and ``oauth`` also needs
-                ``redirect_base_url``); or if a configured OAuth provider has no
-                ``{provider}_id`` column on the user model.
+                ``redirect_base_url``); if a configured OAuth provider has no
+                ``{provider}_id`` column on the user model; if ``email`` or
+                ``channels`` is set with ``identity.recovery=None``; if
+                ``rate_limits`` names an unknown action; or if ``lockout`` is set
+                alongside a ``SessionTransport``'s ``login_*`` arguments.
         """
         if not SECRET_KEY:
             raise ValueError("SECRET_KEY is required")
@@ -290,7 +300,7 @@ class CRUDAuth:
             login_fields=self.identity.login,
             recovery=self.identity.recovery,
         )
-        self._validate_identity(oauth=oauth, email=email)
+        self._validate_identity(oauth=oauth, email=email, channels=channels)
         self.new_user_fields = new_user_fields
         self._new_user_defaults = self.repo.filter_provisioning_data(new_user_defaults or {})
         self.hooks = hooks or AuthHooks()
@@ -298,6 +308,13 @@ class CRUDAuth:
         self._register_schema = register_schema
         self._warn_on_register_extra_fields(register_extra_fields)
         self._warn_on_privileged_register_fields(register_schema)
+        unknown_actions = sorted(set(rate_limits or {}) - set(DEFAULT_RATE_LIMITS))
+        if unknown_actions:
+            raise ValueError(
+                f"Unknown rate_limits key(s) {unknown_actions}; expected "
+                f"{sorted(DEFAULT_RATE_LIMITS)}. Pass a custom action's limit to "
+                "auth.rate_limit(action, RateLimit(...))."
+            )
         self._rate_limits: dict[str, RateLimit] = {**DEFAULT_RATE_LIMITS, **(rate_limits or {})}
         self._owned_redis = redis_client_from_url(redis_url) if redis_url is not None else None
         shared_redis = redis_client if redis_client is not None else self._owned_redis
@@ -327,7 +344,7 @@ class CRUDAuth:
         self._bearer_transport = next(
             (t for t in self.transports if isinstance(t, BearerTransport)), None
         )
-        self.runtime.lockout = self._build_lockout(self._session_transport)
+        self.runtime.lockout = self._build_lockout(lockout)
         for transport in self.transports:
             transport.bind(self.runtime)
 
@@ -337,7 +354,7 @@ class CRUDAuth:
 
         self._email_service: EmailFlowService | None = None
         self._email_token_store: AbstractSessionStorage[Any] | None = None
-        if self.identity.recovery is not None and (email is not None or channels):
+        if email is not None or channels:
             self._build_email(email, channels, algorithm)
 
         self._oauth_router: APIRouter | None = None
@@ -349,43 +366,40 @@ class CRUDAuth:
         if warn_on_memory_backend:
             self._warn_on_memory_backend()
 
-    def _build_lockout(
-        self, session_transport: "SessionTransport | None"
-    ) -> "LockoutPolicy | None":
+    def _build_lockout(self, lockout: LockoutConfig | None) -> "LockoutPolicy | None":
         """Build the one shared login-lockout policy (or ``None`` if no limiter).
 
         Note:
             Called before transports are bound, because both the session and
             bearer transports read ``runtime.lockout`` in their ``bind``/routes.
-            Mirrors the session transport's lockout config when present, else
-            uses defaults - so a bearer-only API still gets lockout.
+            The tuning comes from ``lockout=`` or a session transport's ``login_*``
+            arguments, else the ``LockoutConfig`` defaults.
         """
+        transport_lockout = self._session_transport.lockout if self._session_transport else None
+        if lockout is not None and transport_lockout is not None:
+            raise ValueError(
+                "Login lockout is configured twice: pass either CRUDAuth(lockout=LockoutConfig(...)) "
+                "or SessionTransport's login_* arguments, not both."
+            )
         if self.runtime.rate_limiter is None:
             return None
-        st = session_transport
-        return LockoutPolicy(
-            self.runtime.rate_limiter,
-            max_attempts=st.login_max_attempts if st else DEFAULT_LOGIN_MAX_ATTEMPTS,
-            attempt_window_seconds=(
-                st.login_attempt_window_seconds if st else DEFAULT_LOGIN_ATTEMPT_WINDOW_SECONDS
-            ),
-            lockout_base_seconds=(
-                st.login_lockout_base_seconds if st else DEFAULT_LOGIN_LOCKOUT_BASE_SECONDS
-            ),
-            lockout_max_seconds=(
-                st.login_lockout_max_seconds if st else DEFAULT_LOGIN_LOCKOUT_MAX_SECONDS
-            ),
-            on_login_success=st.on_login_success if st else "clear_all",
-            fail_open=False,
-        )
+        config = lockout or transport_lockout or LockoutConfig()
+        return LockoutPolicy(self.runtime.rate_limiter, **asdict(config), fail_open=False)
 
-    def _validate_identity(self, *, oauth: dict[str, Any] | None, email: Any) -> None:
+    def _validate_identity(
+        self,
+        *,
+        oauth: dict[str, Any] | None,
+        email: Any,
+        channels: list[DeliveryChannel] | None,
+    ) -> None:
         """Check the identity contract against the model, fail-closed at construction.
 
         The model owns the shape; this asserts the config agrees with it, so a
         login field that isn't a unique column, a non-unique recovery field, OAuth
-        without an email login, or an email flow on a model with no email column
-        all raise here rather than splitting into a silent second source of truth.
+        without an email login, recovery delivery without a recovery factor, or an
+        email flow on a model with no email column all raise here rather than
+        splitting into a silent second source of truth.
         """
         for login_field in self.identity.login:
             if not self.repo.is_unique_column(login_field):
@@ -403,6 +417,11 @@ class CRUDAuth:
             raise ValueError(
                 "OAuth requires 'email' in identity.login - OAuth links and creates accounts "
                 "by email, so an email-less contract cannot enable OAuth."
+            )
+        if recovery is None and (email is not None or channels):
+            raise ValueError(
+                "email= and channels= deliver recovery tokens, so they require a recovery "
+                "factor; set identity.recovery or drop them."
             )
         if email is not None and not self.repo.has("email"):
             raise ValueError("email=EmailConfig(...) requires an 'email' column on the user model.")
@@ -878,10 +897,12 @@ class CRUDAuth:
         """Build a FastAPI dependency that throttles an endpoint.
 
         ``limit`` is a ``RateLimit`` or a sync/async function of ``(request, principal)``
-        returning one (``None`` for no limit). Without it, the ``rate_limits=`` override
-        or :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS` entry for ``action`` applies.
+        returning one (``None`` for no limit). Without it, ``action`` must be a built-in
+        action, and its ``rate_limits=`` override or
+        :data:`~crudauth.ratelimit.DEFAULT_RATE_LIMITS` entry applies.
         ``key`` picks who shares a budget: a ``KeyBy`` member, ``key(request)``, or
-        ``key(request, principal)``. ``transport`` narrows which credentials identify the
+        ``key(request, principal)``. ``KeyBy.IP`` keys an IPv6 client by its ``/64``
+        (see [client_ip_key][crudauth.utils.client_ip_key]). ``transport`` narrows which credentials identify the
         caller, as on [current_user][crudauth.crud_auth.CRUDAuth.current_user]. Writes
         ``X-RateLimit-*`` headers and raises
         [RateLimitException][crudauth.exceptions.RateLimitException] (429) when the caller exceeds the window.
@@ -918,7 +939,7 @@ class CRUDAuth:
         if key is KeyBy.IP:
 
             def ident_for(request: Request, principal: Principal | None) -> str:
-                return get_client_ip(request, trusted_hops)
+                return client_ip_key(get_client_ip(request, trusted_hops))
 
         elif key is KeyBy.USER_OR_IP:
             needs_principal = True
@@ -926,7 +947,7 @@ class CRUDAuth:
             def ident_for(request: Request, principal: Principal | None) -> str:
                 if principal is not None:
                     return f"user:{principal.user_id}"
-                return f"ip:{get_client_ip(request, trusted_hops)}"
+                return f"ip:{client_ip_key(get_client_ip(request, trusted_hops))}"
 
         elif callable(key):
             key_callback = key
@@ -1287,14 +1308,25 @@ class CRUDAuth:
             await self._email_token_store.initialize()
 
     async def shutdown(self) -> None:
-        """Close connections. Call in lifespan teardown."""
-        for t in self.transports:
-            await t.shutdown()
+        """Close connections. Call in lifespan teardown.
+
+        Every component is closed even when an earlier one fails; the first
+        failure is re-raised once all of them were attempted.
+        """
+        closers: list[Callable[[], Awaitable[None]]] = [t.shutdown for t in self.transports]
         if self._oauth_state_storage is not None:
-            await self._oauth_state_storage.close()
+            closers.append(self._oauth_state_storage.close)
         if self._email_token_store is not None:
-            await self._email_token_store.close()
+            closers.append(self._email_token_store.close)
         if self.runtime.rate_limiter is not None:
-            await self.runtime.rate_limiter.close()
+            closers.append(self.runtime.rate_limiter.close)
         if self._owned_redis is not None:
-            await self._owned_redis.aclose()
+            closers.append(self._owned_redis.aclose)
+        errors: list[Exception] = []
+        for close in closers:
+            try:
+                await close()
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]

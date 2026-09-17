@@ -66,6 +66,14 @@ auth = CRUDAuth(..., rate_limits={"register": RateLimit(3, 600)})  # 3 signups /
 `register` counts only signups that pass validation, so a rejected password doesn't use up the
 budget.
 
+A key that isn't a built-in action raises at construction; a custom action passes its limit to
+`auth.rate_limit(action, RateLimit(...))`. `RateLimit` rejects a negative `times` or a
+`seconds` that isn't positive.
+
+`KeyBy.IP` keys an IPv6 client by its `/64`, the block one subscriber is normally given, so
+rotating through addresses in it doesn't buy fresh budgets. The `register` limit and the login
+lockout key IPs the same way. See [`client_ip_key`](../../api/utils.md).
+
 ## Login lockout
 
 <p align="center">
@@ -75,27 +83,43 @@ budget.
 
 The login path (the session `/login` and the bearer `/token`, which share it) has its own
 escalating lockout, separate from `rate_limit()`. Repeated failures from an IP + username
-trip a block whose duration doubles each round, up to a cap. Configure it on the
-`SessionTransport`:
+trip a block whose duration doubles each round, up to a cap. Configure it on `CRUDAuth`, which
+works whichever transports you use:
 
 ```python
-SessionTransport(
-    login_max_attempts=5,            # failures allowed in the window
-    login_attempt_window_seconds=60,
-    login_lockout_base_seconds=60,   # first lockout; doubles each round
-    login_lockout_max_seconds=3600,  # cap
-    on_login_success="clear_all",
+from crudauth.ratelimit import LockoutConfig
+
+auth = CRUDAuth(
+    ...,
+    lockout=LockoutConfig(
+        max_attempts=5,               # failures allowed in the window
+        attempt_window_seconds=60,
+        lockout_base_seconds=60,      # first lockout; doubles each round
+        lockout_max_seconds=3600,     # cap
+        round_retention_seconds=3600, # how long the round count survives
+        on_login_success="clear_all",
+    ),
 )
 ```
 
+`SessionTransport`'s `login_max_attempts`, `login_attempt_window_seconds`,
+`login_lockout_base_seconds`, `login_lockout_max_seconds` and `on_login_success` set the same
+values; setting them and `lockout=` together raises.
+
 - **Escalation:** each repeat offense waits longer (60s, 120s, 240s, ... up to the cap), and
   the round count persists so a slow, paced attack keeps climbing rather than resetting.
-- **`on_login_success`:** `"clear_all"` (default) clears both per-user and per-IP pressure on
-  a good login, which is friendly to users behind shared egress; `"clear_user_only"` keeps
-  per-IP pressure, which is tighter but only safe when your per-IP key identifies one client.
+- **`on_login_success`:** a good login always clears that username's counters. `"clear_all"`
+  (default) also takes back the per-IP failures that username added from that IP, which is
+  friendly to users behind shared egress who mistyped before getting in. Failures against other
+  usernames stay counted, so logging into your own account doesn't reset a spray, and an IP
+  lock stays until it expires. `"clear_user_only"` keeps all per-IP pressure, which is tighter
+  but only safe when your per-IP key identifies one client.
+- **Usernames are case-folded** in the lockout key, so `bob`, `Bob` and `BOB` share one budget
+  even when your database compares them case-insensitively.
 - **Keying behind a proxy:** per-IP counters use the client IP, so set `trusted_proxy_hops` to
   the number of proxies in front of you. Otherwise every request looks like the proxy's IP and
-  shares one bucket. See [`get_client_ip`](../../api/utils.md).
+  shares one bucket. Repeated `X-Forwarded-For` header lines are read as one chain. See
+  [`get_client_ip`](../../api/utils.md).
 
 Lockout **fails closed**: if the limiter backend errors, a login is blocked rather than
 allowed, so an attacker can't disable it by knocking the backend over.

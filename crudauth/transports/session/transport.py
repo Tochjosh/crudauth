@@ -4,17 +4,13 @@ This is the default transport - configuring nothing gives you cookie sessions,
 CSRF synchronizer-token, login lockout, secure cookies, and ``/login`` ``/logout``.
 """
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Form, Request, Response
 from fastapi.security import OAuth2PasswordRequestForm
 
 from ...constants import (
     DEFAULT_CLEANUP_INTERVAL_MINUTES,
-    DEFAULT_LOGIN_ATTEMPT_WINDOW_SECONDS,
-    DEFAULT_LOGIN_LOCKOUT_BASE_SECONDS,
-    DEFAULT_LOGIN_LOCKOUT_MAX_SECONDS,
-    DEFAULT_LOGIN_MAX_ATTEMPTS,
     DEFAULT_MAX_SESSIONS_PER_USER,
     DEFAULT_REMEMBER_ME_DAYS,
     DEFAULT_SESSION_TIMEOUT_MINUTES,
@@ -24,6 +20,7 @@ from ...core import AuthContext, AuthRuntime, CookieConfig, Transport
 from ...exceptions import CSRFException, ForbiddenException
 from ...hooks import HookContext
 from ...principal import Principal
+from ...ratelimit.config import LockoutConfig, LoginSuccessClears
 from ...storage import get_session_storage
 from ...storage.backends.redis import redis_client_from_url
 from ...storage.constants import BACKEND_MEMORY, BACKEND_REDIS
@@ -59,12 +56,15 @@ class SessionTransport(Transport):
             Mutually exclusive with ``redis_url``.
         csrf: Enforce the synchronizer-token header on unsafe methods (default ``True``).
         cookies: Per-transport [CookieConfig][crudauth.core.CookieConfig] override.
-        login_max_attempts: Failed logins before the escalating lockout trips.
-        on_login_success: What a successful login clears - ``"clear_all"`` (default)
-            or ``"clear_user_only"`` (keeps per-IP pressure; only safe when the
-            per-IP key identifies an individual client, not a shared NAT/CGNAT
-            egress). Governs the shared lockout (both ``/login`` and ``/token``).
-            See [LockoutPolicy][crudauth.ratelimit.policy.LockoutPolicy].
+        login_max_attempts: The login lockout's ``max_attempts``.
+        login_attempt_window_seconds: The login lockout's ``attempt_window_seconds``.
+        login_lockout_base_seconds: The login lockout's ``lockout_base_seconds``.
+        login_lockout_max_seconds: The login lockout's ``lockout_max_seconds``.
+        on_login_success: The login lockout's ``on_login_success``. These ``login_*``
+            arguments tune the lockout shared by ``/login`` and ``/token``; any left
+            unset keeps the [LockoutConfig][crudauth.ratelimit.config.LockoutConfig]
+            default. ``CRUDAuth(lockout=LockoutConfig(...))`` sets the same values
+            without needing a session transport; setting both raises ``ValueError``.
         management_routes: When ``True``, mount the opt-in session/CSRF management
             routes on the shared router: ``POST /logout-all``, ``GET /sessions``,
             ``DELETE /sessions/{id}``, and ``POST /csrf/refresh``. Default ``False``
@@ -94,11 +94,11 @@ class SessionTransport(Transport):
         remember_me_days: int = DEFAULT_REMEMBER_ME_DAYS,
         cleanup_interval_minutes: int = DEFAULT_CLEANUP_INTERVAL_MINUTES,
         cookies: CookieConfig | None = None,
-        login_max_attempts: int = DEFAULT_LOGIN_MAX_ATTEMPTS,
-        login_attempt_window_seconds: int = DEFAULT_LOGIN_ATTEMPT_WINDOW_SECONDS,
-        login_lockout_base_seconds: int = DEFAULT_LOGIN_LOCKOUT_BASE_SECONDS,
-        login_lockout_max_seconds: int = DEFAULT_LOGIN_LOCKOUT_MAX_SECONDS,
-        on_login_success: Literal["clear_all", "clear_user_only"] = "clear_all",
+        login_max_attempts: int | None = None,
+        login_attempt_window_seconds: int | None = None,
+        login_lockout_base_seconds: int | None = None,
+        login_lockout_max_seconds: int | None = None,
+        on_login_success: LoginSuccessClears | None = None,
         management_routes: bool = False,
     ):
         if redis_url is not None and redis_client is not None:
@@ -119,11 +119,15 @@ class SessionTransport(Transport):
         self.remember_me_days = remember_me_days
         self.cleanup_interval_minutes = cleanup_interval_minutes
         self._cookie_override = cookies
-        self.login_max_attempts = login_max_attempts
-        self.login_attempt_window_seconds = login_attempt_window_seconds
-        self.login_lockout_base_seconds = login_lockout_base_seconds
-        self.login_lockout_max_seconds = login_lockout_max_seconds
-        self.on_login_success = on_login_success
+        lockout_overrides: dict[str, Any] = {
+            "max_attempts": login_max_attempts,
+            "attempt_window_seconds": login_attempt_window_seconds,
+            "lockout_base_seconds": login_lockout_base_seconds,
+            "lockout_max_seconds": login_lockout_max_seconds,
+            "on_login_success": on_login_success,
+        }
+        overrides = {name: value for name, value in lockout_overrides.items() if value is not None}
+        self.lockout: LockoutConfig | None = LockoutConfig(**overrides) if overrides else None
         self.management_routes = management_routes
         self.manager: SessionManager | None = None
 

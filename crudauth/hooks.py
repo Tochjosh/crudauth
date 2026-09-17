@@ -8,6 +8,7 @@ across *every* path - password register, OAuth, etc.
 from __future__ import annotations
 
 import inspect
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
@@ -15,6 +16,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from fastapi import Request
 
 __all__ = ["AuthHooks", "HookContext"]
+
+logger = logging.getLogger("crudauth.hooks")
 
 Hook = Callable[..., Optional[Awaitable[None]]]
 
@@ -30,9 +33,15 @@ class HookContext:
     extra: dict[str, Any] | None = None
 
 
-async def _maybe_await(result: Any) -> None:
-    if inspect.isawaitable(result):
-        await result
+async def _run_best_effort(name: str, hook: Hook | None, *args: Any, **kwargs: Any) -> None:
+    if hook is None:
+        return
+    try:
+        result = hook(*args, **kwargs)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.exception("crudauth: %s hook failed", name)
 
 
 @dataclass
@@ -48,6 +57,13 @@ class AuthHooks:
 
         AuthHooks(on_after_register=after_register)
         ```
+
+    Note:
+        Hooks run after the operation is done (the account created, the session
+        stored, the password changed), so they can't block or undo it. An
+        exception a hook raises is logged on the ``crudauth.hooks`` logger with its
+        traceback and the request completes normally. A hook that writes through
+        ``db`` owns that work: commit it, or roll back on its own failure.
     """
 
     on_after_register: Hook | None = None
@@ -60,37 +76,53 @@ class AuthHooks:
     on_after_sudo: Hook | None = None
 
     async def run_after_register(self, user: dict, *, db: Any, context: HookContext) -> None:
-        if self.on_after_register is not None:
-            await _maybe_await(self.on_after_register(user, db=db, context=context))
+        await _run_best_effort(
+            "on_after_register", self.on_after_register, user, db=db, context=context
+        )
 
     async def run_after_login(self, user: dict, *, request: Any, context: HookContext) -> None:
-        if self.on_after_login is not None:
-            await _maybe_await(self.on_after_login(user, request=request, context=context))
+        await _run_best_effort(
+            "on_after_login", self.on_after_login, user, request=request, context=context
+        )
 
     async def run_after_logout(self, user: dict, *, request: Any, context: HookContext) -> None:
-        if self.on_after_logout is not None:
-            await _maybe_await(self.on_after_logout(user, request=request, context=context))
+        await _run_best_effort(
+            "on_after_logout", self.on_after_logout, user, request=request, context=context
+        )
 
     async def run_after_recovery_verified(
         self, user: dict, *, db: Any, context: HookContext
     ) -> None:
-        if self.on_after_recovery_verified is not None:
-            await _maybe_await(self.on_after_recovery_verified(user, db=db, context=context))
+        await _run_best_effort(
+            "on_after_recovery_verified",
+            self.on_after_recovery_verified,
+            user,
+            db=db,
+            context=context,
+        )
 
     async def run_after_password_reset(self, user: dict, *, db: Any, context: HookContext) -> None:
-        if self.on_after_password_reset is not None:
-            await _maybe_await(self.on_after_password_reset(user, db=db, context=context))
+        await _run_best_effort(
+            "on_after_password_reset", self.on_after_password_reset, user, db=db, context=context
+        )
 
     async def run_after_password_changed(
         self, user: dict, *, db: Any, context: HookContext
     ) -> None:
-        if self.on_after_password_changed is not None:
-            await _maybe_await(self.on_after_password_changed(user, db=db, context=context))
+        await _run_best_effort(
+            "on_after_password_changed",
+            self.on_after_password_changed,
+            user,
+            db=db,
+            context=context,
+        )
 
     async def run_after_email_changed(self, user: dict, *, db: Any, context: HookContext) -> None:
-        if self.on_after_email_changed is not None:
-            await _maybe_await(self.on_after_email_changed(user, db=db, context=context))
+        await _run_best_effort(
+            "on_after_email_changed", self.on_after_email_changed, user, db=db, context=context
+        )
 
     async def run_after_sudo(self, user: dict, *, request: Any, context: HookContext) -> None:
-        if self.on_after_sudo is not None:
-            await _maybe_await(self.on_after_sudo(user, request=request, context=context))
+        await _run_best_effort(
+            "on_after_sudo", self.on_after_sudo, user, request=request, context=context
+        )

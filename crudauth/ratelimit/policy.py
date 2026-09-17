@@ -8,7 +8,6 @@ per-username failure counters with exponential backoff and round retention.
 from __future__ import annotations
 
 import logging
-from typing import Literal
 
 from ..constants import (
     DEFAULT_LOGIN_ATTEMPT_WINDOW_SECONDS,
@@ -17,7 +16,9 @@ from ..constants import (
     DEFAULT_LOGIN_MAX_ATTEMPTS,
     DEFAULT_LOGIN_ROUND_RETENTION_SECONDS,
 )
+from ..utils import canonical_identifier, client_ip_key
 from .base import RateLimiterBackend
+from .config import LoginSuccessClears
 from .constants import LOCKOUT_NAMESPACE
 
 __all__ = ["LockoutPolicy"]
@@ -47,19 +48,20 @@ class LockoutPolicy:
             offenders resume escalating rather than resetting. The TTL is slid
             forward on every lockout (sliding window), so a slow, paced attack
             keeps climbing the escalation ladder instead of forgetting it.
-        on_login_success: What a successful login clears.
-            ``"clear_all"`` (default) clears both the per-username and per-IP
-            failure pressure - friendly to legitimate users behind a shared
-            egress (corporate NAT / mobile CGNAT), at the cost of letting a
-            co-located attacker's per-IP budget be refreshed by an unrelated
-            user's success. ``"clear_user_only"`` clears just the username
-            dimension, keeping per-IP pressure - tighter against a single-source
-            brute force, but only safe when your per-IP key reliably identifies
-            an individual client (you terminate behind a proxy with
-            ``trusted_proxy_hops`` set AND your users aren't predominantly behind
-            shared egress); otherwise it can lock out innocent co-located users.
-            The lockout's primary key is ``ip + username`` together; this governs
-            only the secondary per-IP pressure valve on success.
+        on_login_success: What a successful login clears. Both modes clear the
+            username's own counters, lock and rounds. ``"clear_all"`` (default)
+            also takes back the per-IP pressure that this username's own failures
+            from this IP added in the current attempt window - friendly to a
+            legitimate user behind a shared egress (corporate NAT / mobile CGNAT)
+            who mistyped before getting in, while failures against other
+            usernames stay counted, so logging into your own account can't
+            launder a spray. ``"clear_user_only"`` keeps all per-IP pressure -
+            tighter against a single-source brute force, but only safe when your
+            per-IP key reliably identifies an individual client (you terminate
+            behind a proxy with ``trusted_proxy_hops`` set AND your users aren't
+            predominantly behind shared egress); otherwise it can lock out
+            innocent co-located users. A success never clears an IP lock or the
+            IP's escalation rounds.
         fail_open: On a backend error, allow (``True``) or block (``False``).
     """
 
@@ -72,7 +74,7 @@ class LockoutPolicy:
         lockout_base_seconds: int = DEFAULT_LOGIN_LOCKOUT_BASE_SECONDS,
         lockout_max_seconds: int = DEFAULT_LOGIN_LOCKOUT_MAX_SECONDS,
         round_retention_seconds: int = DEFAULT_LOGIN_ROUND_RETENTION_SECONDS,
-        on_login_success: Literal["clear_all", "clear_user_only"] = "clear_all",
+        on_login_success: LoginSuccessClears = "clear_all",
         fail_open: bool = False,
     ):
         self.backend = backend
@@ -90,9 +92,14 @@ class LockoutPolicy:
         """Record an attempt and report whether it's allowed.
 
         Args:
-            ip_address: Caller IP (one of the two keyed dimensions).
-            username: Submitted username/email (the other dimension).
-            success: When ``True``, clears all counters for this pair and allows.
+            ip_address: Caller IP (one of the two keyed dimensions). Keyed through
+                [client_ip_key][crudauth.utils.client_ip_key], so an IPv6 client
+                shares one budget across its ``/64``.
+            username: Submitted username/email (the other dimension). Keyed through
+                [canonical_identifier][crudauth.utils.canonical_identifier], so case
+                variants share one budget.
+            success: When ``True``, clears the username's counters (and, under
+                ``"clear_all"``, the IP pressure its own failures added) and allows.
 
         Returns:
             ``(allowed, attempts_remaining, retry_after_seconds)``.
@@ -101,24 +108,28 @@ class LockoutPolicy:
             The escalation branch issues several sequential backend ops (per-IP
             and per-username lock + round counters). It runs only on *repeated
             failures* (already past the attempt cap), so it's intentionally not
-            pipelined - the hot success/under-cap paths stay at one or two ops.
+            pipelined.
         """
         ns = LOCKOUT_NAMESPACE
-        ip_attempts = f"{ns}:ip:{ip_address}"
-        user_attempts = f"{ns}:user:{username}"
-        ip_lock = f"{ns}:lock:ip:{ip_address}"
-        user_lock = f"{ns}:lock:user:{username}"
-        ip_rounds = f"{ns}:rounds:ip:{ip_address}"
-        user_rounds = f"{ns}:rounds:user:{username}"
+        ip = client_ip_key(ip_address)
+        user = canonical_identifier(username)
+        ip_attempts = f"{ns}:ip:{ip}"
+        user_attempts = f"{ns}:user:{user}"
+        pair_attempts = f"{ns}:pair:{ip}:{user}"
+        ip_lock = f"{ns}:lock:ip:{ip}"
+        user_lock = f"{ns}:lock:user:{user}"
+        ip_rounds = f"{ns}:rounds:ip:{ip}"
+        user_rounds = f"{ns}:rounds:user:{user}"
         b = self.backend
 
         try:
             if success:
-                cleared = [user_attempts, user_lock, user_rounds]
-                if self.on_login_success == "clear_all":
-                    cleared += [ip_attempts, ip_lock, ip_rounds]
-                for key in cleared:
+                for key in (user_attempts, user_lock, user_rounds):
                     await b.delete(key)
+                if self.on_login_success == "clear_all":
+                    own_failures = await b.get_count(pair_attempts)
+                    if own_failures and await b.delete(pair_attempts):
+                        await b.increment(ip_attempts, -own_failures, self.attempt_window)
                 return True, None, 0
 
             active_lockout = max(await b.get_ttl(ip_lock), await b.get_ttl(user_lock))
@@ -127,6 +138,10 @@ class LockoutPolicy:
 
             ip_count = await b.increment(ip_attempts, 1, self.attempt_window)
             user_count = await b.increment(user_attempts, 1, self.attempt_window)
+            if self.on_login_success == "clear_all":
+                ip_window = await b.get_ttl(ip_attempts)
+                if ip_window > 0:
+                    await b.increment(pair_attempts, 1, ip_window)
             attempt_count = max(ip_count, user_count)
             remaining = max(0, self.max_attempts - attempt_count)
             if attempt_count <= self.max_attempts:

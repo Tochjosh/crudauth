@@ -81,6 +81,8 @@ class Principal:
 - **Role/ownership:** put the rule in `check=`; keep it a pure predicate on the `Principal`.
 - **App policy (welcome email, trial grant):** don't inline it in a route; register an `AuthHooks`
   callback (`on_after_register`, `on_after_login`, ...) so it fires uniformly across every path.
+  Hooks run after the operation completes; an exception in one is logged (`crudauth.hooks`) and
+  doesn't fail the request.
 - **Per-user rate limit:** `auth.rate_limit(action, key=KeyBy.USER)` resolves the user via the same
   cached authentication, so it composes with `current_user` without a second lookup. Use
   `KeyBy.USER_OR_IP` to fall back to the client IP for anonymous callers, and pass a function of

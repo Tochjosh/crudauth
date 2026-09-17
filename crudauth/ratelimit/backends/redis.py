@@ -47,16 +47,20 @@ class RedisBackend(RateLimiterBackend):
         return f"{self.prefix}{key}"
 
     async def increment(self, key: str, amount: int = 1, expiry: int | None = None) -> int:
-        """Increment; arm the TTL only when the key is first created.
+        """Increment and arm the TTL in one transaction (``INCRBY`` + ``EXPIRE NX``).
 
-        ``value == amount`` means this increment created the key - the
-        first-touch-only contract from [RateLimiterBackend.increment][crudauth.ratelimit.base.RateLimiterBackend.increment].
+        ``EXPIRE NX`` only sets a TTL on a key that has none, which is the
+        first-touch-only contract from [RateLimiterBackend.increment][crudauth.ratelimit.base.RateLimiterBackend.increment];
+        running both in one ``MULTI`` means a counter is never left without its
+        TTL, and a key that somehow has none gets one on its next increment.
         """
         k = self._k(key)
-        value = int(await self.client.incrby(k, amount))
-        if expiry is not None and value == amount:
-            await self.client.expire(k, expiry)
-        return value
+        async with self.client.pipeline(transaction=True) as pipe:
+            pipe.incrby(k, amount)
+            if expiry is not None:
+                pipe.expire(k, expiry, nx=True)
+            results = await pipe.execute()
+        return int(results[0])
 
     async def increment_and_refresh_ttl(
         self, key: str, amount: int = 1, expiry: int | None = None
@@ -76,6 +80,7 @@ class RedisBackend(RateLimiterBackend):
         return int(raw) if raw is not None else None
 
     async def get_ttl(self, key: str) -> int:
+        """Remaining TTL in seconds; ``0`` for an absent key or one with no TTL."""
         ttl = await self.client.ttl(self._k(key))
         return max(0, int(ttl))
 

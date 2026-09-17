@@ -6,6 +6,7 @@ import base64
 import functools
 import hashlib
 import inspect
+import ipaddress
 import secrets
 import unicodedata
 from typing import Any, Callable, overload
@@ -14,6 +15,8 @@ from urllib.parse import urlsplit
 import bcrypt
 from fastapi import Request
 from fastapi.concurrency import run_in_threadpool
+
+from .constants import IPV6_CLIENT_PREFIX_LENGTH
 
 __all__ = [
     "normalize_password",
@@ -31,6 +34,7 @@ __all__ = [
     "mask_email",
     "get_client_ip",
     "is_cross_site",
+    "client_ip_key",
     "safe_redirect_path",
 ]
 
@@ -293,15 +297,15 @@ def mask_email(email: str) -> str:
 
 
 def canonical_identifier(identifier: str) -> str:
-    """Normalize a login identifier the same way the user lookup does.
+    """Normalize a login identifier into its lockout key (trim + casefold).
 
-    Email identifiers are canonicalized (trim + lowercase) so that case variants
-    of one address (``v@x.com``, ``V@x.com``) collapse to a single rate-limit /
-    lockout key; otherwise an attacker could reset the per-username counter just
-    by varying the case while still hitting the same account. Usernames (no
-    ``@``) are left as-is, matching ``get_by_username`` which is case-sensitive.
+    Case variants of one identifier (``v@x.com`` / ``V@x.com``, ``bob`` / ``BOB``)
+    collapse to a single key, so an attacker can't reset the per-username counter
+    by varying the case while a case-insensitive lookup or collation still
+    reaches the same account. A key coarser than the lookup only makes the
+    lockout stricter.
     """
-    return canonical_email(identifier) if "@" in identifier else identifier
+    return identifier.strip().casefold()
 
 
 def is_cross_site(request: Request) -> bool:
@@ -324,11 +328,13 @@ def get_client_ip(request: Request, trusted_hops: int = 0) -> str:
         request: The incoming request.
         trusted_hops: Number of trusted reverse proxies in front of the app.
             ``0`` (default) ignores forwarding headers entirely and uses the
-            socket peer - correct when the app is directly exposed. ``N`` trusts
-            the ``N`` right-most ``X-Forwarded-For`` entries as your proxies and
-            returns the entry just left of them (clamped to the left-most entry
-            if the chain is shorter), which an attacker prepending fake values
-            cannot reach.
+            socket peer - correct when the app is directly exposed. ``N`` reads
+            the ``N``-th ``X-Forwarded-For`` entry from the right: each trusted
+            proxy appends the address it received the request from, so that
+            entry is the client address your outermost proxy saw, and values an
+            attacker prepends sit further left where they are never read. A
+            chain shorter than ``N`` resolves to its left-most entry. Repeated
+            ``X-Forwarded-For`` header lines are read as one list, in order.
 
     Returns:
         The resolved client IP, or ``"unknown"`` if it cannot be determined.
@@ -340,14 +346,39 @@ def get_client_ip(request: Request, trusted_hops: int = 0) -> str:
         ```
     """
     if trusted_hops > 0:
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            parts = [p.strip() for p in forwarded.split(",") if p.strip()]
-            if parts:
-                return parts[-min(trusted_hops, len(parts))]
+        forwarded = ",".join(request.headers.getlist("x-forwarded-for"))
+        parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+        if parts:
+            return parts[-min(trusted_hops, len(parts))]
     if request.client is not None:
         return request.client.host
     return "unknown"
+
+
+def client_ip_key(ip: str) -> str:
+    """The rate-limit and lockout key for a client IP.
+
+    An IPv4 address keys as itself. An IPv6 client keys by its ``/64`` network,
+    the smallest block a single subscriber is normally assigned, so rotating
+    addresses inside one allocation can't mint fresh budgets. An IPv4-mapped IPv6
+    address keys as its IPv4 address. Anything that isn't an IP (``"unknown"``)
+    is returned unchanged.
+
+    Example:
+        ```python
+        client_ip_key("2001:db8:1:2:3:4:5:6")  # "2001:db8:1:2::/64"
+        client_ip_key("::ffff:203.0.113.7")    # "203.0.113.7"
+        ```
+    """
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return ip
+    if isinstance(address, ipaddress.IPv4Address):
+        return str(address)
+    if address.ipv4_mapped is not None:
+        return str(address.ipv4_mapped)
+    return str(ipaddress.IPv6Network((address, IPV6_CLIENT_PREFIX_LENGTH), strict=False))
 
 
 def safe_redirect_path(target: str | None, default: str = "/") -> str:

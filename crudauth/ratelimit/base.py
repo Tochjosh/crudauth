@@ -40,8 +40,11 @@ class RateLimiterBackend(ABC):
             the key is created (the increment that brings it into existence) and
             NOT re-armed on subsequent increments - otherwise sustained load
             would push the TTL forward forever and a fixed window would never
-            close. Both in-tree backends honor this (Redis: ``value == amount``;
-            memory: key absent from the deadline map); a new backend must too.
+            close. The increment and arming the TTL must be atomic, so a failure
+            between them can't leave a counter that never expires. Both in-tree
+            backends honor this (Redis: ``INCRBY`` + ``EXPIRE NX`` in one
+            transaction; memory: key absent from the deadline map); a new backend
+            must too.
         """
 
     @abstractmethod

@@ -151,9 +151,11 @@ route needs the `Principal`, add `current_user()` to that route as well.
 re-authentication on the same route:
 
 ```python
+from crudauth.ratelimit import RateLimit
+
 @app.post(
     "/account/close",
-    dependencies=[Depends(auth.rate_limit("account"))],
+    dependencies=[Depends(auth.rate_limit("account_close", RateLimit(3, 3600)))],
 )
 async def close_account(
     user: Principal = Depends(auth.current_user(superuser=False)),
