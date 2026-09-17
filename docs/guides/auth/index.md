@@ -55,6 +55,14 @@ code never depends on how the request arrived.
 
     [Sudo mode →](sudo.md)
 
+-   **Two-factor authentication**
+
+    ---
+
+    Authenticator-app codes after the password, with recovery codes.
+
+    [Two-factor authentication →](mfa.md)
+
 </div>
 
 ## Where to start
@@ -71,6 +79,6 @@ code never depends on how the request arrived.
     **Supporting both at once?** [Multiple transports](multiple-transports.md).
 
     **Adding social login?** [OAuth](oauth.md). **Gating destructive actions?**
-    [Sudo mode](sudo.md).
+    [Sudo mode](sudo.md). **Second factor?** [Two-factor authentication](mfa.md).
 
 [Start with Protecting routes →](protecting-routes.md){ .md-button .md-button--primary }

@@ -72,6 +72,7 @@ fails with `email_unverified`:
   [Registration](../accounts/registration.md#setting-columns-the-server-controls).
 
 A disabled user (`is_active` false) gets no session: the callback fails with `account_inactive`.
+OAuth logins skip [two-factor authentication](mfa.md#oauth) unless `MfaConfig(oauth=True)`.
 
 This linking logic lives in `auth.oauth` (an `OAuthAccountService`, or `None` when OAuth isn't
 configured), so a hand-written callback can reuse it:

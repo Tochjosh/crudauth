@@ -71,7 +71,7 @@
     uv add crudauth
     ```
 
-For OAuth, Redis, and device parsing, install the extras: `pip install "crudauth[all]"`.
+For OAuth, Redis, device parsing, and two-factor authentication, install the extras: `pip install "crudauth[all]"`.
 
 CRUDAuth ships a [library skill](https://library-skills.io) embedded in the package, so AI coding
 agents follow its actual conventions in sync with the installed version. Install it into your project

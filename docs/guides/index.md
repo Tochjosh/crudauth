@@ -10,8 +10,8 @@ self-contained, shows the setup that produces the endpoints, and links into the
 
     ---
 
-    Protect routes, run cookie sessions and bearer tokens, add OAuth, and gate sensitive
-    actions with sudo.
+    Protect routes, run cookie sessions and bearer tokens, add OAuth and two-factor
+    authentication, and gate sensitive actions with sudo.
 
     [Authentication →](auth/index.md)
 

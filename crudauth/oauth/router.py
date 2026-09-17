@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from ..constants import OAUTH_STATE_TTL_SECONDS
 from ..core import AuthRuntime
@@ -205,13 +205,37 @@ def build_oauth_router(
         if not runtime.repo.is_active(user):
             return _error_response(ACCOUNT_INACTIVE)
 
+        redirect_url = safe_redirect_path(state_data.redirect_to, default=default_redirect)
+        if runtime.mfa is not None and runtime.mfa.config.oauth:
+            challenge = await runtime.mfa.challenge_login(
+                db,
+                user,
+                request=request,
+                transport="session",
+                lockout_identifier=f"oauth:{runtime.repo.user_id(user)}",
+                options={
+                    "metadata": {"login_type": "oauth", "oauth_provider": provider},
+                    "redirect_to": redirect_url,
+                },
+            )
+            if challenge is not None:
+                challenged: Response
+                if response_mode == "json":
+                    challenged = JSONResponse(challenge)
+                else:
+                    challenged = RedirectResponse(
+                        url=f"{default_redirect}#mfa_challenge={challenge['challenge']}",
+                        status_code=307,
+                    )
+                _clear_state_cookie(challenged)
+                return challenged
+
         session_id, csrf = await session_manager.create_session(
             request,
             user_id=runtime.repo.user_id(user),
             metadata={"login_type": "oauth", "oauth_provider": provider},
             token_version=runtime.repo.token_version(user),
         )
-        redirect_url = safe_redirect_path(state_data.redirect_to, default=default_redirect)
 
         await runtime.hooks.run_after_login(
             runtime.repo.to_dict(user),

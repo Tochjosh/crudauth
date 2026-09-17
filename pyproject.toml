@@ -35,7 +35,8 @@ dependencies = [
 oauth = ["httpx>=0.24.0"]
 redis = ["redis>=5.0.0"]
 useragent = ["user-agents>=2.2.0"]
-all = ["httpx>=0.24.0", "redis>=5.0.0", "user-agents>=2.2.0"]
+mfa = ["cryptography>=42.0.0"]
+all = ["httpx>=0.24.0", "redis>=5.0.0", "user-agents>=2.2.0", "cryptography>=42.0.0"]
 
 [project.urls]
 Homepage = "https://github.com/benavlabs/crudauth"
@@ -51,6 +52,7 @@ dev = [
     "httpx>=0.24.0",
     "redis>=5.0.0",
     "user-agents>=2.2.0",
+    "cryptography>=42.0.0",
     "fakeredis>=2.20.0",
     "ruff>=0.3.0",
     "mypy>=1.9.0",
@@ -65,6 +67,7 @@ docs = [
     "httpx>=0.24.0",
     "redis>=5.0.0",
     "user-agents>=2.2.0",
+    "cryptography>=42.0.0",
 ]
 
 [build-system]

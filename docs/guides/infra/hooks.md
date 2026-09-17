@@ -35,6 +35,9 @@ be lost, enqueue it from the hook rather than doing it inline.
 | `on_after_password_changed` | in-session password change (`/change-password`) | `user, db, context` |
 | `on_after_email_changed` | email change confirm | `user, db, context` |
 | `on_after_sudo` | a sudo elevation | `user, request, context` |
+| `on_after_mfa_enabled` | an account turns MFA on | `user, db, context` |
+| `on_after_mfa_disabled` | an account turns MFA off | `user, db, context` |
+| `on_after_recovery_code_used` | an MFA recovery code is spent | `user, db, context` |
 
 All hooks also receive a `context` keyword.
 

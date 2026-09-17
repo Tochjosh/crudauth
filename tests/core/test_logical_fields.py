@@ -15,7 +15,7 @@ import pathlib
 import re
 
 from crudauth.constants import LOGICAL_FIELDS
-from crudauth.models.mixin import AuthUserMixin
+from crudauth.models.mixin import make_auth_identity
 
 # Mixin columns that are audit metadata, not part of the logical contract.
 _NON_CONTRACT_COLUMNS = {"created_at", "updated_at"}
@@ -34,7 +34,8 @@ def test_logical_fields_match_auth_user_mixin() -> None:
     # AuthUserMixin is the canonical shipped model; LOGICAL_FIELDS must be exactly
     # its contract columns so a column added to the mixin can't be silently
     # missing from gating / the hook contract (and vice versa).
-    mixin_columns = set(AuthUserMixin.__annotations__) - _NON_CONTRACT_COLUMNS
+    full_shape = make_auth_identity(mfa=True)
+    mixin_columns = set(full_shape.__annotations__) - _NON_CONTRACT_COLUMNS
     assert set(LOGICAL_FIELDS) == mixin_columns
 
 

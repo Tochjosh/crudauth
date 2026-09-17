@@ -38,7 +38,8 @@ async def sudo(body: SudoIn, request: Request, user: Principal = Depends(auth.cu
 
 `elevate()` re-checks the password and stamps the session with an absolute expiry
 (`window_seconds` from now). A wrong password raises `401`; a non-session credential raises
-`403`.
+`403`. With [two-factor authentication](mfa.md), an enrolled user can pass an authenticator code
+instead: `elevate(user, code=body.code, db=db, request=request)`.
 
 ## Gating an action
 
@@ -78,4 +79,4 @@ auth = CRUDAuth(..., hooks=AuthHooks(on_after_sudo=on_sudo))
 
 ---
 
-[Next: Registration →](../accounts/registration.md){ .md-button .md-button--primary }
+[Next: Two-factor authentication →](mfa.md){ .md-button .md-button--primary }

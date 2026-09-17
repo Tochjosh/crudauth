@@ -74,6 +74,9 @@ class AuthHooks:
     on_after_password_changed: Hook | None = None
     on_after_email_changed: Hook | None = None
     on_after_sudo: Hook | None = None
+    on_after_mfa_enabled: Hook | None = None
+    on_after_mfa_disabled: Hook | None = None
+    on_after_recovery_code_used: Hook | None = None
 
     async def run_after_register(self, user: dict, *, db: Any, context: HookContext) -> None:
         await _run_best_effort(
@@ -125,4 +128,25 @@ class AuthHooks:
     async def run_after_sudo(self, user: dict, *, request: Any, context: HookContext) -> None:
         await _run_best_effort(
             "on_after_sudo", self.on_after_sudo, user, request=request, context=context
+        )
+
+    async def run_after_mfa_enabled(self, user: dict, *, db: Any, context: HookContext) -> None:
+        await _run_best_effort(
+            "on_after_mfa_enabled", self.on_after_mfa_enabled, user, db=db, context=context
+        )
+
+    async def run_after_mfa_disabled(self, user: dict, *, db: Any, context: HookContext) -> None:
+        await _run_best_effort(
+            "on_after_mfa_disabled", self.on_after_mfa_disabled, user, db=db, context=context
+        )
+
+    async def run_after_recovery_code_used(
+        self, user: dict, *, db: Any, context: HookContext
+    ) -> None:
+        await _run_best_effort(
+            "on_after_recovery_code_used",
+            self.on_after_recovery_code_used,
+            user,
+            db=db,
+            context=context,
         )

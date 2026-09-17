@@ -273,6 +273,52 @@ class SessionTransport(Transport):
         if not await self.manager.validate_csrf_token(session_id, header):
             raise CSRFException("Invalid CSRF token")
 
+    @property
+    def sets_cookies(self) -> bool:
+        return True
+
+    async def complete_login(
+        self, request: Request, response: Response, user: Any, options: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Create the session, set its cookies, and fire ``on_after_login``.
+
+        ``options``: ``remember_me`` for a persistent cookie, and ``metadata`` stored
+        on the session (an OAuth login passes ``login_type="oauth"``, which is also
+        the hook's ``transport``).
+
+        Returns:
+            ``{"id", "username", "csrf_token"}``.
+        """
+        assert self.manager is not None
+        runtime = self.runtime
+        remember_me = bool(options.get("remember_me"))
+        metadata = dict(options.get("metadata") or {})
+        if remember_me:
+            metadata[REMEMBER_ME_META_KEY] = True
+        session_id, csrf = await self.manager.create_session(
+            request,
+            user_id=runtime.repo.user_id(user),
+            metadata=metadata,
+            token_version=runtime.repo.token_version(user),
+        )
+        cookie_max_age = self.manager.timeout_seconds_for(metadata) if remember_me else None
+        self.manager.set_session_cookies(response, session_id, csrf, max_age=cookie_max_age)
+        await runtime.hooks.run_after_login(
+            runtime.repo.to_dict(user),
+            request=request,
+            context=HookContext(
+                ip_address=get_client_ip(request, runtime.trusted_proxy_hops),
+                user_agent=request.headers.get("user-agent"),
+                transport=metadata.get("login_type", self.name),
+                request=request,
+            ),
+        )
+        return {
+            "id": runtime.repo.user_id(user),
+            "username": runtime.repo.get(user, "username"),
+            "csrf_token": csrf,
+        }
+
     def clear_cookies(self, response: Response) -> None:
         """Expire the session and CSRF cookies."""
         assert self.manager is not None
@@ -308,36 +354,26 @@ class SessionTransport(Transport):
             assert self.manager is not None
             if is_cross_site(request):
                 raise ForbiddenException("Cross-site login requests are not allowed.")
-            ip = get_client_ip(request, runtime.trusted_proxy_hops)
             user = await runtime.authenticate_password(
-                db, form_data.username, form_data.password, request=request
-            )
-
-            metadata = {REMEMBER_ME_META_KEY: True} if remember_me else {}
-            session_id, csrf = await self.manager.create_session(
-                request,
-                user_id=runtime.repo.user_id(user),
-                metadata=metadata,
-                token_version=runtime.repo.token_version(user),
-            )
-            cookie_max_age = self.manager.timeout_seconds_for(metadata) if remember_me else None
-            self.manager.set_session_cookies(response, session_id, csrf, max_age=cookie_max_age)
-
-            await runtime.hooks.run_after_login(
-                runtime.repo.to_dict(user),
+                db,
+                form_data.username,
+                form_data.password,
                 request=request,
-                context=HookContext(
-                    ip_address=ip,
-                    user_agent=request.headers.get("user-agent"),
-                    transport=self.name,
-                    request=request,
-                ),
+                record_success=runtime.mfa is None,
             )
-            return {
-                "id": runtime.repo.user_id(user),
-                "username": runtime.repo.get(user, "username"),
-                "csrf_token": csrf,
-            }
+            options = {"remember_me": remember_me}
+            if runtime.mfa is not None:
+                challenge = await runtime.mfa.challenge_login(
+                    db,
+                    user,
+                    request=request,
+                    transport=self.name,
+                    lockout_identifier=form_data.username,
+                    options=options,
+                )
+                if challenge is not None:
+                    return challenge
+            return await self.complete_login(request, response, user, options)
 
         @router.post("/logout")
         async def logout(request: Request, response: Response, db: Annotated[Any, Depends(db_dep)]):

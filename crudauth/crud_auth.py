@@ -38,6 +38,9 @@ from .exceptions import (
 )
 from .hooks import AuthHooks, HookContext
 from .identity import IdentityConfig
+from .mfa import MfaConfig, MfaService
+from .mfa.constants import CHALLENGE_STORAGE_PREFIX, MFA_FIELDS
+from .mfa.router import build_mfa_router
 from .oauth import OAuthAccountService, OAuthProviderFactory
 from .oauth.router import build_oauth_router
 from .principal import Principal
@@ -167,6 +170,7 @@ class CRUDAuth:
         lockout: LockoutConfig | None = None,
         trusted_proxy_hops: int = 0,
         sudo: SudoConfig | None = None,
+        mfa: MfaConfig | None = None,
         warn_on_memory_backend: bool = True,
         password_policy: PasswordPolicy | None = None,
     ):
@@ -268,6 +272,10 @@ class CRUDAuth:
                 actions) with this [SudoConfig][crudauth.sudo.SudoConfig]. Requires
                 a session transport - elevation is stamped on the server-side
                 session. Exposes ``auth.sudo`` and ``auth.require_sudo()``.
+            mfa: Enable TOTP two-factor authentication with this
+                [MfaConfig][crudauth.mfa.config.MfaConfig]. The model needs the MFA
+                columns (``make_auth_identity(mfa=True)``) and ``cryptography``
+                (``crudauth[mfa]``). Exposes ``auth.mfa`` and the ``/mfa`` routes.
             warn_on_memory_backend: Log a startup warning when an in-memory
                 backend is active (the zero-config default). In-memory state is
                 per-process, so under multiple workers it silently breaks; set
@@ -347,6 +355,10 @@ class CRUDAuth:
         self.runtime.lockout = self._build_lockout(lockout)
         for transport in self.transports:
             transport.bind(self.runtime)
+
+        self._mfa_challenge_store: AbstractSessionStorage[Any] | None = None
+        if mfa is not None:
+            self._build_mfa(mfa, SECRET_KEY)
 
         self.sudo: SudoManager | None = None
         if sudo is not None:
@@ -501,6 +513,8 @@ class CRUDAuth:
         stores = (self._email_token_store, self._oauth_state_storage)
         if any(isinstance(store, MemorySessionStorage) for store in stores):
             memory.append("one-time-token/OAuth-state stores")
+        if isinstance(self._mfa_challenge_store, MemorySessionStorage):
+            memory.append("MFA-challenge store")
         if not memory:
             return
         logger.warning(
@@ -681,6 +695,32 @@ class CRUDAuth:
             **paths,
         )
 
+    # --- mfa wiring ----------------------------------------------------------
+    def _build_mfa(self, config: MfaConfig, secret_key: str) -> None:
+        missing = [field for field in MFA_FIELDS if not self.repo.has(field)]
+        if missing:
+            raise ValueError(
+                f"mfa=MfaConfig(...) needs the MFA columns {missing} on the user model. "
+                "Use make_auth_identity(mfa=True), or map them via column_map=."
+            )
+        if secret_key in config.encryption_keys:
+            raise ValueError("MfaConfig.encryption_key must differ from SECRET_KEY.")
+        backend, redis_client = self._backend_config()
+        self._mfa_challenge_store = get_session_storage(
+            backend,
+            prefix=CHALLENGE_STORAGE_PREFIX,
+            expiration=config.challenge_ttl_seconds,
+            client=redis_client,
+        )
+        self.runtime.mfa = MfaService(
+            runtime=self.runtime, config=config, challenge_store=self._mfa_challenge_store
+        )
+
+    @property
+    def mfa(self) -> MfaService | None:
+        """The [MfaService][crudauth.mfa.service.MfaService], or ``None`` when MFA isn't configured."""
+        return self.runtime.mfa
+
     # --- sudo wiring ---------------------------------------------------------
     def _build_sudo(self, config: SudoConfig) -> None:
         if self._session_transport is None:
@@ -694,6 +734,7 @@ class CRUDAuth:
             backend=self.runtime.rate_limiter,
             hooks=self.hooks,
             config=config,
+            mfa=self.runtime.mfa,
         )
 
     # --- the current_user() factory -----------------------------------------
@@ -716,7 +757,13 @@ class CRUDAuth:
         )
 
     async def authenticate_password(
-        self, db: Any, identifier: str, password: str, *, request: Request
+        self,
+        db: Any,
+        identifier: str,
+        password: str,
+        *,
+        request: Request,
+        record_success: bool = True,
     ) -> Any:
         """Verify a username/email + password with the full login hardening.
 
@@ -738,7 +785,9 @@ class CRUDAuth:
                 ...
             ```
         """
-        return await self.runtime.authenticate_password(db, identifier, password, request=request)
+        return await self.runtime.authenticate_password(
+            db, identifier, password, request=request, record_success=record_success
+        )
 
     def issue_tokens(self, user: Any, *, scopes: list[str] | None = None) -> dict[str, Any]:
         """Mint a bearer access (+refresh) token pair for a user.
@@ -1257,6 +1306,8 @@ class CRUDAuth:
             router.include_router(self._oauth_router)
         if self._email_service is not None:
             router.include_router(build_email_router(auth=self, service=self._email_service))
+        if self.runtime.mfa is not None:
+            router.include_router(build_mfa_router(auth=self, service=self.runtime.mfa))
         return router
 
     @property
@@ -1306,6 +1357,8 @@ class CRUDAuth:
             await self._oauth_state_storage.initialize()
         if self._email_token_store is not None:
             await self._email_token_store.initialize()
+        if self._mfa_challenge_store is not None:
+            await self._mfa_challenge_store.initialize()
 
     async def shutdown(self) -> None:
         """Close connections. Call in lifespan teardown.
@@ -1318,6 +1371,8 @@ class CRUDAuth:
             closers.append(self._oauth_state_storage.close)
         if self._email_token_store is not None:
             closers.append(self._email_token_store.close)
+        if self._mfa_challenge_store is not None:
+            closers.append(self._mfa_challenge_store.close)
         if self.runtime.rate_limiter is not None:
             closers.append(self.runtime.rate_limiter.close)
         if self._owned_redis is not None:
