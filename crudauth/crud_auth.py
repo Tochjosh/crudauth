@@ -13,7 +13,18 @@ async def me(user: Principal = Depends(auth.current_user())):
 import inspect
 import logging
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Annotated, Any, Awaitable, Callable, Literal, Sequence, TypeVar
+from types import MappingProxyType
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Awaitable,
+    Callable,
+    Literal,
+    Mapping,
+    Sequence,
+    TypeVar,
+)
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
@@ -32,6 +43,7 @@ from .mfa.constants import CHALLENGE_STORAGE_PREFIX, MFA_FIELDS
 from .mfa.router import build_mfa_router
 from .oauth import (
     AbstractOAuthProvider,
+    GenericOIDCProvider,
     OAuthAccountService,
     OAuthCredentials,
     OAuthProviderFactory,
@@ -296,6 +308,7 @@ class CRUDAuth:
         self._email_service: EmailFlowService | None = None
         self._oauth_service: OAuthAccountService | None = None
         self._oauth_router: APIRouter | None = None
+        self._oauth_providers: dict[str, AbstractOAuthProvider] = {}
         if mfa is not None:
             self._build_mfa(mfa)
         if sudo is not None:
@@ -566,7 +579,7 @@ class CRUDAuth:
         if not redirect_base_url:
             raise ValueError("redirect_base_url is required when oauth=... is configured")
         paths = resolve_oauth_paths(oauth_paths)
-        providers = {
+        self._oauth_providers = {
             name: self._oauth_provider(
                 name, credentials, callback_url(redirect_base_url, paths, name)
             )
@@ -580,7 +593,7 @@ class CRUDAuth:
         )
         self._oauth_router = build_oauth_router(
             runtime=self.runtime,
-            providers=providers,
+            providers=self._oauth_providers,
             state_storage=state_storage,
             account_service=self._oauth_service,
             session_manager=sessions,
@@ -589,6 +602,15 @@ class CRUDAuth:
             response_mode=response_mode,
             **paths,
         )
+
+    @property
+    def oauth_providers(self) -> Mapping[str, AbstractOAuthProvider]:
+        """The configured OAuth providers, by the name they were configured under.
+
+        Read-only; the provider objects carry what was resolved for them, such as
+        an OIDC provider's discovery document.
+        """
+        return MappingProxyType(self._oauth_providers)
 
     def _oauth_provider(
         self, name: str, credentials: OAuthCredentials, redirect_uri: str
@@ -599,6 +621,15 @@ class CRUDAuth:
                 f"to store and match its account id. Add it (e.g. "
                 f"'{name}_id: Mapped[str | None] = mapped_column(unique=True, index=True, "
                 f"default=None)') or map it via column_map=."
+            )
+        if credentials.issuer:
+            return GenericOIDCProvider(
+                credentials.client_id,
+                credentials.client_secret,
+                redirect_uri,
+                issuer=credentials.issuer,
+                provider_name=name,
+                scopes=credentials.scopes,
             )
         return OAuthProviderFactory.create_provider(
             name,
@@ -1054,6 +1085,8 @@ class CRUDAuth:
             await self.runtime.rate_limiter.initialize()
         for transport in self.transports:
             await transport.initialize()
+        for provider in self._oauth_providers.values():
+            await provider.initialize()
         for _, store in self._stores:
             await store.initialize()
 

@@ -17,12 +17,28 @@ def _utcnow() -> datetime:
 class OAuthCredentials(BaseModel):
     """Client credentials for a provider, supplied via ``oauth={...}``.
 
-    Leave ``client_secret`` empty for a public client (PKCE only).
+    Leave ``client_secret`` empty for a public client (PKCE only). Set ``issuer``
+    for any OpenID Connect provider that isn't built in (Keycloak, Zitadel,
+    Authentik, Auth0, Okta, Entra ID, ...): its endpoints are then read from
+    ``{issuer}/.well-known/openid-configuration`` when the app starts, instead of
+    the name being looked up in
+    [OAuthProviderFactory][crudauth.oauth.factory.OAuthProviderFactory].
+
+    Example:
+        ```python
+        oauth={
+            "google": OAuthCredentials(client_id=..., client_secret=...),
+            "keycloak": OAuthCredentials(
+                client_id=..., client_secret=..., issuer="https://sso.example.com/realms/main"
+            ),
+        }
+        ```
     """
 
     client_id: str
     client_secret: str = Field(default="", repr=False)
     scopes: list[str] | None = None
+    issuer: str | None = None
 
 
 class OAuthUserInfo(BaseModel):

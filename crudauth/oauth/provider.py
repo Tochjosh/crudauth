@@ -13,7 +13,13 @@ from abc import ABC, abstractmethod
 from typing import Any
 from urllib.parse import urlencode
 
-from .constants import OAUTH_HTTP_TIMEOUT_SECONDS, PKCE_VERIFIER_BYTES, STATE_BYTES
+from .constants import (
+    OAUTH_HTTP_TIMEOUT_SECONDS,
+    PKCE_VERIFIER_BYTES,
+    STATE_BYTES,
+    TOKEN_AUTH_BASIC,
+    TOKEN_AUTH_POST,
+)
 from .schemas import OAuthUserInfo
 
 __all__ = ["AbstractOAuthProvider"]
@@ -75,6 +81,7 @@ class AbstractOAuthProvider(ABC):
     """
 
     requires_client_secret: bool = False
+    token_auth_method: str = TOKEN_AUTH_POST
 
     def __init__(
         self,
@@ -87,6 +94,7 @@ class AbstractOAuthProvider(ABC):
         token_endpoint: str,
         userinfo_endpoint: str,
         provider_name: str,
+        transport: Any | None = None,
     ):
         if self.requires_client_secret and not client_secret:
             raise ValueError(
@@ -101,6 +109,22 @@ class AbstractOAuthProvider(ABC):
         self.token_endpoint = token_endpoint
         self.userinfo_endpoint = userinfo_endpoint
         self.provider_name = provider_name
+        self.transport = transport
+
+    # --- lifecycle -----------------------------------------------------------
+    async def initialize(self) -> None:
+        """Resolve whatever the provider needs before it can serve a login.
+
+        A no-op for a provider with static endpoints.
+        [CRUDAuth.initialize][crudauth.crud_auth.CRUDAuth.initialize] awaits this
+        for every configured provider, so a provider that discovers its endpoints
+        can do it there.
+        """
+        return None
+
+    def _ensure_ready(self) -> None:
+        """Raise if the provider isn't usable yet; called before every outbound step."""
+        return None
 
     # --- PKCE / state --------------------------------------------------------
     @staticmethod
@@ -136,6 +160,7 @@ class AbstractOAuthProvider(ABC):
             ``code_verifier`` is present only when ``pkce`` is true and must be
             persisted to verify the callback.
         """
+        self._ensure_ready()
         state = state or self.generate_state()
         params: dict[str, str] = {
             "client_id": self.client_id,
@@ -177,8 +202,11 @@ class AbstractOAuthProvider(ABC):
 
         Note:
             ``client_secret`` is sent only when set, so a public client (PKCE
-            only) sends no client authentication.
+            only) sends no client authentication. It rides in the form body
+            (``client_secret_post``) unless ``token_auth_method`` says the
+            provider wants HTTP Basic (``client_secret_basic``).
         """
+        self._ensure_ready()
         httpx = _require_httpx()
         data = {
             "client_id": self.client_id,
@@ -186,15 +214,20 @@ class AbstractOAuthProvider(ABC):
             "redirect_uri": self.redirect_uri,
             "grant_type": "authorization_code",
         }
-        if self.client_secret:
+        auth = None
+        if self.client_secret and self.token_auth_method == TOKEN_AUTH_BASIC:
+            auth = (self.client_id, self.client_secret)
+        elif self.client_secret:
             data["client_secret"] = self.client_secret
         if code_verifier:
             data["code_verifier"] = code_verifier
         req_headers = {"Accept": "application/json"}
         if headers:
             req_headers.update(headers)
-        async with httpx.AsyncClient(timeout=OAUTH_HTTP_TIMEOUT_SECONDS) as client:
-            resp = await client.post(self.token_endpoint, data=data, headers=req_headers)
+        async with httpx.AsyncClient(
+            timeout=OAUTH_HTTP_TIMEOUT_SECONDS, transport=self.transport
+        ) as client:
+            resp = await client.post(self.token_endpoint, data=data, headers=req_headers, auth=auth)
             resp.raise_for_status()
             return resp.json()
 
@@ -211,8 +244,11 @@ class AbstractOAuthProvider(ABC):
         Raises:
             httpx.HTTPStatusError: If the userinfo endpoint returns an error status.
         """
+        self._ensure_ready()
         httpx = _require_httpx()
-        async with httpx.AsyncClient(timeout=OAUTH_HTTP_TIMEOUT_SECONDS) as client:
+        async with httpx.AsyncClient(
+            timeout=OAUTH_HTTP_TIMEOUT_SECONDS, transport=self.transport
+        ) as client:
             resp = await client.get(
                 self.userinfo_endpoint,
                 headers={
