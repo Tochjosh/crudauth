@@ -160,3 +160,22 @@ class LockoutPolicy:
             if self.fail_open:
                 return True, None, 0
             return False, 0, self.lockout_base
+
+    async def forget_attempt(self, ip_address: str, username: str) -> None:
+        """Take back the one attempt a correct password recorded, leaving earlier failures.
+
+        For a login that still needs a second factor: the password neither clears the
+        counters nor uses up the budget the codes that follow are checked against.
+        """
+        ns = LOCKOUT_NAMESPACE
+        ip = client_ip_key(ip_address)
+        user = canonical_identifier(username)
+        keys = [f"{ns}:ip:{ip}", f"{ns}:user:{user}"]
+        if self.on_login_success == "clear_all":
+            keys.append(f"{ns}:pair:{ip}:{user}")
+        try:
+            for key in keys:
+                if (await self.backend.get_count(key) or 0) > 0:
+                    await self.backend.increment(key, -1, self.attempt_window)
+        except Exception as exc:
+            logger.warning("lockout backend error while forgetting an attempt: %s", exc)

@@ -29,14 +29,18 @@ Startup raises if a column is missing (map with `column_map=`), the key isn't a 
   the transport's `complete_login`; after setup it adds `recovery_codes`; `on_after_login` fires here.
 - Challenges: hashed in the session store, `challenge_ttl_seconds` (300), single use, dead after
   `max_code_attempts` (5) wrong codes. Wrong codes count against the login lockout; a correct password
-  doesn't clear it, a correct code does. Session challenges refuse `Sec-Fetch-Site: cross-site`. A
+  neither clears it nor counts against it (`LockoutPolicy.forget_attempt`), a correct code clears it. Session challenges refuse `Sec-Fetch-Site: cross-site`. A
   password reset or change (`token_version` bump) voids an outstanding challenge.
 - Codes: 6 ASCII digits (spaces ignored), 30 s steps, ±1 step drift, constant-time; a step is claimed
   atomically (`repo.claim_totp_step`), so no replay, even concurrently. A recovery code works in place
   of a code.
-- OAuth: an OAuth claim of an unverified account removes its MFA enrollment. Skipped unless `MfaConfig(oauth=True)`; then the callback returns the challenge (JSON) or
-  redirects to `redirect_base_url#mfa_challenge=...`. `POST /mfa/challenge {"challenge"}` returns
-  `setup` details; the verify response carries `redirect_to`.
+- `required` applies at password login (and OAuth with `oauth=True`); existing sessions/refresh tokens keep
+  working. Enabling MFA doesn't sign out other sessions (revoke them in `on_after_mfa_enabled`).
+- OAuth: an OAuth claim of an unverified account removes its MFA enrollment. Skipped unless `MfaConfig(oauth=True)`,
+  even for `required` accounts (startup warns); then the callback returns the challenge (JSON) or
+  redirects to `redirect_base_url#mfa_challenge=...` (strip it from history with
+  `history.replaceState`). `POST /mfa/challenge {"challenge"}` returns `setup` details; the verify
+  response carries `redirect_to`.
 - A hand-written login: `authenticate_password(..., record_success=False)`, then
   `auth.mfa.challenge_login(db, user, request=..., transport="session", lockout_identifier=...,
   options={...})`; `None` means no MFA for this account (lockout already cleared).
