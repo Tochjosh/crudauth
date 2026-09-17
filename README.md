@@ -62,7 +62,7 @@
 
 ```bash
 pip install crudauth            # core (session + bearer)
-pip install "crudauth[all]"     # + httpx (oauth), redis, user-agents
+pip install "crudauth[all]"     # + httpx (oauth), redis, user-agents, cryptography (mfa)
 ```
 
 Or with uv:

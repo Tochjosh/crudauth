@@ -14,6 +14,7 @@ make_auth_identity(
     identifiers=("email", "username"),   # which columns can be a login identifier
     recovery="email",                    # the recovery factor: "email", another field name, or None
     oauth=True,                          # emit oauth-linkage columns (google_id, github_id, ...)
+    mfa=False,                           # emit the TOTP columns (needed for CRUDAuth(mfa=...))
 )
 ```
 

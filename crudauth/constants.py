@@ -64,7 +64,14 @@ LOGICAL_FIELDS = (
     "github_id",
     "oauth_created_at",
     "oauth_updated_at",
+    "totp_secret_encrypted",
+    "totp_confirmed_at",
+    "totp_last_step",
+    "mfa_recovery_codes",
 )
+
+# Logical fields hooks never receive: they hold (encrypted or hashed) second-factor secrets.
+HOOK_HIDDEN_FIELDS = frozenset({"totp_secret_encrypted", "mfa_recovery_codes"})
 
 # --- registration gating --------------------------------------------------
 # The base set of fields self-registration may set, before any opt-in extras.

@@ -190,23 +190,26 @@ class BearerTransport(Transport):
             """
             if self.refresh == REFRESH_LOCATION_COOKIE and is_cross_site(request):
                 raise ForbiddenException("Cross-site login requests are not allowed.")
-            ip = get_client_ip(request, runtime.trusted_proxy_hops)
             user = await runtime.authenticate_password(
-                db, form_data.username, form_data.password, request=request
-            )
-
-            body = self.issue_tokens(user, scopes=form_data.scopes, response=response)
-            await runtime.hooks.run_after_login(
-                runtime.repo.to_dict(user),
+                db,
+                form_data.username,
+                form_data.password,
                 request=request,
-                context=HookContext(
-                    ip_address=ip,
-                    user_agent=request.headers.get("user-agent"),
-                    transport=self.name,
-                    request=request,
-                ),
+                record_success=runtime.mfa is None,
             )
-            return body
+            options = {"scopes": form_data.scopes}
+            if runtime.mfa is not None:
+                challenge = await runtime.mfa.challenge_login(
+                    db,
+                    user,
+                    request=request,
+                    transport=self.name,
+                    lockout_identifier=form_data.username,
+                    options=options,
+                )
+                if challenge is not None:
+                    return challenge
+            return await self.complete_login(request, response, user, options)
 
         @router.post("/refresh")
         async def refresh_token(request: Request, db: Annotated[Any, Depends(db_dep)]):
@@ -239,6 +242,32 @@ class BearerTransport(Transport):
                 return {"detail": "Logged out"}
 
         return router
+
+    async def complete_login(
+        self, request: Request, response: Response, user: Any, options: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Issue the token pair for the requested ``scopes`` and fire ``on_after_login``.
+
+        Returns:
+            ``{"access_token", "token_type"}``, plus ``refresh_token`` with ``refresh="body"``.
+        """
+        runtime = self.runtime
+        body = self.issue_tokens(user, scopes=options.get("scopes"), response=response)
+        await runtime.hooks.run_after_login(
+            runtime.repo.to_dict(user),
+            request=request,
+            context=HookContext(
+                ip_address=get_client_ip(request, runtime.trusted_proxy_hops),
+                user_agent=request.headers.get("user-agent"),
+                transport=self.name,
+                request=request,
+            ),
+        )
+        return body
+
+    @property
+    def sets_cookies(self) -> bool:
+        return self.refresh == REFRESH_LOCATION_COOKIE
 
     def clear_cookies(self, response: Response) -> None:
         """Expire the refresh-token cookie (``refresh="cookie"`` only)."""

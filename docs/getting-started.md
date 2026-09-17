@@ -18,7 +18,7 @@ config specific to each feature.
     uv add crudauth
     ```
 
-OAuth, Redis, and device parsing are extras: `pip install "crudauth[all]"`.
+OAuth, Redis, device parsing, and two-factor authentication are extras: `pip install "crudauth[all]"`.
 
 ## Your user model
 

@@ -47,9 +47,9 @@ only** (open-redirect hardened).
      creating both require `info.email_verified`, the account-takeover defense.
    - **verified-email match** → links the provider to the existing account (`{provider}_id` set), so
      the user can then sign in by password or provider. If that account's own email was never
-     verified, the link **claims** it: unusable password, `token_version` bumped, sessions signed out,
-     email marked verified. An account already linked to another id of that provider is refused
-     (`provider_already_linked`).
+     verified, the link **claims** it: unusable password, MFA enrollment removed, `token_version`
+     bumped, sessions signed out, email marked verified. An account already linked to another id of
+     that provider is refused (`provider_already_linked`).
    - **otherwise** → a new user, created verified, with an unusable password and a unique username
      derived from the profile, cut to the `username` column's length (32 when unbounded), with `_1`,
      `_2`, ... then a random suffix on collision.

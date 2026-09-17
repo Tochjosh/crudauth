@@ -28,8 +28,10 @@ from .utils import verify_password_async
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import Request
+    from sqlalchemy.ext.asyncio import AsyncSession
 
     from .hooks import AuthHooks
+    from .mfa.service import MfaService
     from .principal import Principal
     from .ratelimit.base import RateLimiterBackend
     from .repository import UserRepository
@@ -77,19 +79,21 @@ class SudoManager:
     def __init__(
         self,
         *,
-        session_manager: "SessionManager",
-        repo: "UserRepository",
-        backend: "RateLimiterBackend | None",
-        hooks: "AuthHooks",
+        session_manager: SessionManager,
+        repo: UserRepository,
+        backend: RateLimiterBackend | None,
+        hooks: AuthHooks,
         config: SudoConfig,
+        mfa: MfaService | None = None,
     ):
         self.session_manager = session_manager
         self.repo = repo
         self.backend = backend
         self.hooks = hooks
         self.config = config
+        self.mfa = mfa
 
-    def _session_id(self, principal: "Principal") -> str:
+    def _session_id(self, principal: Principal) -> str:
         """The principal's session id, or raise 403 for a non-session credential."""
         session_id = principal.metadata.get("session_id")
         if principal.transport != SessionTransport.name or not session_id:
@@ -97,19 +101,34 @@ class SudoManager:
         return str(session_id)
 
     async def elevate(
-        self, principal: "Principal", password: str, *, request: "Request | None" = None
+        self,
+        principal: Principal,
+        password: str | None = None,
+        *,
+        code: str | None = None,
+        db: AsyncSession | None = None,
+        request: Request | None = None,
     ) -> datetime:
-        """Re-verify ``password`` and stamp the session as elevated.
+        """Re-verify ``password``, or an authenticator ``code``, and stamp the session as elevated.
+
+        A ``code`` needs MFA configured, an enrolled account, and the request's ``db``
+        (the code's time step is claimed so it can't be reused).
 
         Returns the absolute instant the elevation expires.
 
         Raises:
+            ValueError: Neither or both of ``password`` and ``code``, or a ``code``
+                without MFA or ``db``.
             ForbiddenException: The principal isn't session-backed, or its
                 session has since vanished (stale credential).
-            UnauthorizedException: Wrong password (counts toward the lockout).
+            UnauthorizedException: Wrong password or code (counts toward the lockout).
             SudoLockoutError: Too many wrong attempts; sudo is locked (429 +
                 ``Retry-After``). The elevation stamp is cleared on lockout.
         """
+        if (password is None) == (code is None):
+            raise ValueError("Pass exactly one of password or code.")
+        if code is not None and (self.mfa is None or db is None):
+            raise ValueError("Elevating with a code needs mfa=MfaConfig(...) and the request's db.")
         session_id = self._session_id(principal)
         user = principal.user
         if user is None:
@@ -121,10 +140,10 @@ class SudoManager:
         if attempt > self.config.max_attempts:
             await self._lock(session_id, user_id)
 
-        if not await verify_password_async(password, self.repo.get(user, "hashed_password")):
+        if not await self._verify(user, password, code, db):
             if attempt >= self.config.max_attempts:
                 await self._lock(session_id, user_id)
-            raise UnauthorizedException("Incorrect password")
+            raise UnauthorizedException("Incorrect password" if code is None else "Invalid code")
 
         await self._clear_failures(user_id)
         elevated_until = _utcnow() + timedelta(seconds=self.config.window_seconds)
@@ -145,7 +164,16 @@ class SudoManager:
         )
         return elevated_until
 
-    async def is_elevated(self, principal: "Principal") -> bool:
+    async def _verify(
+        self, user: Any, password: str | None, code: str | None, db: AsyncSession | None
+    ) -> bool:
+        if code is not None and self.mfa is not None and db is not None:
+            return await self.mfa.verify_totp(db, user, code)
+        return password is not None and await verify_password_async(
+            password, self.repo.get(user, "hashed_password")
+        )
+
+    async def is_elevated(self, principal: Principal) -> bool:
         """Whether the principal's session holds an unexpired sudo elevation."""
         session_id = principal.metadata.get("session_id")
         if principal.transport != SessionTransport.name or not session_id:

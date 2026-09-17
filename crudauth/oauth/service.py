@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..exceptions import OAuthAccountException
+from ..mfa.constants import MFA_FIELDS
 from ..provisioning import NewUserContext, NewUserFields, resolve_new_user_fields
 from ..repository import UserRepository
 from ..utils import canonical_email, make_unusable_password
@@ -89,8 +90,9 @@ class OAuthAccountService:
         Note:
             Only a verified provider email links or creates an account. Linking
             to an account whose own email was never verified claims it: its
-            password becomes unusable, its ``token_version`` is bumped, its
-            sessions are signed out, and its email is marked verified.
+            password becomes unusable, any two-factor enrollment is removed, its
+            ``token_version`` is bumped, its sessions are signed out, and its
+            email is marked verified.
         """
         user = await self.repo.get_by_oauth(db, info.provider, info.provider_user_id)
         if user is not None:
@@ -137,6 +139,7 @@ class OAuthAccountService:
         if claimed:
             data["hashed_password"] = make_unusable_password()
             data["email_verified"] = True
+            data.update(dict.fromkeys(MFA_FIELDS))
         await self.repo.update(db, user, data)
         if claimed:
             await self.repo.increment_token_version(db, user)

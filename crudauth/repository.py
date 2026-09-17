@@ -12,11 +12,12 @@ import logging
 from collections.abc import Iterable, Iterator
 from typing import Any
 
-from sqlalchemy import String, TypeDecorator, UniqueConstraint, select, update
+from sqlalchemy import String, TypeDecorator, UniqueConstraint, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import TypeEngine
 
 from .constants import (
+    HOOK_HIDDEN_FIELDS,
     LOGICAL_FIELDS,
     REGISTRATION_ALLOWED_FIELDS,
     REGISTRATION_GATED_FIELDS,
@@ -462,6 +463,46 @@ class UserRepository:
         await db.commit()
         await db.refresh(user)
 
+    async def claim_totp_step(self, db: AsyncSession, user: Any, step: int) -> bool:
+        """Record ``step`` as the user's last accepted TOTP step, if it's newer.
+
+        One conditional ``UPDATE``, so two requests racing with the same code can't
+        both claim it.
+
+        Returns:
+            ``True`` if this call claimed the step.
+        """
+        last_step = self._attr("totp_last_step")
+        result = await db.execute(
+            update(self.model)
+            .where(
+                self._attr("id") == self.user_id(user), or_(last_step.is_(None), last_step < step)
+            )
+            .values({last_step: step})
+        )
+        await db.commit()
+        await db.refresh(user)
+        return bool(getattr(result, "rowcount", 0))
+
+    async def replace_if_unchanged(
+        self, db: AsyncSession, user: Any, logical: str, expected: Any, value: Any
+    ) -> bool:
+        """Set ``logical`` to ``value`` only if it still holds ``expected`` (compare-and-set).
+
+        Returns:
+            ``True`` if the value was replaced.
+        """
+        column = self._attr(logical)
+        matches = column.is_(None) if expected is None else column == expected
+        result = await db.execute(
+            update(self.model)
+            .where(self._attr("id") == self.user_id(user), matches)
+            .values({column: value})
+        )
+        await db.commit()
+        await db.refresh(user)
+        return bool(getattr(result, "rowcount", 0))
+
     def to_dict(self, user: Any) -> dict[str, Any]:
         """Project a user row onto the logical contract (for hooks).
 
@@ -469,6 +510,11 @@ class UserRepository:
             Contract-only by design - the dict holds the crudauth logical fields
             (``id``, ``email``, ...), not your app's own columns. A hook that
             needs ``full_name`` should re-load the row via ``db`` using the
-            ``id``, not expect it in this dict.
+            ``id``, not expect it in this dict. The stored TOTP secret and
+            recovery-code hashes are left out.
         """
-        return {f: self.get(user, f) for f in LOGICAL_FIELDS if self.has(f)}
+        return {
+            f: self.get(user, f)
+            for f in LOGICAL_FIELDS
+            if self.has(f) and f not in HOOK_HIDDEN_FIELDS
+        }

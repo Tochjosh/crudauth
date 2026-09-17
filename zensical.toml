@@ -101,6 +101,7 @@ edit_uri = "edit/main/docs/"
         { "Multiple transports" = "guides/auth/multiple-transports.md" },
         { "OAuth" = "guides/auth/oauth.md" },
         { "Sudo mode" = "guides/auth/sudo.md" },
+        { "Two-factor authentication" = "guides/auth/mfa.md" },
     ] },
     { "Accounts" = [
         { "Overview" = "guides/accounts/index.md" },
@@ -149,6 +150,7 @@ edit_uri = "edit/main/docs/"
     { "Provisioning" = "api/provisioning.md" },
     { "Passwords" = "api/passwords.md" },
     { "Sudo" = "api/sudo.md" },
+    { "MFA" = "api/mfa.md" },
     { "UserRepository" = "api/repository.md" },
     { "Models" = "api/models.md" },
     { "Rate limiting & lockout" = "api/ratelimit.md" },

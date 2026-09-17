@@ -45,6 +45,7 @@ from .crud_auth import CRUDAuth, SessionInfo
 from .email.service import EmailFlowService
 from .hooks import AuthHooks, HookContext
 from .identity import IdentityConfig
+from .mfa import MfaConfig, MfaService
 from .models.mixin import AuthUserMixin, make_auth_identity
 from .oauth import OAuthAccountService, OAuthCredentials
 from .principal import Principal
@@ -94,12 +95,14 @@ __all__ = [
     "PasswordPolicy",
     "PasswordContext",
     "SudoConfig",
+    "MfaConfig",
     # toolbox: reusable building blocks (use the wired services off `auth`, or
     # construct/type them directly). Token issuance is intentionally not exported
     # here - use `auth.issue_tokens(...)` so the scope clamp and epoch come along.
     "UserRepository",
     "SessionManager",
     "SudoManager",
+    "MfaService",
     "EmailFlowService",
     "OAuthAccountService",
     "get_password_hash",

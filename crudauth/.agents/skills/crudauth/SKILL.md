@@ -5,7 +5,7 @@ description: >
   package) — covers `CRUDAuth`, the `AuthUserMixin` / `make_auth_identity` user model, `IdentityConfig`,
   `current_user(...)` gates, session + bearer transports, OAuth (Google/GitHub), email verification /
   password reset / change, custom email bodies (`EmailSender` / `EmailContext` / `DeliveryChannel`),
-  registration allowlists and provisioning, sudo mode, and account shapes (email, username-only, phone
+  registration allowlists and provisioning, sudo mode, TOTP two-factor authentication (`MfaConfig`), and account shapes (email, username-only, phone
   recovery). Activate when the code imports `crudauth`, defines a `CRUDAuth(...)`, a `current_user`
   dependency, an `AuthUserMixin` model, or an `EmailSender`, or when the user asks to add login /
   signup / sessions / JWT / OAuth / email verification to a FastAPI app, even without naming the library.
@@ -179,6 +179,14 @@ existing account, or creates one, **only on a provider-verified email**. See `re
 
 ---
 
+## Two-factor authentication
+
+`CRUDAuth(..., mfa=MfaConfig(issuer="Acme", encryption_key=FERNET_KEY, required=...))` with a
+`make_auth_identity(mfa=True)` model. Enrolled accounts get a challenge from `/login` / `/token`, answered at
+`POST /mfa/verify`. See `references/mfa.md`.
+
+---
+
 ## Production
 
 In-memory backends aren't shared across workers (crudauth warns at startup). Use Redis and wire the
@@ -282,3 +290,5 @@ Load on demand:
   the message kinds, verify/reset/change endpoints, non-enumeration.
 - `references/oauth.md` — providers, `OAuthCredentials`, account linking, `/set-password`, custom providers.
 - `references/production.md` — Redis storage, lifespan, rate limiting & lockout, sudo mode, proxies, secrets.
+- `references/mfa.md` — TOTP two-factor: `MfaConfig`, `make_auth_identity(mfa=True)`, login challenges,
+  `/mfa/*` routes, recovery codes, sudo with a code.

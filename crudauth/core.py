@@ -32,6 +32,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
     from .email.service import EmailFlowService
     from .hooks import AuthHooks
+    from .mfa.service import MfaService
     from .ratelimit import LockoutPolicy, RateLimiterBackend
     from .repository import UserRepository
 
@@ -80,6 +81,8 @@ class AuthRuntime:
             uses unless it's configured directly: the one ``CRUDAuth`` built from
             ``redis_url``, or the caller's ``redis_client``.
         transports: Every configured transport, in precedence order.
+        mfa: The [MfaService][crudauth.mfa.service.MfaService], or ``None`` when MFA
+            isn't configured.
 
     Note:
         ``lockout`` is a single shared policy used by BOTH the session ``/login``
@@ -100,6 +103,7 @@ class AuthRuntime:
     trusted_proxy_hops: int = 0
     redis_client: Any = None
     transports: list[Transport] = field(default_factory=list)
+    mfa: "MfaService | None" = None
 
     def clear_cookies(self, response: Response) -> None:
         """Expire the cookie credentials of every configured transport, for a logout."""
@@ -107,7 +111,13 @@ class AuthRuntime:
             transport.clear_cookies(response)
 
     async def authenticate_password(
-        self, db: "AsyncSession", identifier: str, password: str, *, request: Request
+        self,
+        db: "AsyncSession",
+        identifier: str,
+        password: str,
+        *,
+        request: Request,
+        record_success: bool = True,
     ) -> Any:
         """Verify a username/email + password with the full login hardening.
 
@@ -119,6 +129,11 @@ class AuthRuntime:
         row on success - the caller then establishes a session or mints a token.
         A stored hash made before Unicode normalization is replaced with a
         normalized one on a successful login.
+
+        With ``record_success=False`` a correct password leaves the lockout counters
+        in place, for a login that still needs its second factor; call
+        [record_login_success][crudauth.core.AuthRuntime.record_login_success] once
+        the login completes.
 
         Raises:
             RateLimitException: The lockout is engaged for this IP/identifier.
@@ -154,9 +169,14 @@ class AuthRuntime:
             raise UnauthorizedException("Incorrect username or password")
         if new_hash is not None:
             await self.repo.update(db, user, {"hashed_password": new_hash})
-        if self.lockout is not None:
-            await self.lockout.check_and_record(ip, identifier, success=True)
+        if record_success:
+            await self.record_login_success(ip, identifier)
         return user
+
+    async def record_login_success(self, ip_address: str, identifier: str) -> None:
+        """Clear the login lockout pressure a completed login earned."""
+        if self.lockout is not None:
+            await self.lockout.check_and_record(ip_address, identifier, success=True)
 
 
 @dataclass
@@ -276,6 +296,23 @@ class Transport(ABC):
 
         The default sets no cookies, so it clears none.
         """
+
+    @property
+    def sets_cookies(self) -> bool:
+        """Whether a completed login sets a cookie, so a cross-site request must not complete it."""
+        return False
+
+    async def complete_login(
+        self, request: Request, response: Response, user: Any, options: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Issue this transport's credential for a user whose login is fully verified.
+
+        ``/login`` and ``/token`` end here, and so does ``/mfa/verify`` once the code
+        checks out, with the ``options`` the login started with. Fires
+        ``on_after_login`` and returns the response body. The default raises, since a
+        transport without a login route has nothing to issue.
+        """
+        raise NotImplementedError(f"The {self.name!r} transport doesn't issue login credentials.")
 
     async def initialize(self) -> None:
         """Open connections / start background work. Called from ``auth.initialize()``."""

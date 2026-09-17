@@ -6,7 +6,7 @@ Every HTTP route CRUDAuth can mount, in one place. You get them by including the
 app.include_router(auth.router)
 ```
 
-Which routes appear depends on your config (transports, `email=`, `oauth=`, `management_routes`). For
+Which routes appear depends on your config (transports, `email=`, `oauth=`, `mfa=`, `management_routes`). For
 the full behavior of each flow, follow the guide links; this page is the at-a-glance map.
 
 **Auth column:** *none* = unauthenticated allowed; *any* = any authenticated transport; *session* =
@@ -76,6 +76,22 @@ Mounted per provider in `oauth={...}` (needs a `SessionTransport` + `redirect_ba
 |---|---|---|---|
 | GET | `/oauth/{provider}/authorize` | none | Start the flow; `?redirect_to=` (same-origin relative) for the post-login landing. |
 | GET | `/oauth/{provider}/callback` | none | Finish the flow, link/create the user, establish a session. |
+
+## Two-factor authentication
+
+Mounted by `mfa=MfaConfig(...)`. With MFA, `/login` and `/token` return
+`{"mfa_required": true, "challenge", "expires_in"}` (plus `setup` for a required account that
+isn't enrolled) instead of a credential for accounts that use it. ([Two-factor authentication](../guides/auth/mfa.md))
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| POST | `/mfa/verify` | none | `{"challenge", "code"}` → the credential the login started (cookies or tokens), plus `recovery_codes` after enrollment. `401` wrong code, `400` bad challenge. |
+| POST | `/mfa/challenge` | none | `{"challenge"}` → `{"setup"}` details of a live setup challenge (for OAuth redirects). |
+| GET | `/mfa` | authenticated | `{"enabled", "required", "recovery_codes_remaining"}`. |
+| POST | `/mfa/totp/setup` | authenticated | `{"password"}` → `{"secret", "otpauth_uri"}`; `400` if already enabled. |
+| POST | `/mfa/totp/confirm` | authenticated | `{"code"}` → `{"recovery_codes"}`, shown once. |
+| POST | `/mfa/totp/disable` | authenticated | `{"code"}` (authenticator or recovery); `403` when MFA is required. |
+| POST | `/mfa/recovery-codes/regenerate` | authenticated | `{"code"}` → new `{"recovery_codes"}`. |
 
 ## Not a mounted route: sudo
 

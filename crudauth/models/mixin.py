@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from sqlalchemy import DateTime, String
+from sqlalchemy import DateTime, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 __all__ = ["AuthUserMixin", "make_auth_identity"]
@@ -29,6 +29,7 @@ def make_auth_identity(
     identifiers: Iterable[str] = ("email", "username"),
     recovery: str | None = "email",
     oauth: bool = True,
+    mfa: bool = False,
 ) -> type[Any]:
     """Build a declarative mixin carrying crudauth's user columns for one account shape.
 
@@ -50,6 +51,9 @@ def make_auth_identity(
             ``phone``) with your own constraints, the same way you would any column.
         oauth: Emit the oauth-linkage columns (``oauth_provider`` / ``google_id`` /
             ``github_id`` / timestamps). Required for OAuth login.
+        mfa: Emit the TOTP columns (``totp_secret_encrypted``, ``totp_confirmed_at``,
+            ``totp_last_step``, ``mfa_recovery_codes``). Required for
+            ``CRUDAuth(mfa=...)``.
 
     Returns:
         A declarative mixin class. Inherit it on your model alongside ``Base``.
@@ -120,6 +124,16 @@ def make_auth_identity(
             Mapped[datetime | None],
             mapped_column(DateTime(timezone=True), default=None),
         )
+
+    if mfa:
+        add("totp_secret_encrypted", Mapped[str | None], mapped_column(String(255), default=None))
+        add(
+            "totp_confirmed_at",
+            Mapped[datetime | None],
+            mapped_column(DateTime(timezone=True), default=None),
+        )
+        add("totp_last_step", Mapped[int | None], mapped_column(default=None))
+        add("mfa_recovery_codes", Mapped[str | None], mapped_column(Text, default=None))
 
     add("created_at", Mapped[datetime], mapped_column(DateTime(timezone=True), default=_utcnow))
     add(
