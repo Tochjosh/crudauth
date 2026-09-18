@@ -20,7 +20,9 @@ wrong layer.
 **Framework spine** is the set of ports plus the composition root: `crud_auth.py`
 (`CRUDAuth`, the one object you configure and mount), `core.py` (the `Transport` port and the
 shared runtime types), `resolution.py` (the per-request principal resolver), `principal.py`,
-`repository.py`, `identity.py` (the account-shape contract), and `hooks.py`. `CRUDAuth` is the only module allowed to import from every layer.
+`repository.py`, `identity.py` (the account-shape contract), `protocols.py` (`AuthSurface`, the
+slice of `CRUDAuth` a route builder may use), and `hooks.py`. `CRUDAuth` is the only module
+allowed to import from every layer.
 
 **Cross-cutting leaves** depend on nothing internal: `constants.py`, `exceptions.py`, and
 `utils/` (password hashing, identifier canonicalization, request helpers, callback
@@ -28,8 +30,8 @@ introspection), re-exported as one `crudauth.utils` namespace. The registration 
 `constants.py` because the spine consumes it.
 
 **Features** are vertical slices, each owning its router, service, schemas, and constants:
-`register/`, `email/`, `oauth/`. A feature may import the spine, the leaves, and the
-subsystems, but never another feature.
+`register/`, `account/`, `email/`, `oauth/`, `mfa/`. A feature may import the spine, the leaves,
+and the subsystems, but never another feature.
 
 **Pluggable subsystems** are a `base.py` port over a `backends/` adapter set, so you swap the
 backend without touching callers: `transports/` (session, bearer), `ratelimit/`, and
@@ -102,11 +104,15 @@ that were skipped. Failed resolutions are never cached.
   and a matching `IdentityConfig`; the runtime reads the shape, so username-only, phone-recovery,
   and email accounts are configuration, not forks.
 - **A feature:** add a package with its own `router.py` (plus `service.py` / `schemas.py` /
-  `constants.py`) and mount it from `crud_auth.py`, without importing sibling features.
+  `constants.py`) and mount it from `crud_auth.py`, without importing sibling features. The
+  builder takes `AuthSurface` (`protocols.py`), the typed slice of `CRUDAuth` a route may use,
+  rather than importing `CRUDAuth` itself - which would be circular.
 
 ## One caveat: route modules and deferred annotations
 
 Modules that declare FastAPI routes deliberately **omit** `from __future__ import annotations`,
 because FastAPI must see real types (not deferred strings) to resolve `Depends(...)` and
-request-body models. This applies to `crud_auth.py`, `register/route.py`, the transports, and
-the OAuth and email routers. Everywhere else, keep the `from __future__` import.
+request-body models. This applies to `crud_auth.py` and to every module that builds routes or
+route dependencies: `register/route.py`, `account/router.py`, the OAuth, email and MFA routers,
+`transports/session/{routes,management}.py`, `transports/bearer/routes.py`, `transports/login.py`,
+and `ratelimit/dependency.py`. Everywhere else, keep the `from __future__` import.

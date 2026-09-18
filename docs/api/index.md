@@ -26,8 +26,12 @@ otherwise, each is importable straight from the top-level `crudauth` package.
 
 | Page | What's in it |
 |---|---|
-| [OAuth](oauth.md) | Credentials, the provider port and factory, and account linking. |
-| [Email](email.md) | `EmailConfig`, the `EmailSender` port, and `EmailFlowService`. |
+| [OAuth](oauth.md) | Credentials, the provider port and factory, the generic OIDC provider, and account linking. |
+| [MFA](mfa.md) | `MfaConfig`, `MfaRequirement`, and the `MfaService` behind the TOTP routes. |
+| [Identity](identity.md) | `make_auth_identity` and `IdentityConfig` - the account-shape contract. |
+| [Email](email.md) | `EmailConfig`, the `EmailSender` port, `EmailFlowService`, and `EmailFlowResult`. |
+| [Delivery channels](delivery.md) | The `DeliveryChannel` port and the built-in `EmailChannel`. |
+| [Provisioning](provisioning.md) | `NewUserFields` and the context a new account is built from. |
 | [Hooks](hooks.md) | `AuthHooks` lifecycle callbacks and `HookContext`. |
 | [Passwords](passwords.md) | `PasswordPolicy` and the `PasswordContext` its validators can read. |
 | [Sudo](sudo.md) | `SudoConfig` and `SudoManager` for re-authentication. |

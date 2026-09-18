@@ -34,7 +34,7 @@
 
 <hr>
 <p align="justify">
-<b>crudauth</b> gives you one <code>CRUDAuth</code> object that wires cookie sessions, JWT bearer tokens, OAuth, and email flows (verify / reset / change) - with CSRF, escalating login lockout, sudo mode, and multi-device session management - over <b>your own</b> SQLAlchemy <code>User</code> model. App policy lives in hooks, not in forked dependency code. Sessions and bearer both resolve to the same <code>Principal</code>, so narrowing or adding a transport never changes how you authorize a route.
+<b>crudauth</b> gives you one <code>CRUDAuth</code> object that wires cookie sessions, JWT bearer tokens, OAuth, two-factor authentication, and email flows (verify / reset / change) - with CSRF, escalating login lockout, sudo mode, and multi-device session management - over <b>your own</b> SQLAlchemy <code>User</code> model. App policy lives in hooks, not in forked dependency code. Sessions and bearer both resolve to the same <code>Principal</code>, so narrowing or adding a transport never changes how you authorize a route.
 </p>
 
 <hr>
@@ -44,7 +44,8 @@
 - **Transport-agnostic**: cookie sessions and JWT bearer tokens behind a single `Principal`; first credential present wins, and authorization code never depends on *which* transport authenticated.
 - **Your model, your schema**: works over your existing SQLAlchemy `User` via a logical-field `column_map` - no forced renames, no second user table.
 - **Secure by default**: synchronizer-token CSRF, escalating per-IP/per-user login lockout, bcrypt with SHA-256 pre-hash (no 72-byte truncation), timing-equalized login, and trusted-proxy IP resolution.
-- **OAuth**: Google, GitHub, or a custom provider - with the `state` bound to the initiating browser to block login CSRF.
+- **OAuth and OpenID Connect**: Google, GitHub, any OIDC provider from its issuer (Keycloak, Zitadel, Authentik, Auth0, Okta, Entra ID), or a custom one - with the `state` bound to the initiating browser to block login CSRF.
+- **Two-factor authentication**: opt-in TOTP with encrypted secrets and single-use recovery codes, challenged from both login routes and, if you want it, from OAuth.
 - **Email flows**: verify / reset / change - you implement the `EmailSender` port (render your own HTML from `context.link`), the package mints and verifies the signed, single-use tokens.
 - **Sudo mode**: short-lived re-authentication to gate sensitive actions, stamped on the session and cleared on logout.
 - **Multi-device sessions**: list, revoke one, or "sign out everywhere", with a configurable per-user session cap.
@@ -176,13 +177,14 @@ async def lifespan(app: FastAPI):
     await auth.shutdown()
 ```
 
-## OAuth, email, hooks, sudo
+## OAuth, MFA, email, hooks, sudo
 
-See the usage cookbook for OAuth (Google / GitHub / custom providers), email
-flows (implement the `EmailSender` port; the package mints/verifies the signed
-tokens), lifecycle hooks (`AuthHooks` - welcome email, trial grant, audit log),
-sudo mode (`sudo=SudoConfig()` + `auth.require_sudo()`), and dropping to
-primitives.
+See the usage cookbook for OAuth (Google / GitHub / any OIDC issuer / custom
+providers), two-factor authentication (`mfa=MfaConfig()` - TOTP with recovery
+codes), email flows (implement the `EmailSender` port; the package mints/verifies
+the signed tokens), lifecycle hooks (`AuthHooks` - welcome email, trial grant,
+audit log), sudo mode (`sudo=SudoConfig()` + `auth.require_sudo()`), and dropping
+to primitives.
 
 ## Architecture
 

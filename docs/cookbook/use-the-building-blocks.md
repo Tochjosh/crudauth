@@ -25,7 +25,7 @@ What you get off `auth`:
 | `auth.repo` | the [`UserRepository`](../api/repository.md): `get_by_email`, `resolve_login`, `create`, `update`, `token_version`, ... |
 | `auth.sessions` | the [`SessionManager`](../api/transports.md#sessionmanager): `create_session`, `revoke`, `revoke_all`, CSRF, lockout |
 | `auth.sudo` | the [`SudoManager`](../api/sudo.md): `elevate`, `is_elevated` |
-| `auth.emails` | the [`EmailFlowService`](../api/email.md) (or `None`): `request_password_reset`, `reset_password`, ... |
+| `auth.emails` | the [`EmailFlowService`](../api/email.md) (or `None`): `request_password_reset`, `reset_password`, ... The confirm methods return `EmailFlowResult(user, redirect_to)`. |
 | `auth.oauth` | the [`OAuthAccountService`](../api/oauth.md) (or `None`): `get_or_create_user` |
 | `auth.current_user(...)` | the gate dependency — works on *your* routes |
 | `auth.rate_limit(...)` / `auth.require_sudo()` | the other dependencies |
