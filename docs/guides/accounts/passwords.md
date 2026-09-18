@@ -119,7 +119,8 @@ password.
 ### What the policy covers
 
 The policy runs in CRUDAuth's routes, on a custom `register_schema` too, and in
-`EmailFlowService.reset_password` when you call it directly. Code that sets a password itself
+`EmailFlowService.reset_password` when you call it directly (which returns
+`EmailFlowResult(user, redirect_to)`). Code that sets a password itself
 with `get_password_hash_async` should check it first:
 
 ```python

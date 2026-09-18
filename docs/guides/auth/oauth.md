@@ -173,6 +173,16 @@ A provider that isn't OpenID Connect (GitHub's OAuth, for instance) needs a clas
 never accepts a public client, so a missing secret fails at startup instead of at the first login.
 See the [OAuth reference](../../api/oauth.md) for the port and factory.
 
+Two hooks are there for a provider that needs setup before it can serve a login: `initialize()`,
+which `CRUDAuth.initialize()` awaits for every configured provider (that's where the OIDC provider
+fetches its discovery document), and `_ensure_ready()`, which runs before each outbound step so an
+unconfigured provider raises a useful error instead of building a broken URL. Both are no-ops by
+default. A provider can also take a `transport=` - an httpx transport used for its outbound calls,
+for a proxy, a client certificate, or a test double.
+
+`auth.oauth_providers` is the configured providers by name, read-only, which is where an OIDC
+provider's resolved discovery document ends up.
+
 ## Custom paths and JSON responses
 
 `oauth_paths` moves the routes. Both paths must contain `{provider}`:

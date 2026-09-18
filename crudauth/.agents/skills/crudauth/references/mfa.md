@@ -12,7 +12,7 @@ auth = CRUDAuth(..., mfa=MfaConfig(
     issuer="Acme",                                     # shown in the authenticator app
     encryption_key=os.environ["MFA_ENCRYPTION_KEY"],  # Fernet key; list = rotation (first encrypts)
     required=lambda user: user.is_superuser,           # False (default) | True | sync/async predicate
-    oauth=False,                                       # challenge OAuth logins too
+    oauth=False,                                       # default: an OAuth login skips the second factor
 ))
 ```
 

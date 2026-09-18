@@ -5,6 +5,92 @@ breaking changes; those are called out explicitly.
 
 ___
 
+## 0.7.0 - 2026-09-17
+
+Second factors, any identity provider, and a security pass over everything that was already here.
+TOTP two-factor authentication is opt-in and covers both login routes and OAuth; an OpenID Connect
+provider needs only its issuer; and five hardening branches went through the OAuth linking, session,
+recovery, password and rate-limit paths. The internals were split up along the way, which is the
+only place anything breaks.
+
+#### Added
+- **TOTP two-factor authentication** (`mfa=MfaConfig(...)`): RFC 6238 codes with a ±1 step drift
+  window, encrypted secrets (Fernet, with key rotation), hashed single-use recovery codes, and an
+  atomic per-step claim so one code can't be spent twice. Seven routes under `/mfa`
+  (`verify`, `challenge`, the `GET` status, `totp/setup`, `totp/confirm`, `totp/disable`,
+  `recovery-codes/regenerate`), a login challenge that both `/login` and `/token` hand off to, and
+  an `oauth=` switch for whether a social login must also pass the second factor. Enrollment can
+  be required for a group of accounts.
+- **Any OpenID Connect provider from its issuer** (`OAuthCredentials(issuer=...)`): Keycloak,
+  Zitadel, Authentik, Auth0, Okta or Entra ID need no provider class. Endpoints come from
+  `{issuer}/.well-known/openid-configuration` during `await auth.initialize()`, the document must
+  declare the issuer it was fetched from, the issuer must be https off localhost, and client
+  authentication follows what the provider advertises (`client_secret_post`, or Basic when that's
+  all it takes). `GenericOIDCProvider.from_discovery(...)` builds one outside `CRUDAuth`.
+- **Public OAuth clients**: `client_secret` is sent only when set, so a PKCE-only client isn't
+  rejected for sending an empty one (thanks @carlosplanchon).
+- **A return destination through the recovery links** (`redirect_to` on the three request endpoints):
+  carried inside the signed token rather than the emailed URL, so it survives the link being opened
+  on another device and there is nothing in the URL to edit. The confirm responses hand it back;
+  same-origin relative paths only.
+- **Configurable password policies** (`password_policy=PasswordPolicy(...)`): enforced on
+  registration, set/change password, reset, and the direct service calls (thanks @emiliano-go).
+- **Dynamic rate limits**: per-request limit resolution, `KeyBy.USER_OR_IP`, key callbacks that can
+  read the principal, and public access to the configured backend (thanks @emiliano-go).
+- **`auth.resolve_principal(request, update_activity=False)`** for middleware and other
+  request-level code, sharing the per-request principal cache (thanks @emiliano-go).
+- **Injected Redis clients** on `CRUDAuth` and `SessionTransport`: a client you pass stays yours and
+  isn't closed on shutdown (thanks @emiliano-go).
+- **A configurable OAuth router**: custom paths and a JSON response mode alongside the redirect one
+  (thanks @emiliano-go).
+- **`safe_redirect_path`** exported for application routes - the same same-origin check the OAuth
+  callback uses (thanks @emiliano-go).
+- **`auth.oauth_providers`**, the configured providers by name, and an optional `transport=` on any
+  provider for a proxy, a client certificate, or a test double.
+
+#### Security
+- **OAuth account linking**: an unverified local account is claimed rather than silently linked, a
+  provider that doesn't report a verified email can't link to an existing account, and the callback
+  no longer leaks which addresses exist.
+- **Sessions**: `/sessions` and its delete route work on opaque handles instead of raw session ids,
+  sessions are bound to `token_version`, writes are compare-and-set, logout clears a bearer refresh
+  cookie too, and a login the browser marks `Sec-Fetch-Site: cross-site` is refused.
+- **Recovery**: tokens are bound to the account state they were minted for (a password reset dies
+  when the password or recovery value changes), the previous address is notified on an email change,
+  and signup stays non-enumerable.
+- **Passwords**: hashing and verification run off the event loop, the unusable-password path is
+  timing-equalized, and passwords are NFKC-normalized before hashing.
+- **Rate limiting and lockout**: `X-Forwarded-For` is read against a trusted-proxy boundary, TTLs are
+  set atomically with the counter, `clear_all` can't be used to wipe a spray, the lockout is
+  configurable (`LockoutConfig`), and a correct password that still needs a second factor neither
+  counts against the lockout nor clears it.
+
+#### Changed
+- `CRUDAuth.initialize()` also initializes the configured OAuth providers, which is where an OIDC
+  provider resolves its endpoints. An app that never called it now needs to.
+- The composition root was split up: the account and session-management routes, the rate-limit
+  dependencies, the OAuth path helpers and the transports' own routes moved into their own modules,
+  `utils.py` became a package, and the route builders take a typed `AuthSurface` instead of `Any`.
+  Every documented import path is unchanged.
+
+#### Breaking changes
+- **`EmailFlowService.confirm_recovery_verification` / `reset_password` / `confirm_email_change`
+  return `EmailFlowResult(user, redirect_to)`** instead of the user row. Unpack it, or read `.user`;
+  code that ignores the return value is unaffected.
+- **`DELETE /sessions/{id}` takes a session handle**, and each entry's `id` in `GET /sessions` is
+  that handle (the SHA-256 of the session id) rather than the session id itself. The response shape
+  is unchanged; a client that stored the old values must re-read the list.
+- **Internals that moved**: `auth._apply_rate_limit` is gone (use `enforce_rate_limit` or
+  `auth.rate_limit(...)`), the per-feature store attributes are one registry, `SessionInfo` is
+  defined in `crudauth.transports.session.management` (importing it from `crudauth` is unchanged),
+  `_shared_router` and `_add_session_management_routes` are gone, and four transport helpers dropped
+  their underscore: `SessionTransport.enforce_csrf`, `BearerTransport.read_refresh`, `clamp_scopes`
+  and `access_token`.
+- **`AbstractOAuthProvider` gained `initialize()` and `_ensure_ready()`** (both no-ops by default)
+  and an optional `transport=` argument; a subclass that passes its arguments through is unaffected.
+
+___
+
 ## 0.6.0 - 2026-06-21
 
 CRUDAuth as a toolbox. The hardened auth flows that used to live only inside the route handlers

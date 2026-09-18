@@ -29,6 +29,8 @@ validation, client-IP resolution, and display masking.
 
 ::: crudauth.utils.mask_email
 
+::: crudauth.utils.is_cross_site
+
 ::: crudauth.utils.get_client_ip
 
 ::: crudauth.utils.client_ip_key

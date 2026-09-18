@@ -26,7 +26,7 @@ One object is the composition root:
   authorization code never depends on how the request authenticated.
 
 `CRUDAuth` (capitalized) is the object you build; `crudauth` lowercase is the package/import. This
-skill covers `crudauth >= 0.4`.
+skill covers `crudauth >= 0.7` (MFA and the generic OIDC provider landed in 0.7).
 
 **The highest-value content is the [Security invariants](#security-invariants-do-not-break-these) and
 [Gotchas](#gotchas) sections — read them before writing code.** Most crudauth mistakes are security

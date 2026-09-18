@@ -30,18 +30,19 @@
 </p>
 <hr>
 <p align="justify">
-<b>CRUDAuth</b> gives you one <code>CRUDAuth</code> object that wires cookie sessions, JWT bearer tokens, OAuth, and email flows (verify / reset / change) - with CSRF, escalating login lockout, sudo mode, and multi-device session management - over <b>your own</b> SQLAlchemy <code>User</code> model. Sessions and bearer both resolve to the same <code>Principal</code>, so narrowing or adding a transport never changes how you authorize a route, and app policy lives in <b>hooks</b> instead of forked dependency code.
+<b>CRUDAuth</b> gives you one <code>CRUDAuth</code> object that wires cookie sessions, JWT bearer tokens, OAuth, two-factor authentication, and email flows (verify / reset / change) - with CSRF, escalating login lockout, sudo mode, and multi-device session management - over <b>your own</b> SQLAlchemy <code>User</code> model. Sessions and bearer both resolve to the same <code>Principal</code>, so narrowing or adding a transport never changes how you authorize a route, and app policy lives in <b>hooks</b> instead of forked dependency code.
 </p>
 <hr>
 
-> **Status:** early `0.2` (alpha) - this is the v1 surface we're converging on. APIs may still shift before `1.0`.
+> **Status:** `0.7` (alpha) - this is the v1 surface we're converging on. APIs may still shift before `1.0`.
 
 ## Features
 
 - **Transport-agnostic**: cookie sessions and JWT bearer tokens behind a single `Principal`; first credential present wins, and authorization never depends on *which* transport authenticated.
 - **Your model, your schema**: works over your existing SQLAlchemy `User` via a logical-field `column_map` - no forced renames, no second user table.
 - **Secure by default**: synchronizer-token CSRF, escalating per-IP/per-user login lockout, bcrypt with SHA-256 pre-hash (no 72-byte truncation), timing-equalized login, and trusted-proxy IP resolution.
-- **OAuth**: Google, GitHub, or a custom provider - with the `state` bound to the initiating browser to block login CSRF.
+- **OAuth and OpenID Connect**: Google, GitHub, any OIDC provider from its issuer (Keycloak, Zitadel, Authentik, Auth0, Okta, Entra ID), or a custom one - with the `state` bound to the initiating browser to block login CSRF.
+- **Two-factor authentication**: opt-in TOTP with encrypted secrets and single-use recovery codes, challenged from both login routes and, if you want it, from OAuth.
 - **Email flows**: verify / reset / change - you implement the `EmailSender` port (render your own HTML from `context.link`), the package mints and verifies the signed, single-use tokens.
 - **Sudo mode**: short-lived re-authentication to gate sensitive actions, stamped on the session and cleared on logout.
 - **Multi-device sessions**: list, revoke one, or "sign out everywhere", with a configurable per-user session cap.

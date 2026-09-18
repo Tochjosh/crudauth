@@ -56,12 +56,29 @@ A limit that doesn't need the principal (a fixed `RateLimit` keyed by IP or by
 `key(request)`) doesn't touch the database. For your own throttling logic,
 `auth.rate_limiter` is the configured backend.
 
-The built-in account actions (`register`, the email/password requests) ship with defaults.
-Override them per action with `rate_limits={...}` on `CRUDAuth`:
+The built-in account actions ship with defaults. Override them per action with `rate_limits={...}`
+on `CRUDAuth`:
 
 ```python
 auth = CRUDAuth(..., rate_limits={"register": RateLimit(3, 600)})  # 3 signups / 10 min per IP
 ```
+
+An unknown key raises at construction, so these are the ones to pass:
+
+| Action | Default | Guards |
+|---|---|---|
+| `register` | 5 / hour | `POST /register` |
+| `email_verify_request` | 5 / hour | `POST /email/verify-request` |
+| `password_reset_request` | 5 / hour | `POST /password/reset-request` |
+| `email_change_request` | 3 / hour | `POST /email/change-request` |
+| `existing_account_notice` | 5 / hour | the "you already have an account" notice |
+| `change_password` | 5 / hour | `POST /change-password` and `POST /set-password` |
+| `logout_all` | 10 / hour | `POST /logout-all` |
+| `csrf_refresh` | 30 / hour | `POST /csrf/refresh` |
+| `oauth_authorize` | 30 / hour | `GET /oauth/{provider}/authorize` |
+| `mfa_manage` | 10 / hour | the MFA setup, confirm, disable and recovery-code routes |
+
+`auth.rate_limits` reads the merged result back, defaults included.
 
 `register` counts only signups that pass validation, so a rejected password doesn't use up the
 budget.

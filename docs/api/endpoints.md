@@ -61,12 +61,12 @@ bodies are shaped to the factor (`{"email": ...}` or `{"phone": ...}`). ([Email 
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| POST | `/email/verify-request` | none | Send a verification link/code. Non-enumerable (uniform response). |
-| POST | `/email/verify-confirm` | none | `{"token"}` → marks the recovery factor verified. |
-| POST | `/password/reset-request` | none | Send a reset link/code. Non-enumerable. |
-| POST | `/password/reset-confirm` | none | `{"token", "new_password"}`; `422` if the password fails the policy, without using up the token. Evicts the user's other sessions. |
-| POST | `/email/change-request` | authenticated | `{"new_email", "password"}`; `422` if `new_email` is longer than the `email` column. Mounted only when the model has an `email` column. |
-| POST | `/email/change-confirm` | none | `{"token"}` → applies the new address. |
+| POST | `/email/verify-request` | none | `{"<factor>", "redirect_to"?}` → send a verification link/code. Non-enumerable (uniform response). |
+| POST | `/email/verify-confirm` | none | `{"token"}` → marks the recovery factor verified; echoes `redirect_to` when the link carried one. |
+| POST | `/password/reset-request` | none | `{"<factor>", "redirect_to"?}` → send a reset link/code. Non-enumerable. |
+| POST | `/password/reset-confirm` | none | `{"token", "new_password"}`; `422` if the password fails the policy, without using up the token. Evicts the user's other sessions, and echoes `redirect_to` when the link carried one. |
+| POST | `/email/change-request` | authenticated | `{"new_email", "password", "redirect_to"?}`; `422` if `new_email` is longer than the `email` column. Mounted only when the model has an `email` column. |
+| POST | `/email/change-confirm` | none | `{"token"}` → applies the new address; echoes `redirect_to` when the link carried one. |
 
 ## OAuth
 
