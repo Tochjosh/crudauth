@@ -89,14 +89,16 @@ A failed callback redirects to `redirect_base_url` with `?error=<code>`, or retu
 | Code | Meaning |
 |------|---------|
 | `oauth_failed` | The provider reported an error or the user declined, the callback was malformed, or the token exchange or profile request failed. |
+| `invalid_state` | The callback's `state` doesn't match the browser's state cookie, or is no longer stored: the sign-in took longer than the state lives, finished in another browser, or was replayed. |
 | `email_missing` | The provider account has no email address. |
 | `email_unverified` | The provider reports the email as unverified. |
 | `email_too_long` | The email is longer than your `email` column. |
 | `provider_already_linked` | The matching user is linked to a different account of this provider. |
 | `account_inactive` | The user is disabled. |
 
-A callback whose `state` doesn't match the browser's state cookie returns `400` in both modes.
-The state is used up either way, so a retry starts again from `authorize`.
+No session is created on any of these. In JSON mode an `invalid_state` answers `400` with
+`{"detail": "Invalid or expired OAuth state"}` rather than the code. A state is used up by its first
+callback, so a retry starts again from `authorize`.
 
 `GET /oauth/{provider}/authorize` stores a state entry per request, so it's rate limited per IP
 (`oauth_authorize`, 30 per hour by default; tune it with `rate_limits=`).

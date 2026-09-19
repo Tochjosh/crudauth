@@ -13,6 +13,7 @@ from typing import Any
 from .backends import MemoryRateLimiterBackend, RedisBackend
 from .base import RateLimiterBackend
 from .config import DEFAULT_RATE_LIMITS, KeyBy, LockoutConfig, RateLimit, RateLimitResolver
+from .headers import RateLimitHeadersMiddleware
 from .policy import LockoutPolicy
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "DEFAULT_RATE_LIMITS",
     "LockoutPolicy",
     "LockoutConfig",
+    "RateLimitHeadersMiddleware",
     "redis_rate_limiter",
 ]
 

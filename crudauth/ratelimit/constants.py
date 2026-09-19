@@ -14,6 +14,9 @@ LOCKOUT_NAMESPACE = "login"
 # Namespace for the per-endpoint ``rate_limit()`` dependency keys.
 RATE_LIMIT_NAMESPACE = "ratelimit"
 
+# Where a limiter leaves its headers on ``request.state`` for RateLimitHeadersMiddleware.
+RATE_LIMIT_HEADERS_STATE = "crudauth_rate_limit_headers"
+
 # Sudo-lockout keys live under this namespace (``sudo:fail:<uid>`` /
 # ``sudo:lock:<uid>``), kept separate from the ``login`` lockout so a sudo
 # brute force can't reset login counters or vice versa.

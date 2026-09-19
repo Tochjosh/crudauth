@@ -17,6 +17,7 @@ from ..utils import client_ip_key, get_client_ip, takes_two_arguments
 from .base import RateLimiterBackend
 from .config import KeyBy, RateLimit, RateLimitResolver
 from .constants import RATE_LIMIT_NAMESPACE
+from .headers import record_rate_limit_headers
 
 __all__ = ["identity_key", "enforce_rate_limit", "limit_by_request", "limit_by_user"]
 
@@ -72,9 +73,12 @@ async def enforce_rate_limit(
     ``None``, a disabled limit, or no backend lets the request through.
 
     Note:
-        Headers set on the injected ``Response`` are dropped when the dependency
-        raises, so the limit headers are also attached to the
-        [RateLimitException][crudauth.exceptions.RateLimitException].
+        Headers set on the injected ``Response`` only reach the client when the
+        route returns normally. The limiter's own ``429`` carries them on the
+        [RateLimitException][crudauth.exceptions.RateLimitException]; for any
+        other error response they're also recorded on the request, where
+        [RateLimitHeadersMiddleware][crudauth.ratelimit.RateLimitHeadersMiddleware]
+        picks them up.
     """
     effective = limit(request, principal) if callable(limit) else limit
     if inspect.isawaitable(effective):
@@ -91,12 +95,14 @@ async def enforce_rate_limit(
         "X-RateLimit-Limit": str(effective.times),
         "X-RateLimit-Remaining": str(max(0, effective.times - count)),
     }
-    response.headers.update(headers)
+    if limited:
+        headers["X-RateLimit-Remaining"] = "0"
+    response.headers.update(record_rate_limit_headers(request, headers))
     if limited:
         raise RateLimitException(
             "Too many requests. Try again later.",
             retry_after=retry_after,
-            headers={**headers, "X-RateLimit-Remaining": "0"},
+            headers=headers,
         )
 
 

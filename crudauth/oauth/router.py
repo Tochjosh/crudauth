@@ -13,7 +13,7 @@ from ..exceptions import BadRequestException, OAuthAccountException
 from ..hooks import HookContext
 from ..storage.base import AbstractSessionStorage
 from ..utils import safe_redirect_path
-from .constants import ACCOUNT_INACTIVE, OAUTH_FAILED, OAUTH_STATE_COOKIE_NAME
+from .constants import ACCOUNT_INACTIVE, INVALID_STATE, OAUTH_FAILED, OAUTH_STATE_COOKIE_NAME
 from .provider import AbstractOAuthProvider, _require_httpx
 from .schemas import OAuthState
 from .service import OAuthAccountService
@@ -105,6 +105,17 @@ def build_oauth_router(
         _clear_state_cookie(redirect)
         return redirect
 
+    def _invalid_state() -> Any:
+        """Refuse a state this browser didn't start, or one that's no longer stored.
+
+        No session is created either way. In redirect mode the browser goes back
+        to the app with ``?error=invalid_state``, since the usual causes are a
+        sign-in that outlived its state or finished in another browser.
+        """
+        if response_mode == "json":
+            raise BadRequestException("Invalid or expired OAuth state")
+        return _error_response(INVALID_STATE)
+
     @router.get(authorize_path, dependencies=[Depends(authorize_rate_limit)])
     async def authorize(
         provider: str,
@@ -164,8 +175,11 @@ def build_oauth_router(
             ``detail`` (in JSON mode) or redirect to the post-login default with
             ``?error=<code>``. ``oauth_failed`` covers a provider-reported
             ``?error=...``, a malformed callback, a token-exchange or userinfo
-            failure, and a payload the provider can't parse. Account resolution
-            reports the [OAuthAccountException][crudauth.exceptions.OAuthAccountException]
+            failure, and a payload the provider can't parse. ``invalid_state``
+            covers a state that doesn't match the browser's cookie or is no longer
+            stored (in JSON mode that one stays a 400 with the message
+            "Invalid or expired OAuth state"). Account resolution reports the
+            [OAuthAccountException][crudauth.exceptions.OAuthAccountException]
             code, and a disabled account reports ``account_inactive``.
         """
         prov = _provider(provider)
@@ -173,10 +187,10 @@ def build_oauth_router(
             return _error_response()
         bound = request.cookies.get(OAUTH_STATE_COOKIE_NAME)
         if not bound or bound != state:
-            raise BadRequestException("Invalid or expired OAuth state")
+            return _invalid_state()
         state_data = await state_storage.get_and_delete(state, OAuthState)
         if state_data is None or state_data.provider != provider:
-            raise BadRequestException("Invalid or expired OAuth state")
+            return _invalid_state()
 
         httpx = _require_httpx()
         try:

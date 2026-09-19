@@ -89,3 +89,7 @@ class Principal:
   `(request, principal)` as the limit to pick a `RateLimit` (or `None` for no limit) per request.
   Give `rate_limit` the same `transport=` as a narrowed `current_user(transport=...)` so they
   still share one authentication.
+- **Rate-limit headers on errors:** a request the limiter counted but a later dependency or the
+  route refused (`401`, `404`, `422`) leaves without `X-RateLimit-*`. Add
+  `app.add_middleware(RateLimitHeadersMiddleware)` (from `crudauth.ratelimit`) to copy them onto
+  those responses; with several limiters it reports the one with the least remaining.
