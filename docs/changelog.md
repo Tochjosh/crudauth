@@ -5,6 +5,30 @@ breaking changes; those are called out explicitly.
 
 ___
 
+## 0.7.1 - 2026-09-18
+
+Two fixes that came out of moving the FastAPI boilerplate onto 0.7.0. A redirect-mode OAuth callback
+now sends a failed state check back to the app like every other failure, and rate-limit headers can
+now reach the responses a later dependency or the route refused. No breaking changes.
+
+#### Added
+- **`RateLimitHeadersMiddleware`** (`from crudauth.ratelimit import RateLimitHeadersMiddleware`):
+  copies `X-RateLimit-Limit` and `X-RateLimit-Remaining` onto the responses that lost them because
+  something after the limiter raised, such as a `401` from `current_user()`, a `404` from the route,
+  or a `422` for a bad body. It only fills in missing headers, and a request no limiter counted gets
+  none. It's opt-in.
+
+#### Fixed
+- **A failed OAuth state check in redirect mode redirects**: a callback with no state cookie, a
+  cookie from another sign-in, or a state that's used up or expired now goes to
+  `redirect_base_url?error=invalid_state`, and the state cookie is cleared. Before, it answered
+  with a JSON `400` on the API's origin. JSON mode still answers `400`.
+- **Several limiters on one route report the tightest**: the headers describe the limiter with the
+  least remaining, since that's the one the client will hit first. Before, the last limiter to run
+  overwrote the others, so a route could report a loose budget while it was about to hit a tight one.
+
+___
+
 ## 0.7.0 - 2026-09-17
 
 Second factors, any identity provider, and a security pass over everything that was already here.
