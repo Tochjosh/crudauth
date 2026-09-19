@@ -8,6 +8,7 @@ GITHUB = "github"
 
 # Callback error codes, reported as ``?error=`` (redirect mode) or ``detail`` (JSON mode).
 OAUTH_FAILED = "oauth_failed"
+INVALID_STATE = "invalid_state"
 EMAIL_MISSING = "email_missing"
 EMAIL_UNVERIFIED = "email_unverified"
 EMAIL_TOO_LONG = "email_too_long"

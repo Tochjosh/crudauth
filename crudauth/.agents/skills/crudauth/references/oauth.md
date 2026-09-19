@@ -72,8 +72,10 @@ only** (open-redirect hardened).
      `_2`, ... then a random suffix on collision.
 
 A disabled user gets no session (`account_inactive`). Failures redirect to `redirect_base_url` with
-`?error=<code>` (`oauth_failed`, `email_missing`, `email_unverified`, `email_too_long`,
-`provider_already_linked`, `account_inactive`), or return `400 {"detail": "<code>"}` in JSON mode.
+`?error=<code>` (`oauth_failed`, `invalid_state`, `email_missing`, `email_unverified`,
+`email_too_long`, `provider_already_linked`, `account_inactive`), or return `400 {"detail": "<code>"}`
+in JSON mode — except `invalid_state`, which answers `400 {"detail": "Invalid or expired OAuth state"}`.
+`invalid_state` means the callback's state didn't match the browser's cookie or is no longer stored.
 The service raises `OAuthAccountException` (`.code`). `authorize` is rate limited per IP
 (`oauth_authorize`, 30/hour).
 
