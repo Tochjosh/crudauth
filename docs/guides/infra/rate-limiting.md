@@ -56,6 +56,27 @@ A limit that doesn't need the principal (a fixed `RateLimit` keyed by IP or by
 `key(request)`) doesn't touch the database. For your own throttling logic,
 `auth.rate_limiter` is the configured backend.
 
+### Headers on error responses
+
+`X-RateLimit-Limit` and `X-RateLimit-Remaining` go on the route's response, and the `429` carries
+them with `Retry-After`. A request can also be counted and then refused by something after the
+limiter: `current_user()` answering `401`, the route raising a `404`, a `422` for a bad body.
+FastAPI builds those responses from the exception, so they leave without the headers, and a
+client reading the headers to pace itself can't see that the refused requests spent budget.
+
+Add `RateLimitHeadersMiddleware` to put the headers on those responses too:
+
+```python
+from crudauth.ratelimit import RateLimitHeadersMiddleware
+
+app.add_middleware(RateLimitHeadersMiddleware)
+```
+
+It only fills in headers a response doesn't already have, and a request no limiter counted gets
+none. When several limiters count the same request, the headers describe the one with the least
+remaining, since that's the budget the client runs into first. Responses built outside the
+middleware stack, such as an unhandled exception's `500`, go out without them.
+
 The built-in account actions ship with defaults. Override them per action with `rate_limits={...}`
 on `CRUDAuth`:
 
